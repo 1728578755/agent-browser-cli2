@@ -11,7 +11,7 @@
 | Chrome / Edge | 近两年版本 | 只有手工验证需要；自动化测试用假扩展 |
 
 ```bash
-git clone https://github.com/sleepinginsummer/agent-browser-cli
+git clone https://github.com/1728578755/agent-browser-cli
 cd agent-browser-cli
 cargo build
 ```

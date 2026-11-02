@@ -7,7 +7,7 @@
 
 ## v0.3.8 - 2026-11-02
 
-首次在 GitHub 公开发布（<https://github.com/sleepinginsummer/agent-browser-cli>）。相对 v0.3.7 补齐了页面读取、批量执行、网络拦截、挑战页处理、异步任务等能力，并统一了退出码契约。
+首次在 GitHub 公开发布（<https://github.com/1728578755/agent-browser-cli>）。相对 v0.3.7 补齐了页面读取、批量执行、网络拦截、挑战页处理、异步任务等能力，并统一了退出码契约。
 
 ### 新增
 

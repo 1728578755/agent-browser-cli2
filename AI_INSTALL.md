@@ -3,7 +3,7 @@
 把下面这段话发给 AI，让 AI 在你的本机环境里完成安装、配置 skill 和验证。
 
 ```text
-请帮我安装 agent-browser-cli：https://github.com/sleepinginsummer/agent-browser-cli
+请帮我安装 agent-browser-cli：https://github.com/1728578755/agent-browser-cli
 
 要求：
 1. 优先使用 npm 安装：npm install -g @sleepinsummer/agent-browser-cli。
@@ -50,7 +50,7 @@ Windows 11 22H2+
 如果当前平台包暂未发布或安装失败，使用源码构建：
 
 ```bash
-git clone https://github.com/sleepinginsummer/agent-browser-cli.git
+git clone https://github.com/1728578755/agent-browser-cli.git
 cd agent-browser-cli
 cargo build --release
 ./target/release/agent-browser-cli --help

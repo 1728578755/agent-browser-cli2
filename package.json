@@ -13,9 +13,9 @@
     "rust",
     "web-scraping"
   ],
-  "homepage": "https://github.com/sleepinginsummer/agent-browser-cli#readme",
+  "homepage": "https://github.com/1728578755/agent-browser-cli#readme",
   "bugs": {
-    "url": "https://github.com/sleepinginsummer/agent-browser-cli/issues"
+    "url": "https://github.com/1728578755/agent-browser-cli/issues"
   },
   "bin": {
     "agent-browser-cli": "npm/bin/agent-browser-cli.js"
@@ -55,7 +55,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/sleepinginsummer/agent-browser-cli"
+    "url": "https://github.com/1728578755/agent-browser-cli"
   },
   "publishConfig": {
     "access": "public",

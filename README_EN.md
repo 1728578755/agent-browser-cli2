@@ -7,11 +7,11 @@ A browser perception and control CLI for agents, turning a real Chrome session i
 Browser perception · Page control · Chrome session reuse · CDP · Conditional wait · Agent Skill integration
 
 <p>
-  <a href="https://github.com/sleepinginsummer/agent-browser-cli"><img src="https://img.shields.io/badge/CLI-agentbrowsercli-2ea44f" alt="CLI agentbrowsercli"></a>
-  <a href="https://github.com/sleepinginsummer/agent-browser-cli/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-green" alt="License MIT"></a>
-  <a href="https://github.com/sleepinginsummer/agent-browser-cli"><img src="https://img.shields.io/badge/sys-win%2Fmac%2Flinux-0078D6?labelColor=0078D6&color=C0C0C0" alt="sys win/mac/linux"></a>
-  <a href="https://github.com/sleepinginsummer/agent-browser-cli/releases"><img src="https://img.shields.io/badge/release-v0.3.8-orange" alt="release v0.3.8"></a>
-  <a href="https://github.com/sleepinginsummer/agent-browser-cli/pulls"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen" alt="PRs welcome"></a>
+  <a href="https://github.com/1728578755/agent-browser-cli"><img src="https://img.shields.io/badge/CLI-agentbrowsercli-2ea44f" alt="CLI agentbrowsercli"></a>
+  <a href="https://github.com/1728578755/agent-browser-cli/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-green" alt="License MIT"></a>
+  <a href="https://github.com/1728578755/agent-browser-cli"><img src="https://img.shields.io/badge/sys-win%2Fmac%2Flinux-0078D6?labelColor=0078D6&color=C0C0C0" alt="sys win/mac/linux"></a>
+  <a href="https://github.com/1728578755/agent-browser-cli/releases"><img src="https://img.shields.io/badge/release-v0.3.8-orange" alt="release v0.3.8"></a>
+  <a href="https://github.com/1728578755/agent-browser-cli/pulls"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen" alt="PRs welcome"></a>
 </p>
 
 [AI One-Line Install](#ai-one-line-install) · [Manual Installation](#manual-installation) · [Chrome Extension](#chrome-extension) · [Update](#update) · [Changelog](CHANGELOG.md) · [Uninstall](#uninstall) · [Friendly Links](#friendly-links)
@@ -42,7 +42,7 @@ Thanks to the GenericAgent project for the browser bridge, page simplification, 
 ## AI One-Line Install
 
 ```text
-Please read https://github.com/sleepinginsummer/agent-browser-cli/blob/main/AI_INSTALL.md, follow the instructions to install the CLI, load the Chrome extension, and add `skills/agent-browser-cli/SKILL.md`.
+Please read https://github.com/1728578755/agent-browser-cli/blob/main/AI_INSTALL.md, follow the instructions to install the CLI, load the Chrome extension, and add `skills/agent-browser-cli/SKILL.md`.
 ```
 
 ## Improvements
@@ -132,7 +132,7 @@ npm install -g @sleepinsummer/agent-browser-cli
 agent-browser-cli tabs
 ```
 
-> The npm scope is `@sleepinsummer` while the GitHub account is `sleepinginsummer`; both belong to the same maintainer.
+> The npm scope is `@sleepinsummer` while the GitHub account is `1728578755`; both belong to the same maintainer.
 
 ### Build From Source
 
@@ -144,7 +144,7 @@ cargo build --release
 
 ## Chrome Extension
 
-1. Recommended: download `chrome-extensions.zip` from the [latest Release](https://github.com/sleepinginsummer/agent-browser-cli/releases/latest), extract it, open `chrome://extensions` in Chrome, enable `Developer mode`, click `Load unpacked`, and select the extracted `tmwd_cdp_bridge` directory.
+1. Recommended: download `chrome-extensions.zip` from the [latest Release](https://github.com/1728578755/agent-browser-cli/releases/latest), extract it, open `chrome://extensions` in Chrome, enable `Developer mode`, click `Load unpacked`, and select the extracted `tmwd_cdp_bridge` directory.
 
 2. When building from local source, you can also load this extension directory directly:
 
@@ -355,7 +355,7 @@ For the full version history, see [CHANGELOG.md](./CHANGELOG.md).
 AI one-line update:
 
 ```text
-Please read https://github.com/sleepinginsummer/agent-browser-cli/blob/main/AI_INSTALL.md, follow the instructions to update the CLI, download the extension zip again to the user-specified location, ask the user to manually load the Chrome extension, and update the related SKILL.md.
+Please read https://github.com/1728578755/agent-browser-cli/blob/main/AI_INSTALL.md, follow the instructions to update the CLI, download the extension zip again to the user-specified location, ask the user to manually load the Chrome extension, and update the related SKILL.md.
 ```
 
 If the Chrome extension has updates, download the zip again, overwrite the existing files, and reload the `Agent Browser CLI Bridge` extension in `chrome://extensions`.
