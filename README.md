@@ -35,7 +35,7 @@
 
 ## 致谢
 
-本项目的浏览器控制能力提取并改造自 [GenericAgent](https://github.com/lsdefine/GenericAgent) 项目中的 Web 工具链，包括 `TMWebDriver`、`simphtml` 和 `tmwd_cdp_bridge` 扩展相关思路与实现。
+本项目是 [GenericAgent](https://github.com/lsdefine/GenericAgent) 的**非官方二次开发**，与上游项目无隶属或背书关系。浏览器控制能力提取并改造自其 Web 工具链，包括 `TMWebDriver`、`simphtml` 和 `tmwd_cdp_bridge` 扩展相关思路与实现。
 
 感谢 GenericAgent 项目提供的浏览器桥接、页面简化、CDP 控制和实践 SOP。本仓库在此基础上做了面向独立使用和 CLI 调用的整理与增强。
 

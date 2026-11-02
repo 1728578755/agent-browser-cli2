@@ -3,8 +3,10 @@
 agent-browser-cli
 Copyright (c) 2026 1728578755
 
-This product includes software derived from GenericAgent
-(<https://github.com/lsdefine/GenericAgent>). The browser bridge, page
+This product is an unofficial derivative work of GenericAgent
+(<https://github.com/lsdefine/GenericAgent>) and is not affiliated with or
+endorsed by the upstream project. It includes software derived from
+GenericAgent. The browser bridge, page
 simplification and CDP control code in `assets/tmwd_cdp_bridge/` and
 `assets/simphtml_opt.js` originate from that project.
 

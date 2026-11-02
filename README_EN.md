@@ -35,7 +35,7 @@ This project is not Selenium or Playwright. It is better suited for helping agen
 
 ## Acknowledgements
 
-The browser control capability in this project was extracted and adapted from the Web toolchain in [GenericAgent](https://github.com/lsdefine/GenericAgent), including ideas and implementation around `TMWebDriver`, `simphtml`, and the `tmwd_cdp_bridge` extension.
+This project is an **unofficial derivative work** of [GenericAgent](https://github.com/lsdefine/GenericAgent), with no affiliation or endorsement from the upstream project. The browser control capability was extracted and adapted from its Web toolchain, including ideas and implementation around `TMWebDriver`, `simphtml`, and the `tmwd_cdp_bridge` extension.
 
 Thanks to the GenericAgent project for the browser bridge, page simplification, CDP control, and practical SOPs. This repository reorganizes and enhances that work for standalone usage and CLI invocation.
 
