@@ -17,7 +17,7 @@ function platformPackageName(platform = process.platform, arch = process.arch) {
   if (platform === "darwin" && arch === "x64") return "agent-browser-cli2-darwin-x64";
   if (platform === "linux" && arch === "x64") return "agent-browser-cli2-linux-x64";
   if (platform === "linux" && arch === "arm64") return "agent-browser-cli2-linux-arm64";
-  if (platform === "win32" && arch === "x64") return "agent-browser-cli2-win32-x64";
+  if (platform === "win32" && arch === "x64") return "agent-browser-cli2-windows-x64";
   return null;
 }
 

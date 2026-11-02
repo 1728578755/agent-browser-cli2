@@ -32,7 +32,7 @@ agent-browser-cli2-darwin-arm64
 agent-browser-cli2-darwin-x64
 agent-browser-cli2-linux-x64
 agent-browser-cli2-linux-arm64
-agent-browser-cli2-win32-x64
+agent-browser-cli2-windows-x64
 ```
 
 Windows ARM64 没有预编译包，需要自行 `cargo build --release`，再用 `AGENT_BROWSER_CLI_BIN` 指向生成的二进制。

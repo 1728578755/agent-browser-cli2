@@ -37,7 +37,7 @@ jobs:
             os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             binary: agent-browser-cli
-          - name: win32-x64
+          - name: windows-x64
             os: windows-2022
             target: x86_64-pc-windows-msvc
             binary: agent-browser-cli.exe
@@ -275,7 +275,7 @@ jobs:
             "${base}-darwin-x64"
             "${base}-linux-x64"
             "${base}-linux-arm64"
-            "${base}-win32-x64"
+            "${base}-windows-x64"
           )
           for pkg in "${packages[@]}"; do
             encoded="${pkg//\//%2F}"
@@ -309,7 +309,7 @@ jobs:
             "${base}-darwin-x64"
             "${base}-linux-x64"
             "${base}-linux-arm64"
-            "${base}-win32-x64"
+            "${base}-windows-x64"
           )
           summary='/tmp/mirror-sync.md'
           printf '| 包 | 结果 |\n|---|---|\n' > "${summary}"

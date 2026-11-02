@@ -51,7 +51,7 @@
     "agent-browser-cli2-darwin-x64": "0.3.8",
     "agent-browser-cli2-linux-x64": "0.3.8",
     "agent-browser-cli2-linux-arm64": "0.3.8",
-    "agent-browser-cli2-win32-x64": "0.3.8"
+    "agent-browser-cli2-windows-x64": "0.3.8"
   },
   "engines": {
     "node": ">=18"

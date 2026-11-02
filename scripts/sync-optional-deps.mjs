@@ -29,7 +29,7 @@ const platforms = [
   { name: "agent-browser-cli2-darwin-x64", os: "darwin", cpu: "x64" },
   { name: "agent-browser-cli2-linux-x64", os: "linux", cpu: "x64" },
   { name: "agent-browser-cli2-linux-arm64", os: "linux", cpu: "arm64" },
-  { name: "agent-browser-cli2-win32-x64", os: "win32", cpu: "x64" }
+  { name: "agent-browser-cli2-windows-x64", os: "win32", cpu: "x64" }
 ];
 
 packageJson.optionalDependencies ||= {};

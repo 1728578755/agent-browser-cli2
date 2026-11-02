@@ -5,7 +5,7 @@ import { spawnSync } from "node:child_process";
 const [, , targetName, binaryPath] = process.argv;
 
 if (!targetName || !binaryPath) {
-  console.error("Usage: node scripts/package-platform.mjs <darwin-arm64|darwin-x64|linux-x64|linux-arm64|win32-x64> <binary>");
+  console.error("Usage: node scripts/package-platform.mjs <darwin-arm64|darwin-x64|linux-x64|linux-arm64|windows-x64> <binary>");
   process.exit(1);
 }
 
@@ -14,7 +14,7 @@ const meta = {
   "darwin-x64": { os: ["darwin"], cpu: ["x64"], ext: "" },
   "linux-x64": { os: ["linux"], cpu: ["x64"], ext: "" },
   "linux-arm64": { os: ["linux"], cpu: ["arm64"], ext: "" },
-  "win32-x64": { os: ["win32"], cpu: ["x64"], ext: ".exe" }
+  "windows-x64": { os: ["win32"], cpu: ["x64"], ext: ".exe" }
 }[targetName];
 
 if (!meta) {
