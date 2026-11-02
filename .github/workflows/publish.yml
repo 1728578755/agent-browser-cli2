@@ -163,7 +163,7 @@ jobs:
 
       - name: Download binary artifacts
         if: ${{ !contains(github.ref_name, '-extension') }}
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: agent-browser-cli-*
           path: dist/bin
@@ -171,7 +171,7 @@ jobs:
 
       - name: Download npm package artifacts
         if: ${{ !contains(github.ref_name, '-extension') }}
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: npm-*
           path: dist/npm
