@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Agent Browser CLI Bridge",
   "version": "3.4",
-  "description": "Browser control bridge for agent-browser-cli",
+  "description": "Drive the Chrome you are already signed in to: read pages, click, fill, screenshot, inspect network.",
   "minimum_chrome_version": "120",
   "permissions": [
     "cookies",
