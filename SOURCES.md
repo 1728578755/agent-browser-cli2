@@ -17,6 +17,7 @@
 | 追溯参考 | 核对时（2026-11-02）直接上游 `main` HEAD 为 [`bcb43ea`](https://github.com/sleepinginsummer/agent-browser-cli/commit/bcb43ea0311278828bd3ea9d758bc80c18637e12)，仅作时间点参考，不代表逐行对应 |
 | 复用方式 | 在 0.3.7 代码基础上继续开发，未保留上游 Git 提交历史；本仓库不是 GitHub Fork 关系 |
 | 二次开发范围 | 见第 3 节；0.3.7 基线内容见第 2.1 节 |
+| 本仓库 npm 包 | `agent-browser-cli2`（平台子包 `agent-browser-cli2-*`）；CLI 命令仍为 `agent-browser-cli` |
 
 本仓库的版本号从 0.3.7 升到 0.3.8，0.3.7 及更早的代码与文档基线来自直接上游；0.3.8 的增量是本项目的二次开发成果。
 

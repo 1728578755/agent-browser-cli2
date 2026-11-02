@@ -1,13 +1,15 @@
 <div align="center">
 
-# agent-browser-cli
+# agent-browser-cli2
 
 A browser perception and control CLI for agents, turning a real Chrome session into reusable tab scanning, page JavaScript, Cookie, CDP, and screenshot capabilities.
+
+The repository and npm package are named `agent-browser-cli2`; the CLI command, binary, and Skill name remain `agent-browser-cli`, with an `agent-browser-cli2` alias installed as well.
 
 Browser perception · Page control · Chrome session reuse · CDP · Conditional wait · Agent Skill integration
 
 <p>
-  <a href="https://github.com/1728578755/agent-browser-cli2"><img src="https://img.shields.io/badge/CLI-agentbrowsercli-2ea44f" alt="CLI agentbrowsercli"></a>
+  <a href="https://github.com/1728578755/agent-browser-cli2"><img src="https://img.shields.io/badge/CLI-agentbrowsercli2-2ea44f" alt="CLI agentbrowsercli2"></a>
   <a href="https://github.com/1728578755/agent-browser-cli2/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-green" alt="License MIT"></a>
   <a href="https://github.com/1728578755/agent-browser-cli2"><img src="https://img.shields.io/badge/sys-win%2Fmac%2Flinux-0078D6?labelColor=0078D6&color=C0C0C0" alt="sys win/mac/linux"></a>
   <a href="https://github.com/1728578755/agent-browser-cli2/releases"><img src="https://img.shields.io/badge/release-v0.3.8-orange" alt="release v0.3.8"></a>
@@ -132,11 +134,11 @@ When the extension changes, reload the unpacked directory once in `chrome://exte
 ### npm
 
 ```bash
-npm install -g @sleepinsummer/agent-browser-cli
+npm install -g agent-browser-cli2
 agent-browser-cli tabs
 ```
 
-> **Note**: `@sleepinsummer` is the upstream project's npm scope. This repository does not publish its own npm package yet, so the command above installs upstream 0.3.7. To use this repository's 0.3.8, build from source below.
+> The primary command remains `agent-browser-cli` for compatibility with existing scripts and the Skill; an `agent-browser-cli2` alias is installed as well. The source-built binary is also named `agent-browser-cli`.
 
 ### Build From Source
 
@@ -383,7 +385,7 @@ agent-browser-cli stop
 Then clean up as needed:
 
 ```bash
-npm uninstall -g @sleepinsummer/agent-browser-cli
+npm uninstall -g agent-browser-cli2
 rm -rf ~/.agent-browser-cli
 rm -rf ~/.agents/skills/agent-browser-cli
 ```

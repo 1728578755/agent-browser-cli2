@@ -1,13 +1,15 @@
 <div align="center">
 
-# agent-browser-cli
+# agent-browser-cli2
 
 面向 Agent 的浏览器感知与控制 CLI，把真实 Chrome 会话变成可复用的标签页扫描、页面 JS、Cookie、CDP 和截图能力。
+
+仓库与 npm 包名为 `agent-browser-cli2`；CLI 命令、二进制名与 Skill 名保持 `agent-browser-cli`，安装后同时提供 `agent-browser-cli2` 别名。
 
 浏览器感知 · 页面控制 · Chrome 登录态复用 · CDP · 条件等待 · Agent Skill 集成
 
 <p>
-  <a href="https://github.com/1728578755/agent-browser-cli2"><img src="https://img.shields.io/badge/CLI-agentbrowsercli-2ea44f" alt="CLI agentbrowsercli"></a>
+  <a href="https://github.com/1728578755/agent-browser-cli2"><img src="https://img.shields.io/badge/CLI-agentbrowsercli2-2ea44f" alt="CLI agentbrowsercli2"></a>
   <a href="https://github.com/1728578755/agent-browser-cli2/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-green" alt="License MIT"></a>
   <a href="https://github.com/1728578755/agent-browser-cli2"><img src="https://img.shields.io/badge/sys-win%2Fmac%2Flinux-0078D6?labelColor=0078D6&color=C0C0C0" alt="sys win/mac/linux"></a>
   <a href="https://github.com/1728578755/agent-browser-cli2/releases"><img src="https://img.shields.io/badge/release-v0.3.8-orange" alt="release v0.3.8"></a>
@@ -134,11 +136,11 @@ agent-browser-cli run steps.json                        # 一次进程执行多�
 ### npm 安装
 
 ```bash
-npm install -g @sleepinsummer/agent-browser-cli
+npm install -g agent-browser-cli2
 agent-browser-cli tabs
 ```
 
-> **注意**：`@sleepinsummer` 是上游项目的 npm 作用域。本仓库尚未发布独立 npm 包，这条命令安装的是上游 0.3.7；需要本仓库的 0.3.8 请使用下面的源码构建。
+> 安装后主命令仍是 `agent-browser-cli`（兼容既有脚本与 Skill），同时提供 `agent-browser-cli2` 别名；源码构建的二进制名同样为 `agent-browser-cli`。
 
 ### 本地源码构建
 
@@ -388,7 +390,7 @@ agent-browser-cli stop
 然后按需清理：
 
 ```bash
-npm uninstall -g @sleepinsummer/agent-browser-cli
+npm uninstall -g agent-browser-cli2
 rm -rf ~/.agent-browser-cli
 rm -rf ~/.agents/skills/agent-browser-cli
 ```

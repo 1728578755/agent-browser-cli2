@@ -6,7 +6,7 @@
 请帮我安装 agent-browser-cli：https://github.com/1728578755/agent-browser-cli2
 
 要求：
-1. 优先使用 npm 安装：npm install -g @sleepinsummer/agent-browser-cli。
+1. 优先使用 npm 安装：npm install -g agent-browser-cli2。
 2. 先询问我希望把 Chrome 扩展解压到哪个本地目录。
 3. 从 GitHub 最新 Release 下载 `chrome-extensions.zip`，解压到我指定的目录，并指导我在 Chrome 中加载解压后的 `tmwd_cdp_bridge` 扩展目录。
 4. 如果之前已经加载过扩展，必须在 chrome://extensions 里重新加载该扩展，确保最新 `config.js`、`content.js` 和 `background.js` 生效。
@@ -20,22 +20,24 @@
 优先使用 npm 全局安装：
 
 ```bash
-npm install -g @sleepinsummer/agent-browser-cli
+npm install -g agent-browser-cli2
 agent-browser-cli --help
 ```
 
 当前 npm 包按平台安装原生二进制：
 
 ```text
-@sleepinsummer/agent-browser-cli
-@sleepinsummer/agent-browser-cli-darwin-arm64
-@sleepinsummer/agent-browser-cli-darwin-x64
-@sleepinsummer/agent-browser-cli-linux-x64
-@sleepinsummer/agent-browser-cli-linux-arm64
-@sleepinsummer/agent-browser-cli-win32-x64
+agent-browser-cli2
+agent-browser-cli2-darwin-arm64
+agent-browser-cli2-darwin-x64
+agent-browser-cli2-linux-x64
+agent-browser-cli2-linux-arm64
+agent-browser-cli2-win32-x64
 ```
 
 Windows ARM64 没有预编译包，需要自行 `cargo build --release`，再用 `AGENT_BROWSER_CLI_BIN` 指向生成的二进制。
+
+安装后主命令为 `agent-browser-cli`，同时提供 `agent-browser-cli2` 别名。
 
 Linux 使用前请确认本机 Chrome / Chromium 支持安装扩展。
 

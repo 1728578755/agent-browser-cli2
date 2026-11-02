@@ -13,7 +13,7 @@ updates:
     open-pull-requests-limit: 5
     ignore:
       # 平台二进制包由 scripts/sync-optional-deps.mjs 生成，版本跟随根包，不接受单独升级
-      - dependency-name: "@sleepinsummer/agent-browser-cli-*"
+      - dependency-name: "agent-browser-cli2-*"
 
   - package-ecosystem: github-actions
     directory: "/"

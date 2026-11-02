@@ -1,5 +1,5 @@
 {
-  "name": "@sleepinsummer/agent-browser-cli",
+  "name": "agent-browser-cli2",
   "version": "0.3.8",
   "description": "Agent-oriented browser sensing and control CLI backed by a native Rust daemon.",
   "license": "MIT",
@@ -18,7 +18,8 @@
     "url": "https://github.com/1728578755/agent-browser-cli2/issues"
   },
   "bin": {
-    "agent-browser-cli": "npm/bin/agent-browser-cli.js"
+    "agent-browser-cli": "npm/bin/agent-browser-cli.js",
+    "agent-browser-cli2": "npm/bin/agent-browser-cli.js"
   },
   "files": [
     "npm/bin",
@@ -46,11 +47,11 @@
     "postinstall": "node npm/postinstall.js"
   },
   "optionalDependencies": {
-    "@sleepinsummer/agent-browser-cli-darwin-arm64": "0.3.8",
-    "@sleepinsummer/agent-browser-cli-darwin-x64": "0.3.8",
-    "@sleepinsummer/agent-browser-cli-linux-x64": "0.3.8",
-    "@sleepinsummer/agent-browser-cli-linux-arm64": "0.3.8",
-    "@sleepinsummer/agent-browser-cli-win32-x64": "0.3.8"
+    "agent-browser-cli2-darwin-arm64": "0.3.8",
+    "agent-browser-cli2-darwin-x64": "0.3.8",
+    "agent-browser-cli2-linux-x64": "0.3.8",
+    "agent-browser-cli2-linux-arm64": "0.3.8",
+    "agent-browser-cli2-win32-x64": "0.3.8"
   },
   "engines": {
     "node": ">=18"

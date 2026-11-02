@@ -13,11 +13,11 @@ const path = require("node:path");
  * Unsupported platform 让用户无处可去。
  */
 function platformPackageName(platform = process.platform, arch = process.arch) {
-  if (platform === "darwin" && arch === "arm64") return "@sleepinsummer/agent-browser-cli-darwin-arm64";
-  if (platform === "darwin" && arch === "x64") return "@sleepinsummer/agent-browser-cli-darwin-x64";
-  if (platform === "linux" && arch === "x64") return "@sleepinsummer/agent-browser-cli-linux-x64";
-  if (platform === "linux" && arch === "arm64") return "@sleepinsummer/agent-browser-cli-linux-arm64";
-  if (platform === "win32" && arch === "x64") return "@sleepinsummer/agent-browser-cli-win32-x64";
+  if (platform === "darwin" && arch === "arm64") return "agent-browser-cli2-darwin-arm64";
+  if (platform === "darwin" && arch === "x64") return "agent-browser-cli2-darwin-x64";
+  if (platform === "linux" && arch === "x64") return "agent-browser-cli2-linux-x64";
+  if (platform === "linux" && arch === "arm64") return "agent-browser-cli2-linux-arm64";
+  if (platform === "win32" && arch === "x64") return "agent-browser-cli2-win32-x64";
   return null;
 }
 
@@ -33,7 +33,7 @@ function resolveBinary() {
     }
   }
   // 本地开发布局：<repo>/npm/bin → ../../target/release（cargo build --release 的产物）
-  // npm 安装布局：  <prefix>/node_modules/@sleepinsummer/agent-browser-cli/npm/bin
+  // npm 安装布局：  <prefix>/node_modules/agent-browser-cli2/npm/bin
   //                 → <pkg>/target/release —— 发布包的 files 里没有 target，
   //                 所以全局安装时这里必然不存在，只是为了本地开发不依赖 resolve。
   const local = path.resolve(__dirname, "..", "..", "target", "release", `agent-browser-cli${ext}`);
@@ -52,7 +52,7 @@ function resolveBinary() {
   throw new Error(
     `agent-browser-cli 原生二进制缺失（可选依赖 ${pkgName}，回退路径 ${local}）。` +
       `请勿使用 --ignore-optional / --no-optional 安装，可执行 ` +
-      `"npm install @sleepinsummer/agent-browser-cli@latest --force" 重装；` +
+      `"npm install agent-browser-cli2@latest --force" 重装；` +
       `本地开发请先跑 "cargo build --release"。`,
   );
 }

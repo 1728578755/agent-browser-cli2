@@ -25,11 +25,11 @@ const packageVersion = packageJson.version;
 // win32-arm64 故意不在其中：没有 CI 能验证的构建矩阵不如不承诺，
 // 该平台走 README 里的"自行编译 + AGENT_BROWSER_CLI_BIN"路径。
 const platforms = [
-  { name: "@sleepinsummer/agent-browser-cli-darwin-arm64", os: "darwin", cpu: "arm64" },
-  { name: "@sleepinsummer/agent-browser-cli-darwin-x64", os: "darwin", cpu: "x64" },
-  { name: "@sleepinsummer/agent-browser-cli-linux-x64", os: "linux", cpu: "x64" },
-  { name: "@sleepinsummer/agent-browser-cli-linux-arm64", os: "linux", cpu: "arm64" },
-  { name: "@sleepinsummer/agent-browser-cli-win32-x64", os: "win32", cpu: "x64" }
+  { name: "agent-browser-cli2-darwin-arm64", os: "darwin", cpu: "arm64" },
+  { name: "agent-browser-cli2-darwin-x64", os: "darwin", cpu: "x64" },
+  { name: "agent-browser-cli2-linux-x64", os: "linux", cpu: "x64" },
+  { name: "agent-browser-cli2-linux-arm64", os: "linux", cpu: "arm64" },
+  { name: "agent-browser-cli2-win32-x64", os: "win32", cpu: "x64" }
 ];
 
 packageJson.optionalDependencies ||= {};
@@ -54,7 +54,9 @@ if (fs.existsSync(lockPath)) {
   for (const { name, os, cpu } of platforms) {
     const key = `node_modules/${name}`;
     const entry = (lockJson.packages[key] ||= { optional: true });
-    const tarball = `${registry}/${name}/-/${name.split("/")[1]}-${packageVersion}.tgz`;
+    // 包名可能是 scope（@scope/name）或无 scope（name），tarball 文件名只取最后一段。
+    const shortName = name.includes("/") ? name.split("/")[1] : name;
+    const tarball = `${registry}/${name}/-/${shortName}-${packageVersion}.tgz`;
     // 版本变了 → resolved 指向的 tarball 变了 → 旧的 integrity 必然对不上
     if (entry.resolved !== tarball && entry.integrity) delete entry.integrity;
     entry.version = packageVersion;
