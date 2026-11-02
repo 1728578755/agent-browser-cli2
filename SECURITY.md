@@ -26,7 +26,7 @@
 
 请使用 GitHub Security Advisories 的私密报告入口：
 
-> <https://github.com/1728578755/agent-browser-cli/security/advisories/new>
+> <https://github.com/1728578755/agent-browser-cli2/security/advisories/new>
 
 该入口只在维护者与报告者之间可见，支持后续的私下讨论、补丁协作与 CVE 申请。若入口不可用，可先开一个**不含任何技术细节**的 issue，仅说明「需要私密安全联系方式」，维护者会跟进建立私密通道。
 
@@ -162,7 +162,7 @@ daemon 空闲 5 分钟自动退出，18765 随之释放。在这段空窗期（�
 
 **Supported versions:** CLI `0.3.x` and extension `3.4` are supported. `0.2.x` and earlier, and older extension builds, receive no security fixes.
 
-**Reporting:** Use GitHub Security Advisories at <https://github.com/1728578755/agent-browser-cli/security/advisories/new>. Do not open a public issue containing exploit details; if the advisory form is unavailable, open an issue that only asks for a private contact channel.
+**Reporting:** Use GitHub Security Advisories at <https://github.com/1728578755/agent-browser-cli2/security/advisories/new>. Do not open a public issue containing exploit details; if the advisory form is unavailable, open an issue that only asks for a private contact channel.
 
 **Response targets:** acknowledgement within 72 hours, initial assessment within 7 days, fix or mitigation within 30 days, coordinated disclosure normally within 90 days.
 

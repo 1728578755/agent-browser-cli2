@@ -7,11 +7,11 @@
 浏览器感知 · 页面控制 · Chrome 登录态复用 · CDP · 条件等待 · Agent Skill 集成
 
 <p>
-  <a href="https://github.com/1728578755/agent-browser-cli"><img src="https://img.shields.io/badge/CLI-agentbrowsercli-2ea44f" alt="CLI agentbrowsercli"></a>
-  <a href="https://github.com/1728578755/agent-browser-cli/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-green" alt="License MIT"></a>
-  <a href="https://github.com/1728578755/agent-browser-cli"><img src="https://img.shields.io/badge/sys-win%2Fmac%2Flinux-0078D6?labelColor=0078D6&color=C0C0C0" alt="sys win/mac/linux"></a>
-  <a href="https://github.com/1728578755/agent-browser-cli/releases"><img src="https://img.shields.io/badge/release-v0.3.8-orange" alt="release v0.3.8"></a>
-  <a href="https://github.com/1728578755/agent-browser-cli/pulls"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen" alt="PRs welcome"></a>
+  <a href="https://github.com/1728578755/agent-browser-cli2"><img src="https://img.shields.io/badge/CLI-agentbrowsercli-2ea44f" alt="CLI agentbrowsercli"></a>
+  <a href="https://github.com/1728578755/agent-browser-cli2/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-green" alt="License MIT"></a>
+  <a href="https://github.com/1728578755/agent-browser-cli2"><img src="https://img.shields.io/badge/sys-win%2Fmac%2Flinux-0078D6?labelColor=0078D6&color=C0C0C0" alt="sys win/mac/linux"></a>
+  <a href="https://github.com/1728578755/agent-browser-cli2/releases"><img src="https://img.shields.io/badge/release-v0.3.8-orange" alt="release v0.3.8"></a>
+  <a href="https://github.com/1728578755/agent-browser-cli2/pulls"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen" alt="PRs welcome"></a>
 </p>
 
 [AI 一句话安装](#ai-一句话安装) · [手动安装](#手动安装) · [Chrome 扩展](#chrome-扩展) · [更新](#更新) · [更新日志](CHANGELOG.md) · [卸载](#卸载) · [友情链接](#友情链接)
@@ -44,7 +44,7 @@
 ## AI 一句话安装
 
 ```text
-请阅读 https://github.com/1728578755/agent-browser-cli/blob/main/AI_INSTALL.md，按说明安装 CLI、加载 Chrome 扩展，并添加 `skills/agent-browser-cli/SKILL.md`。
+请阅读 https://github.com/1728578755/agent-browser-cli2/blob/main/AI_INSTALL.md，按说明安装 CLI、加载 Chrome 扩展，并添加 `skills/agent-browser-cli/SKILL.md`。
 ```
 
 ## 相对 GenericAgent 的改进（0.3.7 基线）
@@ -150,7 +150,7 @@ cargo build --release
 
 ## Chrome 扩展
 
-1. 推荐从 [最新 Release](https://github.com/1728578755/agent-browser-cli/releases/latest) 下载 `chrome-extensions.zip`，下载后解压，Chrome 打开 `chrome://extensions`，开启“开发者模式”，点击“加载已解压的扩展程序”，选择解压后的 `tmwd_cdp_bridge` 目录。
+1. 推荐从 [最新 Release](https://github.com/1728578755/agent-browser-cli2/releases/latest) 下载 `chrome-extensions.zip`，下载后解压，Chrome 打开 `chrome://extensions`，开启“开发者模式”，点击“加载已解压的扩展程序”，选择解压后的 `tmwd_cdp_bridge` 目录。
 
 2. 本地源码构建时，也可以直接加载扩展目录：
 
@@ -363,7 +363,7 @@ daemon 默认空闲 5 分钟退出，可用 `AGENT_BROWSER_CLI_IDLE_TTL`（秒�
 
 ai一句话更新
 ```text
-请阅读 https://github.com/1728578755/agent-browser-cli/blob/main/AI_INSTALL.md，按说明更新 CLI、重新下载插件 zip 到用户指定位置，用户手动加载 Chrome 扩展，并更新相关 SKILL.md。
+请阅读 https://github.com/1728578755/agent-browser-cli2/blob/main/AI_INSTALL.md，按说明更新 CLI、重新下载插件 zip 到用户指定位置，用户手动加载 Chrome 扩展，并更新相关 SKILL.md。
 ```
 
 如果 Chrome 扩展有更新，在 `chrome://extensions` 中重新下载 zip 覆盖，然后重新加载 `assets/tmwd_cdp_bridge` 扩展。

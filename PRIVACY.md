@@ -188,7 +188,7 @@ rm -rf ~/.agent-browser-cli
 
 ## 8. 联系与变更
 
-- 隐私问题、数据边界疑问：提交到 <https://github.com/1728578755/agent-browser-cli/issues>。
+- 隐私问题、数据边界疑问：提交到 <https://github.com/1728578755/agent-browser-cli2/issues>。
 - 安全漏洞：**不要开公开 issue**，请按 [SECURITY.md](./SECURITY.md) 走私密渠道。
 - 本政策随功能变化更新，最近一次修订：**2026-11-02**（对应 CLI `0.3.8` / 扩展 `3.4`）。
 
@@ -244,4 +244,4 @@ Page content, screenshots, captures, and console logs live only in daemon memory
 
 ### Contact
 
-Privacy questions: <https://github.com/1728578755/agent-browser-cli/issues>. Security reports: use the private channel described in [SECURITY.md](./SECURITY.md), not a public issue.
+Privacy questions: <https://github.com/1728578755/agent-browser-cli2/issues>. Security reports: use the private channel described in [SECURITY.md](./SECURITY.md), not a public issue.
