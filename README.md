@@ -35,11 +35,11 @@
 
 ## 致谢
 
-本项目是 [GenericAgent](https://github.com/lsdefine/GenericAgent) 的**非官方二次开发**，与上游项目无隶属或背书关系。浏览器控制能力提取并改造自其 Web 工具链，包括 `TMWebDriver`、`simphtml` 和 `tmwd_cdp_bridge` 扩展相关思路与实现。
+本项目基于 [sleepinginsummer/agent-browser-cli](https://github.com/sleepinginsummer/agent-browser-cli) 的 0.3.7 代码继续开发；该上游项目又派生自 [GenericAgent](https://github.com/lsdefine/GenericAgent) 的 Web 工具链，包括 `TMWebDriver`、`simphtml` 和 `tmwd_cdp_bridge` 扩展相关思路与实现。
 
-感谢 GenericAgent 项目提供的浏览器桥接、页面简化、CDP 控制和实践 SOP。本仓库在此基础上做了面向独立使用和 CLI 调用的整理与增强。
+本项目与上述两个上游项目均无隶属或背书关系。感谢它们提供的浏览器桥接、页面简化、CDP 控制和实践 SOP；0.3.7 之上的二次开发内容见 [CHANGELOG.md](./CHANGELOG.md) 的 v0.3.8 段。
 
-完整的代码派生清单、规范依据与依赖许可证见 [SOURCES.md](./SOURCES.md)；上游 MIT 版权声明与许可全文见 [NOTICE](./NOTICE)。
+完整的代码派生链、二次开发范围、规范依据与依赖许可证见 [SOURCES.md](./SOURCES.md)；两个上游的 MIT 版权声明与许可全文见 [NOTICE](./NOTICE)。
 
 ## AI 一句话安装
 
@@ -47,7 +47,9 @@
 请阅读 https://github.com/1728578755/agent-browser-cli/blob/main/AI_INSTALL.md，按说明安装 CLI、加载 Chrome 扩展，并添加 `skills/agent-browser-cli/SKILL.md`。
 ```
 
-## 改进内容
+## 相对 GenericAgent 的改进（0.3.7 基线）
+
+以下为 0.3.7 基线相对 GenericAgent 的改动；本仓库在 0.3.7 之上的增量见 CHANGELOG。
 
 - 从 GenericAgent 中拆出浏览器控制能力，以 CLI 形式提供给 Codex、Claude Code、OpenCode 等 Agent 工具使用。GenericAgent 浏览器插件不需要重新安装，可以共用同一个插件。
 - 避免每次命令都重新初始化浏览器连接。
@@ -136,7 +138,7 @@ npm install -g @sleepinsummer/agent-browser-cli
 agent-browser-cli tabs
 ```
 
-> npm 包作用域是 `@sleepinsummer`，GitHub 账号是 `1728578755`，两者属于同一维护者。
+> **注意**：`@sleepinsummer` 是上游项目的 npm 作用域。本仓库尚未发布独立 npm 包，这条命令安装的是上游 0.3.7；需要本仓库的 0.3.8 请使用下面的源码构建。
 
 ### 本地源码构建
 

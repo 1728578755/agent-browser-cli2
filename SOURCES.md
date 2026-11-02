@@ -7,50 +7,72 @@
 
 ## 1. 项目性质与二次开发基线
 
-**本项目是 [GenericAgent](https://github.com/lsdefine/GenericAgent) 的非官方二次开发（derivative work），不是上游官方项目，也不代表上游立场。**
+**本项目是 [sleepinginsummer/agent-browser-cli](https://github.com/sleepinginsummer/agent-browser-cli) 的非官方二次开发；该上游项目又派生自 [GenericAgent](https://github.com/lsdefine/GenericAgent) 的 Web 工具链。本项目与两者均无隶属或背书关系。**
 
 | 项 | 说明 |
 |---|---|
-| 与上游关系 | 非官方派生项目；未获得上游背书；不是 GitHub Fork 关系 |
-| 复用方式 | 抽取上游 Web 工具链代码后重写为 Rust daemon + CLI，不保留上游 Git 提交历史 |
-| 上游版本 | 上游未发布版本 tag；派生代码形成于 2026-10，以上游当时的 `main` 分支为参考基线，未锁定具体 commit |
-| 追溯参考 | 核对时（2026-11-02）上游 `main` HEAD 为 [`5ec4b12`](https://github.com/lsdefine/GenericAgent/commit/5ec4b12b63395f75adc1d865a57b7aaa920e92ee)，仅作时间点参考，不代表逐行对应 |
-| 二次开发范围 | 见第 3 节；原有派生文件见第 2 节 |
+| 直接上游 | `sleepinginsummer/agent-browser-cli`，MIT，Copyright (c) 2026 sleepinginsummer |
+| 间接上游 | `GenericAgent`，MIT，Copyright (c) 2025 lsdefine |
+| 二次开发基线 | 直接上游的 **0.3.7** 代码（`package.json` / `Cargo.toml` 均为 0.3.7） |
+| 追溯参考 | 核对时（2026-11-02）直接上游 `main` HEAD 为 [`bcb43ea`](https://github.com/sleepinginsummer/agent-browser-cli/commit/bcb43ea0311278828bd3ea9d758bc80c18637e12)，仅作时间点参考，不代表逐行对应 |
+| 复用方式 | 在 0.3.7 代码基础上继续开发，未保留上游 Git 提交历史；本仓库不是 GitHub Fork 关系 |
+| 二次开发范围 | 见第 3 节；0.3.7 基线内容见第 2.1 节 |
 
-由于上游没有版本号，无法给出精确的“基于 vX.Y”声明。如果你需要逐行比对，请以本仓库派生文件的实际实现为准；发现上游已修复而本项目仍存在的问题，欢迎提交 Issue。
+本仓库的版本号从 0.3.7 升到 0.3.8，0.3.7 及更早的代码与文档基线来自直接上游；0.3.8 的增量是本项目的二次开发成果。
 
 ## 2. 代码派生来源
 
-### 2.1 GenericAgent
+### 2.1 直接上游：sleepinginsummer/agent-browser-cli
 
 | 项 | 内容 |
 |---|---|
-| 上游项目 | GenericAgent |
+| 仓库 | <https://github.com/sleepinginsummer/agent-browser-cli> |
+| 许可证 | MIT License，Copyright (c) 2026 sleepinginsummer |
+| 基线版本 | 0.3.7 |
+| 上游定位 | 面向 Agent 的浏览器感知与控制 CLI，Rust daemon + Chrome 扩展桥 |
+
+本仓库的 0.3.7 基线整体来自该仓库，包括：
+
+| 范围 | 内容 |
+|---|---|
+| `src/` | Rust CLI、daemon、HTTP/WebSocket 服务、配置与协议 |
+| `assets/` | Chrome 扩展、页面脚本、`simphtml` 页面简化 |
+| `scripts/` / `npm/` | 构建、版本同步、扩展资源同步、npm 启动脚本 |
+| `tests/` | Node 合约测试、假扩展、手工验收脚本 |
+| `skills/` / `docs/` | Agent Skill、行为说明与能力现状 |
+| 根目录 | `package.json`、`Cargo.toml`、README、CHANGELOG、LICENSE 等 |
+
+该上游项目的 README 同样声明其浏览器控制能力派生自 GenericAgent。
+
+### 2.2 间接上游：GenericAgent
+
+| 项 | 内容 |
+|---|---|
 | 仓库 | <https://github.com/lsdefine/GenericAgent> |
 | 许可证 | MIT License，Copyright (c) 2025 lsdefine |
 | 上游定位 | 自演化 Agent，通过 TMWebDriver 注入真实浏览器，保留登录态 |
 
-本项目从 GenericAgent 的 Web 工具链中提取并改造了以下部分：
+GenericAgent 的 Web 工具链经直接上游传入本仓库，主要对应：
 
-| 本项目路径 | 上游对应 | 派生内容 |
+| 本仓库路径 | GenericAgent 对应 | 派生内容 |
 |---|---|---|
 | `assets/tmwd_cdp_bridge/` | `tmwd_cdp_bridge/` | Chrome MV3 扩展骨架、WebSocket 桥接、CDP attach/detach、标签页与会话标识 |
 | `assets/simphtml_opt.js` | `simphtml` | 页面简化与去噪算法（固定浮层处理、可见性判定、文本抽取） |
 | `assets/tmwd_cdp_bridge/background.js` | `TMWebDriver.py` / `tmwd_cdp_bridge` | 本地 WebSocket 客户端与命令分发思路 |
 
-> 上游版权声明与 MIT 许可全文见仓库根目录 [NOTICE](./NOTICE)。分发本项目的二进制或源码时，请同时保留 `LICENSE` 与 `NOTICE`。
+> 两个上游的版权声明与 MIT 许可全文均收录于仓库根目录 [NOTICE](./NOTICE)；本项目自身的 MIT 许可见 [LICENSE](./LICENSE)（保留了两层上游版权行）。
 
-### 2.2 非派生部分
+### 2.3 本项目新增/重写
 
-除上表列出的文件外，`src/`、`scripts/`、`tests/`、`docs/`、`skills/` 与 `assets/page_*.js` 为本项目整理或重写实现。它们同样以 MIT 许可证发布，但不属于 GenericAgent 的原始代码。
+0.3.7 基线之上，本项目完成的重写与新增集中在 `src/`、`assets/page_*.js`、`tests/`、`scripts/`、`docs/`、`skills/` 与构建发布配置，范围见第 3 节。这些增量以 MIT 许可证发布，但仍需保留上游版权与许可声明。
 
 ## 3. 二次开发新增内容
 
-相对上游的 Web 工具链，本项目在二次开发中新增或重写了以下能力（详细行为见 [CHANGELOG.md](./CHANGELOG.md)）：
+相对 0.3.7 基线，本项目在二次开发中新增或重写了以下能力（详细行为见 [CHANGELOG.md](./CHANGELOG.md) 的 v0.3.8 段）：
 
 | 领域 | 二次开发内容 | 主要落点 |
 |---|---|---|
-| 运行时 | Python 运行时改为 Rust daemon + CLI；本机 HTTP API、启动锁、会话路由、空闲退出 | `src/server.rs`、`src/cli.rs`、`src/config.rs` |
+| 运行时 | 本机 HTTP API、启动锁、会话路由、空闲退出、job 队列 | `src/server.rs`、`src/cli.rs`、`src/config.rs` |
 | 页面读取 | `read` / `find` / `scan --fast` / `snapshot --js`，单遍遍历、预算限流、隐藏内容读取 | `assets/page_read.js`、`page_find.js`、`page_snapshot.js` |
 | 页面动作 | `click` / `fill` / `hover` / `select` / `check` / `scroll` / `wait`，支持 iframe 与单次注入 | `assets/page_action.js`、`page_wait.js` |
 | CSP 兼容 | `eval` 被拦截时改用扩展注入 `ops/page_*.js` 的无 eval 通道，结果标记 `via:"no-eval"` | `src/server.rs`、`background.js` |
@@ -60,8 +82,6 @@
 | 多浏览器 | `browsers`、`tabtree`、Profile Label、按 `browser:profile` 隔离会话与网络规则 | `src/server.rs`、`background.js` |
 | 安全加固 | `trust-extension` 白名单与握手 token、token 指纹、配置原子写、fail-closed | `src/config.rs`、`src/cli.rs` |
 | 工程化 | Node 合约测试、假扩展 E2E、真机验收脚本、扩展资源同步守卫、CI/发布流水线、Agent Skill | `tests/`、`.github/workflows/`、`scripts/`、`skills/` |
-
-这些内容属于本项目的二次开发成果，不是 GenericAgent 的上游代码。
 
 ## 4. 规范与平台依据
 
@@ -113,13 +133,14 @@
 ## 6. 名称与商标
 
 - `GenericAgent`、`TMWebDriver`、`simphtml`、`tmwd_cdp_bridge` 的名称与相关权利归上游项目及其作者所有。
+- `agent-browser-cli` 直接上游的名称与相关权利归 `sleepinginsummer` 所有。
 - `Chrome`、`Google Chrome` 是 Google LLC 的商标。
 - 本项目与上述项目/公司相互独立；提及名称仅用于说明来源与兼容性，不构成背书。
 
 ## 7. 许可合规
 
-- 本项目以 MIT License 发布，全文见 [LICENSE](./LICENSE)。
-- GenericAgent 的 MIT 版权声明与许可全文收录于 [NOTICE](./NOTICE)。
+- 本项目以 MIT License 发布，全文见 [LICENSE](./LICENSE)；其中保留 `sleepinginsummer` 与 `1728578755` 两行版权声明。
+- 两个上游的 MIT 版权声明与许可全文收录于 [NOTICE](./NOTICE)。
 - 如果你分发修改后的版本，请保留 `LICENSE`、`NOTICE` 与本文件，并在派生文件头保留来源说明。
 
 ## 8. 变更记录
@@ -128,3 +149,4 @@
 |---|---|
 | 2026-11-02 | 首次整理并公开来源、规范依据与依赖清单 |
 | 2026-11-02 | 补充二次开发基线、上游追溯参考与二次开发新增范围 |
+| 2026-11-02 | 补回直接上游 `sleepinginsummer/agent-browser-cli`（0.3.7）与双层版权声明 |

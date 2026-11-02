@@ -1,23 +1,32 @@
 # NOTICE
 
-agent-browser-cli
+agent-browser-cli (this repository)
 Copyright (c) 2026 1728578755
 
-This product is an unofficial derivative work of GenericAgent
-(<https://github.com/lsdefine/GenericAgent>) and is not affiliated with or
-endorsed by the upstream project. It includes software derived from
-GenericAgent. The browser bridge, page
-simplification and CDP control code in `assets/tmwd_cdp_bridge/` and
-`assets/simphtml_opt.js` originate from that project.
+This product is an unofficial derivative work. It is not affiliated with or
+endorsed by the upstream projects.
 
-The list of derived components, spec references and third-party
-dependencies is maintained in `SOURCES.md`.
+It includes software derived from the following upstream projects:
+
+1. agent-browser-cli (immediate upstream)
+   <https://github.com/sleepinginsummer/agent-browser-cli>
+   Copyright (c) 2026 sleepinginsummer
+
+2. GenericAgent (indirect upstream, via the project above)
+   <https://github.com/lsdefine/GenericAgent>
+   Copyright (c) 2025 lsdefine
+
+Both upstream projects are licensed under the MIT License. The full license
+text below applies to both copyright holders.
+
+See `SOURCES.md` for the list of derived components, the secondary-development
+scope, and third-party dependencies.
 
 --------------------------------------------------------------------------
-GenericAgent
-Copyright (c) 2025 lsdefine
-
 MIT License
+
+Copyright (c) 2026 sleepinginsummer
+Copyright (c) 2025 lsdefine
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

@@ -35,11 +35,11 @@ This project is not Selenium or Playwright. It is better suited for helping agen
 
 ## Acknowledgements
 
-This project is an **unofficial derivative work** of [GenericAgent](https://github.com/lsdefine/GenericAgent), with no affiliation or endorsement from the upstream project. The browser control capability was extracted and adapted from its Web toolchain, including ideas and implementation around `TMWebDriver`, `simphtml`, and the `tmwd_cdp_bridge` extension.
+This project continues from the 0.3.7 codebase of [sleepinginsummer/agent-browser-cli](https://github.com/sleepinginsummer/agent-browser-cli), which in turn derives from the Web toolchain in [GenericAgent](https://github.com/lsdefine/GenericAgent), including ideas and implementation around `TMWebDriver`, `simphtml`, and the `tmwd_cdp_bridge` extension.
 
-Thanks to the GenericAgent project for the browser bridge, page simplification, CDP control, and practical SOPs. This repository reorganizes and enhances that work for standalone usage and CLI invocation.
+This project is an **unofficial derivative work** and is not affiliated with or endorsed by either upstream project. Thanks to both projects for the browser bridge, page simplification, CDP control, and practical SOPs; changes on top of 0.3.7 are listed under v0.3.8 in [CHANGELOG.md](./CHANGELOG.md).
 
-See [SOURCES.md](./SOURCES.md) for the full list of derived components, specification references, and dependency licenses. The upstream MIT copyright notice and license text are reproduced in [NOTICE](./NOTICE).
+See [SOURCES.md](./SOURCES.md) for the full derivation chain, secondary-development scope, specification references, and dependency licenses. The upstream MIT copyright notices and license text are reproduced in [NOTICE](./NOTICE).
 
 ## AI One-Line Install
 
@@ -47,7 +47,9 @@ See [SOURCES.md](./SOURCES.md) for the full list of derived components, specific
 Please read https://github.com/1728578755/agent-browser-cli/blob/main/AI_INSTALL.md, follow the instructions to install the CLI, load the Chrome extension, and add `skills/agent-browser-cli/SKILL.md`.
 ```
 
-## Improvements
+## Improvements over GenericAgent (0.3.7 baseline)
+
+The items below are changes in the 0.3.7 baseline relative to GenericAgent; this repository's changes on top of 0.3.7 are listed in CHANGELOG.
 
 - Extracted browser control capability from GenericAgent and exposed it as a CLI for Codex, Claude Code, and OpenCode. The GenericAgent browser extension can be reused and does not need to be reinstalled.
 - Avoids reinitializing the browser connection for every command.
@@ -134,7 +136,7 @@ npm install -g @sleepinsummer/agent-browser-cli
 agent-browser-cli tabs
 ```
 
-> The npm scope is `@sleepinsummer` while the GitHub account is `1728578755`; both belong to the same maintainer.
+> **Note**: `@sleepinsummer` is the upstream project's npm scope. This repository does not publish its own npm package yet, so the command above installs upstream 0.3.7. To use this repository's 0.3.8, build from source below.
 
 ### Build From Source
 

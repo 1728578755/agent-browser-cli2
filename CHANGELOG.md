@@ -51,7 +51,7 @@
 - **`manifest.json` 增加 `minimum_chrome_version`**：依赖 `world:'MAIN'`、`storage.session` 与 alarms 的 30s 下限。
 - **测试与夹具**：`tests/mock_extension.mjs`（不依赖 Chrome 的 WebSocket 假扩展与端到端自测，支持 `ABC_CLI=target/release/agent-browser-cli.exe` 指定被测二进制，并断言 `wait` 只注入一次）、`tests/extension_net_intercept.test.mjs`（用 `node:vm` 跑真实 `background.js`，假 `chrome.debugger` 记录 CDP 调用）、`tests/live_xhr_wait.mjs`、`tests/live_cdp_net.mjs`（15 条真机断言）、`tests/live_challenge.mjs`（22 条真机断言）、`tests/gen_huge.mjs`（26 万元素页面）、`tests/concurrency_bench.mjs`、`tests/check_page_script.mjs`，以及 `tests/fixtures/read_hidden.html` / `read_hidden_2.html` / `form.html`。
 - **`docs/FEATURE_STATUS.md`**：记录已实现能力、下一步与边界、实测性能。
-- **来源与许可**：新增 `SOURCES.md`，列明二次开发性质与基线、从 GenericAgent 派生的文件、二次开发新增范围、规范依据与一级依赖许可证；`NOTICE` 收录上游 MIT 版权声明全文；`simphtml_opt.js` 与 `background.js` 文件头标注来源；npm 包同步收录 `SOURCES.md` 与 `NOTICE`。
+- **来源与许可**：新增 `SOURCES.md`，列明直接上游 `sleepinginsummer/agent-browser-cli`（0.3.7）与间接上游 GenericAgent 的派生链、二次开发新增范围、规范依据与一级依赖许可证；`NOTICE` 收录上游 MIT 版权声明全文；`simphtml_opt.js` 与 `background.js` 文件头标注来源；npm 包同步收录 `SOURCES.md` 与 `NOTICE`。
 
 ### 变更
 
