@@ -39,6 +39,8 @@ The browser control capability in this project was extracted and adapted from th
 
 Thanks to the GenericAgent project for the browser bridge, page simplification, CDP control, and practical SOPs. This repository reorganizes and enhances that work for standalone usage and CLI invocation.
 
+See [SOURCES.md](./SOURCES.md) for the full list of derived components, specification references, and dependency licenses. The upstream MIT copyright notice and license text are reproduced in [NOTICE](./NOTICE).
+
 ## AI One-Line Install
 
 ```text

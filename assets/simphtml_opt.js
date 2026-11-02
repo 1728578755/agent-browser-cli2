@@ -1,3 +1,5 @@
+// Derived from GenericAgent's simphtml (MIT, Copyright (c) 2025 lsdefine).
+// See SOURCES.md and NOTICE for the upstream license.
 function optHTML(text_only=false, opts) {
   opts = opts || {};
   // 超大页面上「克隆 + 逐节点 getComputedStyle/getBoundingClientRect」会到秒级，

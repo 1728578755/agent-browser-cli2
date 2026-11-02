@@ -39,6 +39,8 @@
 
 感谢 GenericAgent 项目提供的浏览器桥接、页面简化、CDP 控制和实践 SOP。本仓库在此基础上做了面向独立使用和 CLI 调用的整理与增强。
 
+完整的代码派生清单、规范依据与依赖许可证见 [SOURCES.md](./SOURCES.md)；上游 MIT 版权声明与许可全文见 [NOTICE](./NOTICE)。
+
 ## AI 一句话安装
 
 ```text

@@ -1,4 +1,6 @@
 // background.js - Cookie + CDP Bridge
+// Derived from GenericAgent's tmwd_cdp_bridge / TMWebDriver (MIT, Copyright (c) 2025 lsdefine).
+// See SOURCES.md and NOTICE for the upstream license.
 //
 // manifest.json 的 minimum_chrome_version = 120 的依据（manifest 是纯 JSON，不能写注释，
 // 故把推导过程记在这里）：

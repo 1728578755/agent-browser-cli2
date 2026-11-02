@@ -44,13 +44,14 @@
 - **`trust-extension`**：一条命令维护扩展白名单与握手 token（`<id>` / `--remove` / `--list` / `--clear` / `--token` / `--clear-token`），写入后 daemon 每次握手重新读取，无需重启。属于可选的加固手段。
 - **受控标签页设置 `autoDiscardable:false`**：避免标签页被 Chrome 内存节省机制丢弃。
 - **扩展资源同步**：`scripts/sync-extension-assets.mjs` 提供 `npm run sync:extension` / `npm run check:extension`，`ops/` 与 `assets/` 的同步由脚本完成并有 CI 守卫；改过 `assets/page_*.js` 后必须同步，否则扩展与 `ops/` 内的副本不同源。
-- **`--help` 覆盖**：47 个子命令补齐说明（此前 49 个里只有 2 个有），并区分 `scan` / `read` / `snapshot` 这类易混命令。
+- **`--help` 覆盖**：47 个子命令补齐说明，并区分 `scan` / `read` / `snapshot` 这类易混命令。
 - **扩展版本自检**：`/health` 的 `extension` 段给出 `bundled_version` / `connected_versions` / `stale` / `hint`，`status` 在过期时输出 `warning`，`doctor` 增加 `extension_fresh` 检查项。
 - **扩展自动重载**：每分钟比对 `background.js` 内容哈希，发现磁盘改动就在空闲时 `chrome.runtime.reload()`（首次仍需在 `chrome://extensions` 手动重载一次）；扩展连上来时 daemon 比对版本，低于随包版本直接要求浏览器重载（`management.reload`），无需用户操作。
 - **扩展诊断**：`injectProbe`（分别验证 MAIN world 纯函数、MAIN world eval、ISOLATED world eval）与 `selfCheck`（哈希基线、定时器状态、命令占用）。
 - **`manifest.json` 增加 `minimum_chrome_version`**：依赖 `world:'MAIN'`、`storage.session` 与 alarms 的 30s 下限。
 - **测试与夹具**：`tests/mock_extension.mjs`（不依赖 Chrome 的 WebSocket 假扩展与端到端自测，支持 `ABC_CLI=target/release/agent-browser-cli.exe` 指定被测二进制，并断言 `wait` 只注入一次）、`tests/extension_net_intercept.test.mjs`（用 `node:vm` 跑真实 `background.js`，假 `chrome.debugger` 记录 CDP 调用）、`tests/live_xhr_wait.mjs`、`tests/live_cdp_net.mjs`（15 条真机断言）、`tests/live_challenge.mjs`（22 条真机断言）、`tests/gen_huge.mjs`（26 万元素页面）、`tests/concurrency_bench.mjs`、`tests/check_page_script.mjs`，以及 `tests/fixtures/read_hidden.html` / `read_hidden_2.html` / `form.html`。
 - **`docs/FEATURE_STATUS.md`**：记录已实现能力、下一步与边界、实测性能。
+- **来源与许可**：新增 `SOURCES.md`，列明从 GenericAgent 派生的文件、改造范围、规范依据与一级依赖许可证；`NOTICE` 收录上游 MIT 版权声明全文；`simphtml_opt.js` 与 `background.js` 文件头标注来源；npm 包同步收录 `SOURCES.md` 与 `NOTICE`。
 
 ### 变更
 

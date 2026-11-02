@@ -31,7 +31,9 @@
     "AI_INSTALL.md",
     "CHANGELOG.md",
     "PRIVACY.md",
-    "LICENSE"
+    "LICENSE",
+    "SOURCES.md",
+    "NOTICE"
   ],
   "scripts": {
     "build": "cargo build --release",
