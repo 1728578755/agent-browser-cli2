@@ -1,0 +1,15 @@
+# NOTICE
+
+agent-browser-cli
+Copyright (c) 2026 sleepinginsummer
+
+This product includes software derived from GenericAgent
+(https://github.com/lsdefine/GenericAgent), which is distributed under the
+MIT License. The browser bridge, page simplification and CDP control ideas
+in `assets/tmwd_cdp_bridge/` and `assets/simphtml_*.js` originate from that
+project.
+
+The upstream copyright notice and license text are available in the
+GenericAgent repository. GenericAgent is used here under the terms of the
+MIT License; this notice is provided for attribution and does not modify
+the license of this project.

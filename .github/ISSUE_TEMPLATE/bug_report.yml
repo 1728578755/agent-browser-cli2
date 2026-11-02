@@ -1,0 +1,93 @@
+name: Bug 报告
+description: 报告可复现的缺陷
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈。提交前请先搜索已有 issue（含已关闭的），避免重复。
+
+        为了能定位问题，请尽量把版本信息、`status` 输出和最小复现命令贴全；信息缺失的报告通常只能来回追问，处理会慢很多。
+
+  - type: checkboxes
+    id: searched
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已经搜索过已有 issue，没有找到相同问题
+          required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: 操作系统
+      description: 例如 Windows 11 23H2 / macOS 14.5 / Ubuntu 24.04
+      placeholder: Windows 11 Pro 23H2
+    validations:
+      required: true
+
+  - type: input
+    id: chrome-version
+    attributes:
+      label: Chrome（或 Edge）版本
+      description: 浏览器「关于」页面里的版本号
+      placeholder: 131.0.6778.86
+    validations:
+      required: true
+
+  - type: input
+    id: extension-version
+    attributes:
+      label: 扩展版本
+      description: 扩展管理页显示的版本，或 `agent-browser-cli status` 里的 extension.version
+      placeholder: "3.4"
+    validations:
+      required: true
+
+  - type: textarea
+    id: status-output
+    attributes:
+      label: "`agent-browser-cli status` 输出"
+      description: 直接粘贴完整输出（默认是单行 JSON）
+      render: shell
+      placeholder: '{"ok":true,"daemon":{...},"extension":{...}}'
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: 复现步骤
+      description: 从干净状态开始的最小命令序列；涉及页面时给出可公开访问的 URL
+      render: shell
+      placeholder: |
+        1. agent-browser-cli open https://example.com
+        2. agent-browser-cli click '#submit'
+        3. 期望看到 X，实际是 Y
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望结果
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际结果
+      description: 贴返回的 JSON、退出码和错误信息；有报错栈时一并附上
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: 补充信息（可选）
+      description: 是否只在后台标签页出现、是否装了其他扩展、能否稳定复现等
+    validations:
+      required: false

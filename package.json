@@ -1,0 +1,64 @@
+{
+  "name": "@sleepinsummer/agent-browser-cli",
+  "version": "0.3.8",
+  "description": "Agent-oriented browser sensing and control CLI backed by a native Rust daemon.",
+  "license": "MIT",
+  "keywords": [
+    "browser-automation",
+    "chrome",
+    "cdp",
+    "chrome-extension",
+    "agent",
+    "cli",
+    "rust",
+    "web-scraping"
+  ],
+  "homepage": "https://github.com/sleepinginsummer/agent-browser-cli#readme",
+  "bugs": {
+    "url": "https://github.com/sleepinginsummer/agent-browser-cli/issues"
+  },
+  "bin": {
+    "agent-browser-cli": "npm/bin/agent-browser-cli.js"
+  },
+  "files": [
+    "npm/bin",
+    "npm/postinstall.js",
+    "assets",
+    "skills",
+    "docs",
+    "README.md",
+    "README_EN.md",
+    "AI_INSTALL.md",
+    "CHANGELOG.md",
+    "PRIVACY.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "cargo build --release",
+    "version": "node scripts/sync-optional-deps.mjs && node scripts/sync-version.mjs && git add package.json package-lock.json Cargo.toml README.md README_EN.md",
+    "sync-version": "node scripts/sync-version.mjs",
+    "sync:extension": "node scripts/sync-extension-assets.mjs",
+    "check:extension": "node scripts/sync-extension-assets.mjs --check",
+    "bench": "node tests/concurrency_bench.mjs",
+    "prepack": "node scripts/sync-optional-deps.mjs && node scripts/sync-extension-assets.mjs",
+    "postinstall": "node npm/postinstall.js"
+  },
+  "optionalDependencies": {
+    "@sleepinsummer/agent-browser-cli-darwin-arm64": "0.3.8",
+    "@sleepinsummer/agent-browser-cli-darwin-x64": "0.3.8",
+    "@sleepinsummer/agent-browser-cli-linux-x64": "0.3.8",
+    "@sleepinsummer/agent-browser-cli-linux-arm64": "0.3.8",
+    "@sleepinsummer/agent-browser-cli-win32-x64": "0.3.8"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sleepinginsummer/agent-browser-cli"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

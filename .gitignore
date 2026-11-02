@@ -1,0 +1,41 @@
+# Build / packaging
+target/
+build/
+dist/
+npm/platform/
+node_modules/
+*.tgz
+
+# Local environment
+.env
+.env.*
+!.env.example
+
+# Runtime files
+*.log
+.agent-browser-cli.log
+.agent-browser-cli.lock
+daemon.lock
+task.md
+
+# Test output
+coverage/
+*.snap
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Agent / workspace metadata
+.workbuddy/
+.agents/
+.claude/
+.cursor/
+
+# Local drafts and archives
+*.bak
+*.bak-*
+*.orig
+*.zip

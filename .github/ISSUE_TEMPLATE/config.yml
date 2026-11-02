@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 报告安全漏洞
+    url: https://github.com/sleepinginsummer/agent-browser-cli/security/advisories/new
+    about: 安全问题请走私密渠道，不要开公开 issue。

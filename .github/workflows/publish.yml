@@ -1,0 +1,362 @@
+name: Publish npm
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  publish-binaries:
+    name: Publish ${{ matrix.name }}
+    if: ${{ !contains(github.ref_name, '-extension') }}
+    needs: version-check
+    runs-on: ${{ matrix.os }}
+    environment: npm
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: darwin-arm64
+            os: macos-14
+            target: aarch64-apple-darwin
+            binary: agent-browser-cli
+          - name: darwin-x64
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            binary: agent-browser-cli
+          - name: linux-x64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            binary: agent-browser-cli
+          - name: linux-arm64
+            os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            binary: agent-browser-cli
+          - name: win32-x64
+            os: windows-2022
+            target: x86_64-pc-windows-msvc
+            binary: agent-browser-cli.exe
+          # win32-arm64（aarch64-pc-windows-msvc）故意不在这里：没有真实 ARM runner 持续验证的
+          # 构建矩阵，不如不承诺——发布一个从未构建过的包会让用户装成功、运行时才炸。
+          # 该平台的用户走 npm/bin 里给出的"cargo build --release + AGENT_BROWSER_CLI_BIN"路径。
+          # 若将来要补：这里加 aarch64-pc-windows-msvc、package.json 加 optionalDependencies、
+          # npm/bin 的 platformPackageName 加分支、scripts/sync-optional-deps.mjs 的 packages
+          # 数组加一项、mirror-sync 的 packages 数组加一项，五处必须一起改。
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: Upgrade npm
+        shell: bash
+        run: npm install -g npm@11.5.1
+
+      - name: Build binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Stage platform package
+        run: node scripts/package-platform.mjs ${{ matrix.name }} target/${{ matrix.target }}/release/${{ matrix.binary }}
+
+      - name: Pack platform package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/npm
+          npm pack "npm/platform/${{ matrix.name }}" --pack-destination dist/npm
+
+      - name: Publish platform package
+        shell: bash
+        working-directory: npm/platform/${{ matrix.name }}
+        run: |
+          set -euo pipefail
+          PACKAGE_NAME=$(node -p "require('./package.json').name")
+          PACKAGE_VERSION=$(node -p "require('./package.json').version")
+          if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
+            NPM_TAG="${NPM_TAG:-beta}"
+          else
+            NPM_TAG="${NPM_TAG:-latest}"
+          fi
+          if npm publish --access public --tag "${NPM_TAG}"; then
+            exit 0
+          fi
+          if [ "$(npm view "${PACKAGE_NAME}@${PACKAGE_VERSION}" version 2>/dev/null || true)" = "${PACKAGE_VERSION}" ]; then
+            echo "${PACKAGE_NAME}@${PACKAGE_VERSION} already published, skip"
+            exit 0
+          fi
+          exit 1
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-browser-cli-${{ matrix.name }}
+          path: target/${{ matrix.target }}/release/${{ matrix.binary }}
+
+      - name: Upload npm package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-${{ matrix.name }}
+          path: dist/npm/*.tgz
+
+  publish-main:
+    name: Publish main package
+    if: ${{ !contains(github.ref_name, '-extension') }}
+    runs-on: ubuntu-latest
+    environment: npm
+    needs: publish-binaries
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: Upgrade npm
+        run: npm install -g npm@11.5.1
+
+      - name: Publish main package
+        shell: bash
+        run: |
+          set -euo pipefail
+          PACKAGE_NAME=$(node -p "require('./package.json').name")
+          PACKAGE_VERSION=$(node -p "require('./package.json').version")
+          if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
+            NPM_TAG="${NPM_TAG:-beta}"
+          else
+            NPM_TAG="${NPM_TAG:-latest}"
+          fi
+          if npm publish --access public --tag "${NPM_TAG}"; then
+            exit 0
+          fi
+          if [ "$(npm view "${PACKAGE_NAME}@${PACKAGE_VERSION}" version 2>/dev/null || true)" = "${PACKAGE_VERSION}" ]; then
+            echo "${PACKAGE_NAME}@${PACKAGE_VERSION} already published, skip"
+            exit 0
+          fi
+          exit 1
+
+  github-release:
+    name: GitHub Release
+    needs: publish-binaries
+    runs-on: ubuntu-latest
+    if: ${{ always() && startsWith(github.ref, 'refs/tags/') && (needs.publish-binaries.result == 'success' || needs.publish-binaries.result == 'skipped') }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download binary artifacts
+        if: ${{ !contains(github.ref_name, '-extension') }}
+        uses: actions/download-artifact@v4
+        with:
+          pattern: agent-browser-cli-*
+          path: dist/bin
+          merge-multiple: true
+
+      - name: Download npm package artifacts
+        if: ${{ !contains(github.ref_name, '-extension') }}
+        uses: actions/download-artifact@v4
+        with:
+          pattern: npm-*
+          path: dist/npm
+          merge-multiple: true
+
+      - name: Package Chrome extension
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          rm -f dist/chrome-extensions.zip
+          # 压缩包根目录直接放扩展文件，拖入浏览器扩展页即可安装。
+          (cd assets/tmwd_cdp_bridge && zip -r ../../dist/chrome-extensions.zip .)
+
+      - name: Create release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          release_assets=()
+          if [ -d dist/bin ]; then
+            while IFS= read -r file; do release_assets+=("${file}"); done < <(find dist/bin -type f | sort)
+          fi
+          if [ -d dist/npm ]; then
+            while IFS= read -r file; do release_assets+=("${file}"); done < <(find dist/npm -type f -name '*.tgz' | sort)
+          fi
+          extension_package="dist/chrome-extensions.zip"
+          release_assets+=("${extension_package}")
+          TAG_MESSAGE="$(git tag -l --format='%(contents)' "${GITHUB_REF_NAME}" | sed '/-----BEGIN PGP SIGNATURE-----/,$d' | sed '${/^$/d;}')"
+          # push tag 时 GitHub 可能自动生成 draft release（body 预填 commit subject），
+          # gh release create 会复用该 draft 发布，导致 --notes-file 不生效，这里先删除。
+          if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" --jq '.draft' 2>/dev/null | grep -q '^true$'; then
+            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" >/dev/null
+            echo "Removed auto-created draft release for ${GITHUB_REF_NAME}"
+          fi
+          if [[ "${GITHUB_REF_NAME}" == *-extension ]]; then
+            DEFAULT_NOTES="Chrome extension and skill update only. npm packages are unchanged."
+          else
+            DEFAULT_NOTES="Rust/npm native release for macOS, Linux, and Windows."
+          fi
+          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            EXISTING_NOTES="$(gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --json body --jq '.body // ""')"
+            if [ -n "${TAG_MESSAGE}" ] && ! grep -Fq "${TAG_MESSAGE}" <<<"${EXISTING_NOTES}"; then
+              {
+                printf '%s\n' "${EXISTING_NOTES}"
+                [ -n "${EXISTING_NOTES}" ] && printf '\n'
+                printf '%s\n' "${TAG_MESSAGE}"
+              } > release-notes.md
+              gh release edit "${GITHUB_REF_NAME}" \
+                --repo "${GITHUB_REPOSITORY}" \
+                --notes-file release-notes.md
+            fi
+            gh release upload "${GITHUB_REF_NAME}" "${release_assets[@]}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --clobber
+          else
+            if [ -n "${TAG_MESSAGE}" ]; then
+              printf '%s\n' "${TAG_MESSAGE}" > release-notes.md
+            else
+              printf '%s\n' "${DEFAULT_NOTES}" > release-notes.md
+            fi
+            release_flags=()
+            if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
+              release_flags+=(--prerelease)
+            fi
+            gh release create "${GITHUB_REF_NAME}" "${release_assets[@]}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "${GITHUB_REF_NAME}" \
+              --notes-file release-notes.md \
+              "${release_flags[@]}"
+          fi
+
+  mirror-sync:
+    name: Sync npmmirror
+    # Chrome 扩展标签不发 npm 包，不需要同步镜像
+    if: ${{ !contains(github.ref_name, '-extension') }}
+    needs: publish-main
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Trigger npmmirror sync
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 淘宝镜像按包独立抓取上游，历史上出现过单个平台子包漏抓。
+          # 主包 optionalDependencies 强制要求同一版本，子包缺失时 npm 会静默跳过该依赖，
+          # 于是 Windows 用户安装"成功"、运行时才报 native binary not found。
+          # 这里发布后对主包和 5 个平台子包逐个触发回源同步。
+          base=$(node -p "require('./package.json').name")
+          packages=(
+            "${base}"
+            "${base}-darwin-arm64"
+            "${base}-darwin-x64"
+            "${base}-linux-x64"
+            "${base}-linux-arm64"
+            "${base}-win32-x64"
+          )
+          for pkg in "${packages[@]}"; do
+            encoded="${pkg//\//%2F}"
+            triggered=0
+            for attempt in 1 2 3; do
+              code=$(curl -sS -o /tmp/sync.json -w '%{http_code}' -X PUT \
+                -H 'Content-Type: application/json' -d '{}' \
+                "https://registry.npmmirror.com/-/package/${encoded}/syncs")
+              if [[ "${code}" == 2* ]]; then
+                echo "${pkg}: 已入队 $(cat /tmp/sync.json)"
+                triggered=1
+                break
+              fi
+              echo "${pkg}: HTTP ${code}，第 ${attempt} 次触发失败"
+              sleep 5
+            done
+            if [[ "${triggered}" != 1 ]]; then
+              echo "::warning::${pkg} 触发镜像同步失败，可稍后手动重试"
+            fi
+          done
+
+      - name: Wait for npmmirror to serve the new version
+        shell: bash
+        run: |
+          set -euo pipefail
+          base=$(node -p "require('./package.json').name")
+          version=$(node -p "require('./package.json').version")
+          packages=(
+            "${base}"
+            "${base}-darwin-arm64"
+            "${base}-darwin-x64"
+            "${base}-linux-x64"
+            "${base}-linux-arm64"
+            "${base}-win32-x64"
+          )
+          summary='/tmp/mirror-sync.md'
+          printf '| 包 | 结果 |\n|---|---|\n' > "${summary}"
+          failed=0
+          for pkg in "${packages[@]}"; do
+            synced=0
+            # 镜像同步实测约 2 分钟落库，最多等 5 分钟（10 次 x 30s）
+            for attempt in $(seq 1 10); do
+              if [[ "$(npm view "${pkg}@${version}" version --registry=https://registry.npmmirror.com 2>/dev/null || true)" == "${version}" ]]; then
+                synced=1
+                break
+              fi
+              sleep 30
+            done
+            if [[ "${synced}" == 1 ]]; then
+              echo "${pkg}@${version} 镜像已同步"
+              printf '| %s | 已同步 |\n' "${pkg}" >> "${summary}"
+            else
+              echo "::warning::${pkg}@${version} 等待 5 分钟仍未出现在 npmmirror，稍后会自行重试"
+              printf '| %s | 未确认（镜像可能延迟） |\n' "${pkg}" >> "${summary}"
+              failed=1
+            fi
+          done
+          cat "${summary}" >> "${GITHUB_STEP_SUMMARY}"
+          # 镜像状态不影响发布结果，只告警不失败
+          if [[ "${failed}" == 1 ]]; then
+            echo "::warning::部分包在 npmmirror 上未确认同步，建议手动检查"
+          fi
+
+  version-check:
+    name: Version consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Check package.json / Cargo.toml / tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Cargo.toml 落后于 package.json 时，二进制自报版本会和发布版本不一致，
+          # 这类漂移必须在发布前拦住，而不是等用户发现。
+          if [[ "${{ github.ref }}" != refs/tags/* ]]; then
+            node scripts/sync-version.mjs --check
+            echo "非 tag 触发，仅校验 package.json 与 Cargo.toml"
+            exit 0
+          fi
+          tag="${{ github.ref_name }}"
+          tag="${tag#v}"
+          if [[ "${tag}" == *-extension ]]; then
+            echo "extension tag 不发 npm 包，跳过版本校验"
+            exit 0
+          fi
+          node scripts/sync-version.mjs --check --expect "${tag}"

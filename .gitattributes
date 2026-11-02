@@ -1,0 +1,10 @@
+* text=auto eol=lf
+
+*.png binary
+
+# 页面脚本要与 ops/ 副本逐字节比对，两边都禁止换行转换
+assets/page_*.js -text
+assets/tmwd_cdp_bridge/ops/page_*.js -text
+
+# 依赖锁文件只用于可复现构建，不进入 review diff
+Cargo.lock -diff

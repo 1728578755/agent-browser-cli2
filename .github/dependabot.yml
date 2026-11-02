@@ -1,0 +1,22 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    ignore:
+      # 平台二进制包由 scripts/sync-optional-deps.mjs 生成，版本跟随根包，不接受单独升级
+      - dependency-name: "@sleepinsummer/agent-browser-cli-*"
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5

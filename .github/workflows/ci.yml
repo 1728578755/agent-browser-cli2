@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      # 不带 -D warnings 时 clippy 只打印告警、退出码仍是 0，
+      # 静态检查就退化成日志里的建议。
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo check --all-targets
+      - run: cargo test --all-targets --all-features
+
+  extension:
+    name: Chrome extension syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: node --check assets/tmwd_cdp_bridge/background.js
+      - run: node --check assets/tmwd_cdp_bridge/content.js
+      - run: node --check assets/tmwd_cdp_bridge/popup.js
+      - run: node --check assets/tmwd_cdp_bridge/persist_boot.js
+
+  node-tests:
+    name: Node tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      # package.json 与 package-lock.json 必须同步：lock 版本漂移或平台条目缺 version
+      # 都会让下游的 npm ci 直接以 EUSAGE 失败。这里只 dry-run，不装依赖。
+      - name: lock 与 package.json 一致性（npm ci --dry-run）
+        run: npm ci --dry-run
+
+      # 扩展里内联的页面脚本是字符串，语法错误只有 eval 时才炸，单独校验。
+      - name: 页面脚本可解析且入口齐全
+        run: node tests/check_page_script.mjs
+
+      # assets/page_*.js 与 ops/ 副本必须逐字节一致。
+      - name: 扩展注入资源一致性
+        run: node tests/asset_parity.test.mjs
+
+      # hook 的 routes 是计数、routes_list 才是数组。
+      - name: page_net 返回字段契约
+        run: node tests/page_net_contract.test.mjs
+
+      # 读不到原始响应体时不得用空 body 顶替。
+      - name: 响应改写必须放行原响应
+        run: node tests/net_response_rewrite.test.mjs
+
+      - name: 网络拦截（CDP Fetch 域）
+        run: node tests/extension_net_intercept.test.mjs
+
+      - name: CSP 策略 + 可选 API 加载
+        run: node tests/extension_csp_policy.test.mjs
+
+      # Fetch 暂停后必须续传，否则页面请求永久挂起。
+      - name: Fetch 续传不变式
+        run: node tests/fetch_pause_invariant.test.mjs
+
+      # 退出码是唯一的机器可读信号。
+      - name: CLI 退出码契约
+        run: node tests/cli_contract.test.mjs
+
+      # net routes 是只读命令，不得把整份 config 当 cdp 规则下发。
+      - name: net routes 只读性
+        run: node tests/net_routes_idempotent.test.mjs
+
+      - name: 扩展资源同步校验
+        run: npm run check:extension
+
+  # E2E 自检：起真 daemon + 假扩展，占 18766/18767 端口。
+  # 必须单 job 单步骤串行跑，并行会互相抢端口，产生假红/假绿。
+  e2e:
+    name: E2E（假扩展 + 真 daemon）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: cargo build
+      - name: 自检（脚本自带端口体检与 finally 清理）
+        run: node tests/mock_extension.mjs --self-test
