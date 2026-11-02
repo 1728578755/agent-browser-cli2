@@ -83,6 +83,9 @@ jobs:
       - name: Publish platform package
         shell: bash
         working-directory: npm/platform/${{ matrix.name }}
+        env:
+          # 首次发布必须用 token；包存在后可切换到 npm trusted publishing（OIDC）
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
           PACKAGE_NAME=$(node -p "require('./package.json').name")
@@ -134,6 +137,8 @@ jobs:
 
       - name: Publish main package
         shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
           PACKAGE_NAME=$(node -p "require('./package.json').name")
