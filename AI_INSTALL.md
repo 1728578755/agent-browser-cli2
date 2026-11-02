@@ -69,7 +69,7 @@ cargo build --release
 ```bash
 EXT_PARENT="$HOME/agent-browser-cli-extension"
 mkdir -p "$EXT_PARENT"
-ZIP_URL="$(curl -fsSL https://api.github.com/repos/sleepinginsummer/agent-browser-cli/releases/latest | grep -o '"browser_download_url": "[^"]*chrome-extensions.zip"' | head -n 1 | cut -d '"' -f 4)"
+ZIP_URL="$(curl -fsSL https://api.github.com/repos/1728578755/agent-browser-cli/releases/latest | grep -o '"browser_download_url": "[^"]*chrome-extensions.zip"' | head -n 1 | cut -d '"' -f 4)"
 curl -fL "$ZIP_URL" -o "$EXT_PARENT/chrome-extensions.zip"
 unzip -o "$EXT_PARENT/chrome-extensions.zip" -d "$EXT_PARENT"
 ```
