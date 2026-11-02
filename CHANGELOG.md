@@ -55,6 +55,7 @@
 
 ### 变更
 
+- **商店构建**：新增 `STORE_BUILD` 开关，商店包关闭 `exec` / `inject`（不执行运行期下发的代码），其余命令与 GitHub 发行版一致；源码与发行版保持完整功能。
 - **仓库与 npm 包名**：GitHub 仓库改为 `agent-browser-cli2`；npm 包名与 5 个平台子包由上游作用域 `@sleepinsummer/agent-browser-cli*` 改为 `agent-browser-cli2*`；安装后主命令仍为 `agent-browser-cli`，并新增 `agent-browser-cli2` 别名。
 - **Windows 平台子包名**：使用 `agent-browser-cli2-windows-x64`（`win32-x64` 命名被 npm 垃圾检测误拦），安装与解析逻辑同步。
 - **退出码契约统一（会 break 脚本）**：`ok:false` 一律非 0，设置 `AGENT_BROWSER_CLI_EXIT0=1` 可恢复旧的「恒 0」行为。具体落地：

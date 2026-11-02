@@ -10,6 +10,16 @@
 //     的节奏依赖这个下限）；
 //   - 另外 chrome.cookies.getAll({partitionKey}) 需要 119+，已被 120 覆盖。
 // 取三者（111 / 102 / 120）的最大值 = 120。
+// 商店构建开关。
+//
+// Chrome 应用商店的 MV3 政策要求扩展逻辑自包含：不得执行运行期从外部取到的代码，
+// 只有 Debugger API 与 User Scripts API 属于豁免通道。`exec` / `inject` 会把本机 CLI
+// 下发的 JS 字符串交给 eval 执行，因此**商店包关闭这两个命令**，其余命令全部保留。
+//
+// 仓库源码与 GitHub 发行版保持 false（功能完整）；构建商店 zip 时由构建脚本改写为 true，
+// 两者除这一行外完全相同。
+const STORE_BUILD = false;
+
 const LEGACY_CSP_RULE_ID = 9999;
 
 async function removeLegacyCspRule() {
@@ -342,6 +352,15 @@ async function readPersistInjections() {
 async function handleInject(msg) {
   const action = String(msg.action || 'run');
   const world = msg.world === 'ISOLATED' ? 'ISOLATED' : 'MAIN';
+
+  if (STORE_BUILD && action !== 'list' && action !== 'remove') {
+    return {
+      ok: false,
+      error:
+        'exec / inject 不包含在 Chrome 应用商店版本中：该版本不执行运行期下发的代码。' +
+        '改用 read / find / click / fill / snapshot 等固定命令，或从 GitHub 发行版安装完整扩展'
+    };
+  }
 
   if (action === 'list') {
     // 只读：不进锁，避免被一次正在进行的写挡住。
