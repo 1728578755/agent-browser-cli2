@@ -172,7 +172,27 @@ jobs:
         with:
           pattern: agent-browser-cli-*
           path: dist/bin
-          merge-multiple: true
+
+      - name: Normalize binary names
+        if: ${{ !contains(github.ref_name, '-extension') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/release
+          # 每个 artifact 目录里都是同名 agent-browser-cli(.exe)，直接合并会互相覆盖。
+          # 这里按 artifact 名（即平台名）重命名，Release 才能区分架构。
+          for dir in dist/bin/agent-browser-cli-*; do
+            [ -d "$dir" ] || continue
+            name="$(basename "$dir")"
+            for file in "$dir"/*; do
+              base="$(basename "$file")"
+              case "$base" in
+                *.exe) cp "$file" "dist/release/${name}.exe" ;;
+                *) cp "$file" "dist/release/${name}" ;;
+              esac
+            done
+          done
+          ls -l dist/release
 
       - name: Download npm package artifacts
         if: ${{ !contains(github.ref_name, '-extension') }}
@@ -198,8 +218,8 @@ jobs:
         run: |
           set -euo pipefail
           release_assets=()
-          if [ -d dist/bin ]; then
-            while IFS= read -r file; do release_assets+=("${file}"); done < <(find dist/bin -type f | sort)
+          if [ -d dist/release ]; then
+            while IFS= read -r file; do release_assets+=("${file}"); done < <(find dist/release -type f | sort)
           fi
           if [ -d dist/npm ]; then
             while IFS= read -r file; do release_assets+=("${file}"); done < <(find dist/npm -type f -name '*.tgz' | sort)
