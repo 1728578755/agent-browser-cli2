@@ -13,7 +13,7 @@
 
 执行要求：
 1. 先做前置检查并告诉我结果：操作系统与 CPU 架构、node -v、npm -v、Chrome/Edge 版本、PATH 上是否已有 atb 及其版本、~/.atb 是否已存在。
-2. 安装 CLI 优先用 npm install -g @g1728578755/atb@latest；只有预编译包缺失或安装失败时才回退到源码构建 cargo build --release，并用 ATB_BIN 指向产物。
+2. 安装 CLI 优先用 npm install -g @g1728578755/atb@latest；npm 上还没有该版本（404）或预编译包缺失时，回退到源码构建 cargo build --release，并用 ATB_BIN 指向产物。两种方式都失败再停下来汇报。
 3. 安装扩展前先问我：解压目录放在哪里。从 GitHub 最新 Release 下载 chrome-extensions.zip，解压后扩展文件直接位于该目录（manifest.json、background.js、content.js 在同一层，没有再套一层 atb_bridge）。指导我在 chrome://extensions 开启开发者模式、加载已解压的扩展程序，选择这个直接包含 manifest.json 的目录。如果之前装过，必须在扩展卡片上点“重新加载”。
 4. 安装 skill 前先问我是否需要安装、装给哪些 Agent。先运行 atb install-skill --dry-run，把输出原样贴给我，我确认后再执行 atb install-skill；不要用 --yes 跳过确认。
 5. 验证依次运行：atb tabs --pretty、atb status --pretty、atb doctor、atb open https://example.com --pretty、atb read --tab <tabId> --pretty。先跑 tabs 是为了自动拉起 daemon；直接先跑 status 会得到 daemon_not_running，这不是安装失败。把完整 JSON 贴给我。成功判据：tabs 的 count 大于 0；status 的 healthy 为 true 且 summary 为 ready；open 返回 targets[0].tab_id；read 返回非空 title 或 text。
