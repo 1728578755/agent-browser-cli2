@@ -89,7 +89,7 @@ npm i -g @g1728578755/atb
 atb status
 ```
 
-预编译二进制按平台从 `optionalDependencies` 安装，不需要 Rust 工具链。npm 包只提供一个命令名 `atb`。若 npm 源上还没有该版本，用下面的 Release 产物或源码构建。
+预编译二进制按平台从 `optionalDependencies` 安装，不需要 Rust 工具链。npm 包只提供一个命令名 `atb`。npm 主包目前处于发布审核（staged）状态，审核通过前请用下面的 Release 产物或源码构建。
 
 ### 源码构建
 
