@@ -9,6 +9,10 @@ updates:
       # 一次升级合成一个 PR：单个 crate 一条 PR 会把仓库刷屏，也难判断兼容性。
       cargo:
         patterns: ["*"]
+    ignore:
+      # 大版本升级需要人工评估 API 变更，不交给机器人直接开 PR。
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: npm
     directory: "/"
@@ -30,3 +34,6 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
