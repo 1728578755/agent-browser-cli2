@@ -89,7 +89,7 @@ npm i -g @g1728578755/atb
 atb status
 ```
 
-Prebuilt binaries come from `optionalDependencies` per platform, so no Rust toolchain is required. The npm package exposes a single command name, `atb`. The main package is currently held in npm staged publishing; until it is approved, use the Release artifacts or build from source below.
+Prebuilt binaries come from `optionalDependencies` per platform, so no Rust toolchain is required. The npm package exposes a single command name, `atb`.
 
 ### Build from source
 
