@@ -207,7 +207,6 @@ impl TargetSpec {
             TargetSpec::Ids(ids) => ids.join(","),
         }
     }
-
 }
 
 fn strip_prefix_ci<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {

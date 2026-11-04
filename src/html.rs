@@ -284,7 +284,6 @@ pub fn smart_truncate(html: String, budget: usize) -> String {
     result
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

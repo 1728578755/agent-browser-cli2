@@ -349,7 +349,7 @@ export function startMockExtension({ waitForReady = true, port = DEFAULT_EXT_POR
         /* 用默认值 */
       }
       const base = { ok: true, title: "Mock Page", url: tab?.url || "https://mock.local/" };
-      // 每个场景的 status 形状决定 daemon 走快路径还是进 wait 循环（src/server.rs 的
+      // 每个场景的 status 形状决定 daemon 走快路径还是进 wait 循环（src/server/challenge.rs 的
       // `!blocking && (token_ready || !interactive)`）：
       //   cleared         → 命中快路径，via='no-challenge'、injections=0、challenge=status payload
       //   widget-cleared  → 卡住快路径（interactive && !token_ready），循环里 wait 不带 via → 兜成 'clear'
@@ -1329,7 +1329,13 @@ function runSelfTest() {
     result = await run(["challenge", "solve", "--tab", tabId, "--timeout", "6"]);
     const chSolveToken = result.json?.result || {};
     assert(chSolveToken.passed === true && chSolveToken.via === "token", "拿到令牌时 via=token", chSolveToken);
-    assert(chSolveToken.injections >= 1, "token 场景 blocking=true 卡住快路径，必走循环", chSolveToken.injections);
+    // blocking=true 必须挡住「无挑战」快路径；但页面已经给出 token 时，求解循环会在
+    // 状态复查阶段直接收工（auto_solve.clicks=0、injections=0），这是预期行为。
+    assert(
+      chSolveToken.auto_solve?.via === "token",
+      "token 场景不得走无挑战快路径，应由求解循环判定已拿到令牌",
+      chSolveToken,
+    );
 
     // 验证码一直没完成：必须 passed=false，且不得出现 passed=true（假通过回归点）。
     mock.state.challengeScenario = "timeout";

@@ -169,7 +169,7 @@ pub(crate) async fn batch_cdp_call(
     };
     let raw = response.data.or(response.result).unwrap_or(Value::Null);
     // 兼容「裸数组」回包：部分旧扩展 / 页面注入通道直接返回 `results` 数组本身，
-    // 没有 `{ok, results, failed}` 外壳。先补壳再走同一套校验，既不放松 
+    // 没有 `{ok, results, failed}` 外壳。先补壳再走同一套校验，既不放松
     // 的条数/index 检查，也不会把正常回包误判成协议错误。
     let value = if let Some(array) = raw.as_array() {
         let failed = array

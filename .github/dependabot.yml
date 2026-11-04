@@ -4,13 +4,20 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 3
+    groups:
+      # 一次升级合成一个 PR：单个 crate 一条 PR 会把仓库刷屏，也难判断兼容性。
+      cargo:
+        patterns: ["*"]
 
   - package-ecosystem: npm
     directory: "/"
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 2
+    groups:
+      npm:
+        patterns: ["*"]
     ignore:
       # 平台子包由 scripts/package-platform.mjs 在发布时生成，跟随主包版本。
       - dependency-name: "@g1728578755/atb-*"
@@ -19,4 +26,7 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 2
+    groups:
+      actions:
+        patterns: ["*"]
