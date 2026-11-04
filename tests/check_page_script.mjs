@@ -7,7 +7,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const source = fs.readFileSync(path.join(here, "..", "assets", "tmwd_cdp_bridge", "background.js"), "utf8");
+const source = fs.readFileSync(path.join(here, "..", "assets", "atb_bridge", "background.js"), "utf8");
 
 function extract(name, nextName) {
   const start = source.indexOf(`function ${name}`);
@@ -58,12 +58,13 @@ if (failed) {
 // 它们依赖 DOM，无法在 Node 里完整执行；但模板串里的语法错误能在这里提前发现。
 const assetChecks = [
   { file: "page_read.js", entry: "__abcRead" },
-  { file: "page_find.js", entries: ["__abcFind", "__abcCssPath", "__abcVisible"] },
+  { file: "page_find.js", entries: ["__abcFind", "__abcCssPath", "__abcFindVisible", "__abcMaskValue"] },
   { file: "page_action.js", entries: ["__abcAct", "__abcResolve", "__abcDispatch"] },
   { file: "page_snapshot.js", entries: ["__abcSnapshot", "__abcSnapCssPath", "__abcSnapRole"] },
   { file: "page_net.js", entries: ["__abcNet"] },
   { file: "page_wait.js", entries: ["__abcWait"] },
-  { file: "tmwd_cdp_bridge/persist_boot.js", entries: [] },
+  { file: "page_stealth.js", entries: ["__abcStealth"] },
+  { file: "atb_bridge/persist_boot.js", entries: [] },
 ];
 for (const check of assetChecks) {
   const source = fs.readFileSync(path.join(here, "..", "assets", check.file), "utf8");

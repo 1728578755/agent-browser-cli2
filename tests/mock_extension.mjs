@@ -19,7 +19,20 @@ const DEFAULT_EXT_PORT = Number(process.env.EXT_PORT || 18765);
 const ORIGIN = "chrome-extension://" + "a".repeat(32);
 const BROWSER_ID = "browser-mock";
 const PROFILE_ID = "profile-mock";
-const EXT_VERSION = "3.4";
+// 假扩展必须跟**磁盘上的真实清单**同版本：daemon 的 `extension.stale` 是用
+// 「连接方上报的版本 vs 编译进二进制的 manifest 版本」比出来的，写死一个常量
+// 会在清单升级后立刻变成「版本不一致」的假红（曾经写死 3.4，清单已经是 5.x）。
+const EXT_VERSION = (() => {
+  try {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const manifest = JSON.parse(
+      fs.readFileSync(path.join(here, "..", "assets", "atb_bridge", "manifest.json"), "utf8"),
+    );
+    return String(manifest.version || "0");
+  } catch {
+    return "0";
+  }
+})();
 
 class WsClient {
   constructor(socket) {
@@ -233,13 +246,19 @@ export function startMockExtension({ waitForReady = true, port = DEFAULT_EXT_POR
       return state.polls >= state.waitAfter;
     }
     if (/__abcNet\(/.test(code)) {
-      // 只解析最后一次 `__abcNet({...})` 的实参：脚本源码里也有 action: 'log' 之类的字样。
-      const call = code.match(/__abcNet\((\{[\s\S]*\})\);\s*$/);
+      // 取**最后一次** `__abcNet({...})` 的实参。
+      //
+      // 不能用 `match(...$/greedy)`：page_net.js 的注释里就写着 `return __abcNet({})`，
+      // 贪婪匹配会从注释那处一路吞到文件末尾，JSON.parse 必然失败 → 所有 action 都
+      // 退化成 fetch（自检里 net route/log 全部假红）。这里用非贪婪 + 取最后一次。
+      const calls = [...code.matchAll(/__abcNet\((\{[\s\S]*?\})\)/g)];
       let netOpts = {};
-      try {
-        netOpts = call ? JSON.parse(call[1]) : {};
-      } catch {
-        netOpts = {};
+      if (calls.length) {
+        try {
+          netOpts = JSON.parse(calls[calls.length - 1][1]);
+        } catch {
+          netOpts = {};
+        }
       }
       const netAction = String(netOpts.action || "fetch");
       const isLog = netAction === "log";
@@ -256,7 +275,7 @@ export function startMockExtension({ waitForReady = true, port = DEFAULT_EXT_POR
         };
       }
       if (isHook) {
-        // 真实 page_net 的 hook 回包同时给计数与真实数组（的回归点：
+        // 真实 page_net 的 hook 回包同时给计数与真实数组（回归点：
         // daemon 必须持久化 routes_list，而不是把计数当规则存进去）。
         if (Array.isArray(netOpts.routes)) state.netRoutes = netOpts.routes.slice();
         return {
@@ -428,7 +447,7 @@ export function startMockExtension({ waitForReady = true, port = DEFAULT_EXT_POR
           elapsed_ms: Math.max(1, focusAfterMs),
         };
       }
-      // 默认落到 timeout：验证码一直没完成（/假通过的回归场景）。
+      // 默认落到 timeout：验证码一直没完成（假通过的回归场景）。
       return {
         ...base,
         action: "wait",
@@ -826,19 +845,21 @@ function runSelfTest() {
   // 或建好 release 后想直接验 release 时用：ABC_CLI=target/release/... node tests/mock_extension.mjs --self-test
   const bin = process.env.ABC_CLI
     ? path.resolve(repo, process.env.ABC_CLI)
-    : path.join(repo, "target", "debug", process.platform === "win32" ? "agent-browser-cli.exe" : "agent-browser-cli");
+    : path.join(repo, "target", "debug", process.platform === "win32" ? "atb.exe" : "atb");
   if (!fs.existsSync(bin)) {
     console.error(`缺少调试二进制: ${bin}\n先运行 cargo build`);
     process.exit(2);
   }
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "abc-home-"));
   const mockPort = Number(process.env.MOCK_EXT_PORT || 18766);
-  fs.mkdirSync(path.join(home, ".agent-browser-cli"), { recursive: true });
+  fs.mkdirSync(path.join(home, ".atb"), { recursive: true });
   fs.writeFileSync(
-    path.join(home, ".agent-browser-cli", "config.json"),
+    path.join(home, ".atb", "config.json"),
     JSON.stringify({ extension_port: mockPort }),
   );
-  const env = { ...process.env, HOME: home, USERPROFILE: home };
+  // ATB_HOME 是 cfg 侧显式支持的配置目录覆盖：Windows 上改 HOME/USERPROFILE 无效
+  // （dirs::home_dir 走 Known Folder API），不设它就会连到真实 daemon 的端口上。
+  const env = { ...process.env, HOME: home, USERPROFILE: home, ATB_HOME: path.join(home, ".atb") };
   // 必须用异步 spawn：spawnSync 会阻塞 Node 事件循环，假扩展就无法响应 daemon 的命令，
   // 真实的智能体调用也是异步子进程，这里保持一致。
   const run = (args, timeout = 60000) =>
@@ -888,7 +909,7 @@ function runSelfTest() {
       if (await portBusy(port)) {
         console.error(
           `端口 ${port} 已被占用：大概有真实 daemon 在跑（可能连着你的浏览器）。\n` +
-          `请先执行 agent-browser-cli stop，再重跑 node tests/mock_extension.mjs --self-test`,
+          `请先执行 atb stop，再重跑 node tests/mock_extension.mjs --self-test`,
         );
         process.exit(1);
       }
@@ -1310,7 +1331,7 @@ function runSelfTest() {
     assert(chSolveToken.passed === true && chSolveToken.via === "token", "拿到令牌时 via=token", chSolveToken);
     assert(chSolveToken.injections >= 1, "token 场景 blocking=true 卡住快路径，必走循环", chSolveToken.injections);
 
-    // 验证码一直没完成：必须 passed=false，且不得出现 passed=true（/的假通过回归点）。
+    // 验证码一直没完成：必须 passed=false，且不得出现 passed=true（假通过回归点）。
     mock.state.challengeScenario = "timeout";
     result = await run(["challenge", "solve", "--tab", tabId, "--timeout", "2"]);
     const chSolveTimeout = result.json?.result || {};

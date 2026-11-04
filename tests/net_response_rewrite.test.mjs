@@ -1,4 +1,4 @@
-// page_net 的「响应改写」安全性（N3-03）。
+// page_net 的「响应改写」安全性。
 //
 // 旧实现只要规则里出现 `response`，就会用 `await response.clone().text()` 取原响应体；
 // 取不到时 body 保持空串，照样 `new Response('')` 返回给页面，日志还写
@@ -106,10 +106,14 @@ function loadPageNet(originalFetch, XhrClass) {
 }
 
 // ---- 场景 1：只有 status 改写、原响应体读不出来 → 必须放行原响应 ----
+//
+// 注：状态码用 201 而不是 204。204/304 属「无内容」状态码，规则明确要求 204 时
+// 正确的行为是**返回一个没有 body 的 204**（见场景 1b）；那属于主动丢弃内容，
+// 与这里要防的「读不出来却假装改写成功」是两件事。
 {
   const original = makeUnreadableResponse(200);
   const { net, window } = loadPageNet(async () => original);
-  net({ action: 'hook', routes: [{ match: '/api/thing', response: { status: 204 } }] });
+  net({ action: 'hook', routes: [{ match: '/api/thing', response: { status: 201, headers: { 'x-rewritten': '1' } } }] });
 
   let returned;
   let threw = null;
@@ -140,6 +144,29 @@ function loadPageNet(originalFetch, XhrClass) {
       JSON.stringify(entry.response_rewrite_skipped),
     );
   }
+}
+
+// ---- 场景 1b：规则明确要求 204 → 返回真正的空响应，而不是原 200 ----
+//
+// `new Response(stream, {status: 204})` 在浏览器里会抛 TypeError（无内容状态码
+// 不允许带 body），所以这条路径必须显式把 body 置空；否则页面 fetch 直接 reject。
+{
+  const original = makeUnreadableResponse(200);
+  const { net, window } = loadPageNet(async () => original);
+  net({ action: 'hook', routes: [{ match: '/api/no-content', response: { status: 204 } }] });
+
+  let returned = null;
+  let threw = null;
+  try {
+    returned = await window.fetch('https://example.com/api/no-content');
+  } catch (err) {
+    threw = err;
+  }
+  check('204 改写不抛错', threw === null, threw && threw.message);
+  check('204 改写返回新响应', returned && returned !== original, '返回了原对象');
+  check('204 改写状态码正确', returned && returned.status === 204, String(returned && returned.status));
+  const entry = (net({ action: 'log' }).items || []).find((item) => item.body_dropped);
+  check('204 改写日志标明 body 被主动丢弃', Boolean(entry), JSON.stringify(net({ action: 'log' }).items?.slice(-2)));
 }
 
 // ---- 场景 2：规则显式给了 body → 即使原响应体读不出来，也按规则改写 ----
@@ -251,7 +278,11 @@ function loadPageNet(originalFetch, XhrClass) {
     return entries.find((item) => 'response_modified' in item) || entries[entries.length - 1];
   }
 
-  // A) responseText 抛错、规则也没给 response.body → 必须标 body_unreadable
+  // A) 规则只改 status、响应体读不出来（accessor 直接抛错）
+  //    的新契约：只改 status/headers 时**不读 body**，status 照样改写生效，
+  //    responseText / response 原样透传（这里就是继续抛错），日志标 response_modified=true
+  //    且**没有** response_rewrite_skipped —— 旧实现因为读不出 body 就把整条改写
+  //    （含 status）都作废，等于「只想要一个 204」也永远改不掉。
   class UnreadableXhr extends XhrBase {
     get responseText() {
       throw new Error('body unreadable');
@@ -268,21 +299,30 @@ function loadPageNet(originalFetch, XhrClass) {
     const entry = xhrLog(net, '/api/xhr-unreadable');
     check('XHR 体读不出来时有日志', Boolean(entry), '没有该请求的日志');
     if (entry) {
-      check('XHR 跳过改写时 response_modified=false', entry.response_modified === false, JSON.stringify(entry));
+      check('XHR 只改 status 时照常标记已改写', entry.response_modified === true, JSON.stringify(entry));
+      check('XHR 只改 status 时改写生效（204）', entry.status === 204, String(entry.status));
       check(
-        'XHR 跳过改写的原因可读（body_unreadable）',
-        entry.response_rewrite_skipped === 'body_unreadable',
+        'XHR 只改 status 时不读 body（无 body_unreadable 跳过原因）',
+        entry.response_rewrite_skipped === undefined,
         JSON.stringify(entry.response_rewrite_skipped),
       );
     }
+    // 原样透传：不该被替换成空串。
+    let passthroughThrew = false;
+    try { xhr.responseText; } catch (_) { passthroughThrew = true; }
+    check('XHR 只改 status 时 responseText 原样透传（不被伪造为空串）', passthroughThrew, '没有抛错，说明响应体被替换了');
   }
 
-  // B) blob 响应 → 原因要指出是 blob，而不是笼统的 body_unreadable（排查时差很多）
+  // B) blob 响应 + 只改 status → 不 decode / 不 encode 二进制，只改 status。
+  //    旧实现会去 TextDecoder 解码 arraybuffer、对 blob 直接放弃整条改写；
+  //    要求二进制体保持原样，访问器放行原生 response。
   class BlobXhr extends XhrBase {
     constructor() {
       super();
       this.responseType = 'blob';
+      this._blob = { size: 3, type: 'application/octet-stream' };
     }
+    get response() { return this._blob; }
   }
   {
     const { net, window } = loadPageNet(async () => null, BlobXhr);
@@ -294,11 +334,13 @@ function loadPageNet(originalFetch, XhrClass) {
 
     const entry = xhrLog(net, '/api/xhr-blob');
     if (entry) {
+      check('XHR blob 只改 status 时标记已改写', entry.response_modified === true, JSON.stringify(entry));
       check(
-        'XHR blob 响应给出 blob 专属原因',
-        String(entry.response_rewrite_skipped || '').startsWith('blob-without-body'),
+        'XHR blob 只改 status 时不出现 blob 跳过原因（未尝试 decode）',
+        entry.response_rewrite_skipped === undefined,
         JSON.stringify(entry.response_rewrite_skipped),
       );
+      check('XHR blob 响应体原样透传', xhr.response === xhr._blob, 'response 被替换了');
     }
   }
 

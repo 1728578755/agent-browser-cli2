@@ -1,0 +1,204 @@
+---
+name: atb
+description: 在用户已登录的真实 Chrome/Edge 里操作网页：读页面、点击填表、截图/PDF、Cookie、网络拦截、批量抓取、多标签并发与多智能体隔离。当任务需要打开网页、抓取数据、填写后台表单、调试前端请求、处理验证码等待页，或排查浏览器自动化失败时使用。
+---
+
+# atb
+
+控制用户**已登录的真实 Chrome / Edge**，沿用现有 Cookie、Profile 和扩展。Rust daemon + Chrome MV3 扩展桥；不是 Selenium/Playwright，不启动一次性自动化 Profile。
+
+**一次命令 = 一个进程。** 能并发的事放进一条命令，不要用 shell 循环起 N 条。
+
+## 何时用 / 何时不用
+
+用：
+
+- 目标站点需要登录态、短信/扫码后的会话，或必须带用户自己的扩展与浏览器环境。
+- 要同时处理多个标签页，或让多个智能体并行、互不抢页面。
+- 要在真实页面里读 DOM、跑 JS、看网络请求、截图或存 PDF。
+
+不用：
+
+- 需要无头集群、容器内并发、可重复的干净环境：用 Playwright/Puppeteer。
+- 需要绕过登录、付费墙、访问控制或验证码：atb 不做。
+- 只是解析本地 HTML/JSON：不需要浏览器。
+
+## 三条硬规则
+
+1. **批量放进一条命令。** `atb read --tab 111,222,333`、`atb exec --tab all '...'`、`atb scrape`。一条命令只建一次连接，daemon 内部并发；shell 循环把延迟乘以 N。
+2. **改动页面之前先 `--dry-run`。** 只解析目标和校验参数，不发往浏览器。重点看 `targets`：多出来的标签页就是误伤风险。
+3. **不要先跑 `status`。** 目标命令会自动拉起 daemon。只有命令失败，且输出指向连接、端口、扩展或「没有标签页」时，才看 `status` / `doctor` / `logs`。
+
+## 标准循环
+
+```bash
+atb open https://example.com --background --wait-for 'selector:main'
+atb read --max-chars 4000
+atb snapshot --interactive-only
+atb fill @e15 'hello'
+atb click @e16
+atb wait --text '提交成功' --timeout 10
+atb read --selector '.result'
+atb cleanup --dry-run
+atb cleanup
+```
+
+| 阶段 | 做什么 | 不要做 |
+| --- | --- | --- |
+| open | 新标签成为本智能体的默认目标，可直接跟后续命令 | 不要假设用户当前标签就是目标 |
+| 读 | 先 `read` / `scan` 拿正文，再决定是否 `snapshot` | 不要一上来 dump 整页 HTML |
+| 定位 | `snapshot --interactive-only` 拿 `@eN`；`find` 拿 selector | 不要写 `text=` / `xpath=` / `css=` 前缀 |
+| 操作 | `click` / `fill` / `select` / `check` / `send-keys` | 点不动先看 `warnings`，再换 `mouse-click` |
+| 验证 | `wait` 后再读一次结果区域 | 不要用固定 `sleep` |
+| 收尾 | `cleanup` 只关自己 `open` 出来的 | 不要 `close --tab all`（不支持） |
+
+## 选目标
+
+`--tab` 是所有页面命令通用的目标选择器：
+
+| 写法 | 含义 |
+| --- | --- |
+| `--tab 123456` | 单个 tab id |
+| `--tab 111,222` | 多个 id，并发执行、一次返回 |
+| `--tab all` | 当前浏览器/Profile 全部标签页 |
+| `--tab @1,@3` / `@1-5` | 按 `tabs` 顺序（从 1 起） |
+| `--tab url:example.com` | URL 子串，不区分大小写 |
+| `--tab title:订单` | 标题子串 |
+| `--tab group:research` | Chrome 标签组 |
+| `--tab window:1234567` | Chrome 窗口 id |
+| `--tab current` | 当前激活标签页 |
+
+选择顺序：确定 id → `url:` / `title:` → `@N`（先 `tabs --ids` 看清单）→ `all`（破坏性操作不要用）。
+
+- 结果按输入顺序返回；单条失败不影响其它，失败项各自带 `error_code`。
+- 多目标写文件时，`--out` 必须含 `{tab}` 或 `{index}`，否则预检拒绝。
+- `--async` 与 `all` / `@N` / `url:` / `title:` / `group:` / `window:` 互斥。
+- `close --tab group:<标题>` 必须再加 `--yes` 显式确认。
+
+## 按意图选命令
+
+| 目的 | 命令 | 备注 |
+| --- | --- | --- |
+| 读正文 | `read --max-chars 4000` | 默认 20000 字符，超长会截断 |
+| 大页面快速扫 | `scan --fast` | 非 fast 更完整，但更慢 |
+| 找可点元素 | `snapshot --interactive-only` | 返回 `@eN` 引用 |
+| 找元素位置 | `find 'a[href]' --limit 20` | 或 `find --text '登录'` |
+| 点击 | `click @e12` | 无效时 `mouse-click` 发真实鼠标事件 |
+| 填表单 | `fill` / `select` / `check` / `upload` | 文件框用 `upload '<target>' ./a.pdf` |
+| 等条件 | `wait --selector/--text/--js` | 默认 10s，页面内观察，不占进程 |
+| 执行 JS | `exec 'return document.title'` | 封装命令覆盖不到时才用 |
+| iframe | `frames` → `--frame <id>` | `exec` / `inject` 的 `--all-frames` 可一次打全部 |
+| 抓请求 | `network start` 起，`network list` / `detail` 查看 | 或 `net hook` / `net log` |
+| 改响应 | `net mock <pattern> --body '...'` | `--engine cdp` 可拦静态资源与二进制 |
+| 下载 | `download <url> --filename a.pdf` | `download-wait --id <id>` 等完成 |
+| 登录态 | `cookies` | 含 httpOnly，仅本地返回，不落盘 |
+| 批量抓取 | `scrape --urls urls.txt --out out.jsonl` | 自动分批、重试、关页 |
+| 多标签 | `--tab 111,222` | 一条命令并发，不要循环 |
+| 多智能体 | `--agent <name>` / `ATB_AGENT` | 收尾用 `cleanup` |
+| 挑战页 | `challenge solve` | `open` 默认已自动尝试；失败用 `widget` + `click --at` 自己点，最后才 `focus` |
+| 多浏览器 | `browsers` / `broadcast` | 先看有多少实例 |
+| 调试横幅 | `launch --dry-run` → `launch --restart` | 只在启动时生效 |
+| 查全部参数 | `schema --json` | 顶层命令的机器可读参数与 error_code；子命令用 `--help` |
+
+## 输出契约
+
+默认 compact JSON；`--pretty` 才缩进。成功返回 `ok:true` 与结果字段；失败返回：
+
+```json
+{"ok":false,"error":"...","error_code":"target_not_found","hint":"...","example":"...","retryable":true}
+```
+
+- `hint` 是下一步动作，`example` 可直接照抄；部分错误带 `retry_after_ms`。
+- 退出码：`0` 成功 / `1` 执行失败 / `2` 命令写错 / `3` `job wait` 或 `download-wait` 超时 / `4` 结果未知 / `130` 取消。普通 `wait` 超时走 `1`。
+- 退出码 `4` 表示请求已发出但响应丢失。动作类命令不要盲目重试：带同一个 `--idempotency-key` 重发，daemon 在 60 秒内回放首次响应（该记录会落盘，daemon 重启后同样有效；同 key 换 body 返回 409 `idempotency_key_reused`）。
+- `status` 的 `ok` 跟随 `healthy`；需要旧的「恒 0」行为设 `ATB_EXIT0=1`。
+
+## 失败处理
+
+| error_code | 含义 | 下一步 |
+| --- | --- | --- |
+| `invalid_selector` / `invalid_js` | 括号或引号没配平 | 按 `hint` 的「第 N 行」改；`example` 可直接用 |
+| `invalid_target_spec` | `--tab` 语法错 | 对照上面的表；`window:` 后必须是数字 |
+| `target_not_found` | tab id 不存在 | 报错里带可用列表；或 `tabs --ids` |
+| `no_target_tabs` | 桥正常，但没有（过滤后）可操作标签页 | `open` 一个 `http/https` 页面，或放宽 `--tab` 过滤 |
+| `extension_disconnected` | 扩展桥断开（浏览器未开 / SW 断开） | 等 3 秒重试；持续失败看 [troubleshooting.md](./references/troubleshooting.md) |
+| `extension_outdated` | 扩展不支持该能力 | 覆盖 `assets/atb_bridge` 后重载扩展 |
+| `element_not_found` | 选择器没命中 | `find` 确认元素存在、可见 |
+| `csp_blocked` | 页面 CSP 禁止注入 | 改用 `read` / `snapshot` / `click` 等封装命令 |
+| `timeout` | 操作超时 | 加 `--timeout`，或先 `wait` 再操作 |
+| `challenge_timeout` | 挑战页没在时限内放行 | 见 [recipes.md](./references/recipes.md) 的挑战页配方 |
+
+完整错误码与排查见 [troubleshooting.md](./references/troubleshooting.md)。
+
+## 多智能体
+
+隔离依据是调用方身份，不是目标标签：
+
+```bash
+export ATB_AGENT=reviewer
+atb open https://a.com
+atb read
+atb tabs --mine
+atb cleanup
+```
+
+优先级：`--agent` → `ATB_AGENT`（旧名 `AGENT_BROWSER_CLI_AGENT`）→ 终端会话标识（`WT_SESSION` / `TMUX_PANE` / `VSCODE_IPC_HOOK_CLI` 等）→ `default`。
+
+- `open` 只改**自己**的默认标签页，别的智能体的裸命令不受影响。
+- `cleanup` 只关本智能体 `open` 的页面；`--all-agents` 才清全部。
+- 想绝对确定就显式写 `--tab`，不依赖默认标签页。
+- 验证隔离：两个身份各自 `open` 后，分别执行不带 `--tab` 的 `exec 'return location.href'`，应各自返回自己的 URL。
+
+## 长任务与后台
+
+超过 30 秒的操作不要阻塞会话：
+
+```bash
+atb --async exec 'return await fetch("/api").then(r => r.text())'
+atb job list
+atb job wait <jobId> --timeout 300
+atb job get <jobId>
+atb job cancel <jobId>
+```
+
+- `--async` 返回 `job.id`；`job wait` 默认等 300s，超时返回 `job_wait_timeout`，任务不丢。
+- 支持异步：页面读取（`read` / `scan` / `find` / `snapshot` / `cookies` / `frames`）、动作（`click` / `mouse-click` / `fill` / `send-keys` / `hover` / `select` / `check` / `scroll` / `upload`）、产物（`screenshot` / `save-pdf`）、脚本（`exec` / `inject`）、查询（`downloads` / `net`），以及 `wait`。
+- 不支持：`open` / `close` / `cleanup` / `tabs` / `tabtree` / `batch` / `scrape` / `challenge` / `stealth` / `status` / `doctor` 等需要立即拿到结果或改变会话的命令，会报 `unsupported_flag`（退出码 2）。
+- 结果只在 daemon 内存里，重启即失；要留产物就写文件（`--out`）。
+- 大量 URL 用 `scrape`，不要用 `--async` 手工编排。
+
+## 版本与扩展
+
+三方版本：CLI/daemon API 协议 `5`、扩展消息协议 `4`、扩展文件版本（当前 **5.2.9**）。
+
+```bash
+atb status        # 只在排障时看 compatibility：ok / 期望协议 / 已连接协议 / fixes
+atb restart       # CLI 与 daemon 不配套
+atb restart --force   # daemon 占着 18767 且不认当前 token
+```
+
+- 扩展旧了：用仓库 `assets/atb_bridge` 覆盖扩展目录，再到 `chrome://extensions`（Edge 为 `edge://extensions`）点「重新加载」。**覆盖文件不等于重载**。
+- `atb stealth` 返回 `extension_ok:false`：扩展低于 5.0.0，或覆盖后没重载。
+- 升级顺序：换扩展文件 → 重载扩展 → 升级 CLI，或先 `restart`。
+- 主命令统一 `atb`；环境变量新前缀 `ATB_*`，旧前缀 `AGENT_BROWSER_CLI_*` 仍生效；配置目录仍是 `~/.atb`。
+
+## 边界
+
+- `challenge` 默认会主动求解（定位组件、带轨迹点击、等 token/跳转），不是干等；失败时智能体用 `widget` + `click --at` 兜底，图片/短信验证才 `focus` 转人工。不保证通过，也不绕过访问控制。
+- `stealth` 只减少本工具自身留下的痕迹，不承诺「不被检测」；不要用页面 JS 伪造 `navigator.webdriver` 之类信号。
+- 只操作有权访问的页面；不要用登录态去抓取未授权数据。
+- 不 attach 的常用路径：`open`（未命中挑战页）、`read` / `scan` / `find` / `exec` / `wait` / `hover` / `select` / `check` / `scroll` / `inject` / `cookies`，以及带 CSS selector 的 `@e` 引用或 `--frame` 触发的 `click` / `fill`。
+- 会 attach：`snapshot` 默认（要避开用 `snapshot --js`）、纯 CSS 选择器的 `click` / `fill`、`mouse-click`、`send-keys`、`upload`、`network` / `console`、整页/元素截图、`save-pdf`、`net mock --engine cdp`、挑战求解/点击、显式 CDP。设 `ATB_NO_DEBUGGER=1` 可彻底禁止 attach。
+- attach 被拒（页面内嵌别的扩展 iframe，`error_code:"page_protected"`）时不要直接放弃：截图/PDF/鼠标点击会自动回落，结果里看 `via` / `synthetic` 判断走的是哪条通道（`captureVisibleTab` / `captureFullPageStitched` / `stitched-image-pdf` / `synthetic:true`）。只有 `network`、`console`、`upload`、`send-keys`、元素截图仍需调试器。
+- 调试横幅无法运行时去除，唯一开关是启动参数 `--silent-debugger-extension-api`，只能通过 `atb launch --restart` 生效。
+- `trust-extension` 是单向的：只约束「谁能连 daemon」，不校验「扩展连的是不是真 daemon」。
+- daemon 默认空闲 300 秒且无扩展连接时退出，扩展连着时不退；退出后端口空窗期可能被本机其它进程占用，下一条命令会自动拉起。
+- `chrome://`、扩展页、`about:blank` 上的可操作能力受限，先导航到普通 `http/https` 页面。
+
+## 参考文件
+
+| 文件 | 内容 |
+| --- | --- |
+| [commands.md](./references/commands.md) | 按域分组的命令、关键参数、返回要点 |
+| [recipes.md](./references/recipes.md) | 12 个可直接照抄的场景配方 |
+| [troubleshooting.md](./references/troubleshooting.md) | 症状 → 判断 → 处理 |

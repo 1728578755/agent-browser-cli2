@@ -3,28 +3,6 @@
 version = 4
 
 [[package]]
-name = "agent-browser-cli"
-version = "0.3.8"
-dependencies = [
- "anyhow",
- "axum",
- "clap",
- "dirs",
- "dunce",
- "fs2",
- "html5ever",
- "libc",
- "markup5ever_rcdom",
- "path-clean",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "url",
- "uuid",
-]
-
-[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -89,6 +67,29 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "atb"
+version = "0.7.1"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "dirs",
+ "dunce",
+ "fs2",
+ "html5ever",
+ "libc",
+ "markup5ever_rcdom",
+ "path-clean",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "url",
+ "uuid",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]

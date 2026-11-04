@@ -9,8 +9,8 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import vm from 'node:vm';
 
-const backgroundPath = new URL('../assets/tmwd_cdp_bridge/background.js', import.meta.url);
-const contentPath = new URL('../assets/tmwd_cdp_bridge/content.js', import.meta.url);
+const backgroundPath = new URL('../assets/atb_bridge/background.js', import.meta.url);
+const contentPath = new URL('../assets/atb_bridge/content.js', import.meta.url);
 
 function eventTarget(listeners = []) {
   return {

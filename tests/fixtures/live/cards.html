@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Cards fixture</title>
+  <style>
+    body { font-family: sans-serif; margin: 0; padding: 20px; }
+    .list { display: flex; gap: 16px; list-style: none; padding: 0; }
+    .card { border: 1px solid #ccc; padding: 16px; width: 220px; }
+    .card h2 { font-size: 16px; margin: 0 0 8px; }
+    .buy { padding: 6px 12px; }
+  </style>
+</head>
+<body>
+  <!-- 重复结构：三张卡片、每张一个同名按钮。
+       @e 引用/生成的 CSS 路径如果只锚定到「第 n 个 li 下的 button」，querySelector
+       会返回文档序第一个匹配 → 点第 3 张卡片的按钮，实际点到第 1 张。 -->
+  <ul class="list">
+    <li class="card"><h2>Basic</h2><p>$5 / mo</p><button class="buy">Buy now</button></li>
+    <li class="card"><h2>Pro</h2><p>$15 / mo</p><button class="buy">Buy now</button></li>
+    <li class="card"><h2>Team</h2><p>$45 / mo</p><button class="buy">Buy now</button></li>
+  </ul>
+  <script>
+    window.__clicked = [];
+    document.querySelectorAll('.buy').forEach((button, index) => {
+      button.addEventListener('click', () => window.__clicked.push(index));
+    });
+  </script>
+</body>
+</html>

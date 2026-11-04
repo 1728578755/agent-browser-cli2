@@ -11,7 +11,7 @@ import { createContext, runInContext } from 'node:vm';
 import { randomUUID, webcrypto } from 'node:crypto';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const BACKGROUND = join(HERE, '..', 'assets', 'tmwd_cdp_bridge', 'background.js');
+const BACKGROUND = join(HERE, '..', 'assets', 'atb_bridge', 'background.js');
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 

@@ -1,428 +1,390 @@
 <div align="center">
 
-# agent-browser-cli2
+# atb
 
-面向 Agent 的浏览器感知与控制 CLI，把真实 Chrome 会话变成可复用的标签页扫描、页面 JS、Cookie、CDP 和截图能力。
+面向 Agent 的浏览器 CLI：Rust daemon + Chrome MV3 扩展桥，操作用户已登录的真实 Chrome / Edge。
 
-仓库与 npm 包名为 `agent-browser-cli2`；CLI 命令、二进制名与 Skill 名保持 `agent-browser-cli`，安装后同时提供 `agent-browser-cli2` 别名。
-
-浏览器感知 · 页面控制 · Chrome 登录态复用 · CDP · 条件等待 · Agent Skill 集成
+标签页扫描 · 页面读取 · JS 执行 · 点击填表 · 截图 / PDF · Cookie · 网络拦截 · CDP · 多智能体隔离
 
 <p>
-  <a href="https://github.com/1728578755/agent-browser-cli2"><img src="https://img.shields.io/badge/CLI-agentbrowsercli2-2ea44f" alt="CLI agentbrowsercli2"></a>
-  <a href="https://github.com/1728578755/agent-browser-cli2/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-green" alt="License MIT"></a>
-  <a href="https://github.com/1728578755/agent-browser-cli2"><img src="https://img.shields.io/badge/sys-win%2Fmac%2Flinux-0078D6?labelColor=0078D6&color=C0C0C0" alt="sys win/mac/linux"></a>
-  <a href="https://github.com/1728578755/agent-browser-cli2/releases"><img src="https://img.shields.io/badge/release-v0.3.8-orange" alt="release v0.3.8"></a>
-  <a href="https://github.com/1728578755/agent-browser-cli2/pulls"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen" alt="PRs welcome"></a>
+  <a href="https://github.com/1728578755/atb-cli"><img src="https://img.shields.io/badge/CLI-atb-2ea44f" alt="CLI atb"></a>
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-green" alt="License MIT"></a>
+  <a href="https://github.com/1728578755/atb-cli"><img src="https://img.shields.io/badge/sys-win%2Fmac%2Flinux-0078D6?labelColor=0078D6&color=C0C0C0" alt="sys win/mac/linux"></a>
+  <a href="https://github.com/1728578755/atb-cli/releases"><img src="https://img.shields.io/badge/release-v0.7.1-orange" alt="release v0.7.1"></a>
+  <a href="https://github.com/1728578755/atb-cli/pulls"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen" alt="PRs welcome"></a>
 </p>
 
-[AI 一句话安装](#ai-一句话安装) · [手动安装](#手动安装) · [Chrome 扩展](#chrome-扩展) · [更新](#更新) · [更新日志](CHANGELOG.md) · [卸载](#卸载) · [友情链接](#友情链接)
+[30 秒上手](#30-秒上手) · [安装](#安装) · [能力地图](#能力地图) · [版本与配套](#版本与配套) · [安全与隐私](#安全与隐私) · [文档地图](#文档地图)
 
 中文 | [English](README_EN.md)
 
 </div>
 
-`agent-browser-cli` 是一个面向 Agent 的浏览器感知与控制工具。它通过 Chrome 扩展连接用户真实浏览器，保留登录态和 Cookie，提供标签页扫描、页面 JS 执行、Cookie 读取、CDP 控制、截图、文件上传、下拉框点击等能力。
+## 它是什么
 
-本项目不是 Selenium / Playwright。它更适合在已有浏览器会话中辅助 Agent 精确读取页面和执行操作。
+`atb` 让 Agent 用你已经打开的浏览器：一个常驻的 Rust daemon 通过 Chrome 扩展连上正在运行的 Chrome / Edge，CLI 每次只是一个短进程，往 daemon 发一条命令。
 
-## 项目信息
+登录态、Cookie、已装的扩展、当前窗口都不变，因为用的就是你那个窗口。一条命令可以同时作用于多个标签页，结果按输入顺序返回 JSON，退出码区分「命令写错」和「稍后重试」，脚本不必解析错误文本。
 
-- 当前版本：`0.3.8`
-- 支持平台：macOS（arm64 / x64）、Linux（x64 / arm64）、Windows（x64，含 WSL）
-- 未提供预编译包的平台：Windows ARM64（`win32-arm64`）需自行 `cargo build --release`，再用 `AGENT_BROWSER_CLI_BIN` 指向生成的二进制
-- 浏览器：Chrome；Edge 亦可使用，需各装一份扩展
-- Linux 支持前提：本机 Chrome / Chromium 需要支持安装扩展
-- WSL 支持前提：需使用 `WSL 2.0.0+`，并建议在 Windows `11 22H2+` 下启用 `networkingMode=mirrored`，以便 WSL 连接宿主机 `localhost` 上的 Chrome 桥接服务
+daemon 在后台常驻；默认空闲 300 秒退出，但只要还有扩展连着就不退，所以连续操作不会每条命令都重新握手。
 
-## 致谢
+**不是什么**：不是 Selenium / Playwright（不启动一次性自动化 profile，默认也不接管浏览器；只有显式 `atb launch --restart` 才会重启它）；不是云浏览器（CLI、daemon、扩展之间的通信都在 `127.0.0.1`，你操作的网页仍按站点自身逻辑联网）；不是「隐身浏览器」（只减少本工具自身痕迹，不改指纹）。
 
-本项目基于 [sleepinginsummer/agent-browser-cli](https://github.com/sleepinginsummer/agent-browser-cli) 的 0.3.7 代码继续开发；该上游项目又派生自 [GenericAgent](https://github.com/lsdefine/GenericAgent) 的 Web 工具链，包括 `TMWebDriver`、`simphtml` 和 `tmwd_cdp_bridge` 扩展相关思路与实现。
-
-本项目与上述两个上游项目均无隶属或背书关系。感谢它们提供的浏览器桥接、页面简化、CDP 控制和实践 SOP；0.3.7 之上的二次开发内容见 [CHANGELOG.md](./CHANGELOG.md) 的 v0.3.8 段。
-
-完整的代码派生链、二次开发范围、规范依据与依赖许可证见 [SOURCES.md](./SOURCES.md)；两个上游的 MIT 版权声明与许可全文见 [NOTICE](./NOTICE)。
-
-## AI 一句话安装
-
-```text
-请阅读 https://github.com/1728578755/agent-browser-cli2/blob/main/AI_INSTALL.md，按说明安装 CLI、加载 Chrome 扩展，并添加 `skills/agent-browser-cli/SKILL.md`。
-```
-
-## 相对 GenericAgent 的改进（0.3.7 基线）
-
-以下为 0.3.7 基线相对 GenericAgent 的改动；本仓库在 0.3.7 之上的增量见 CHANGELOG。
-
-- 从 GenericAgent 中拆出浏览器控制能力，以 CLI 形式提供给 Codex、Claude Code、OpenCode 等 Agent 工具使用。GenericAgent 浏览器插件不需要重新安装，可以共用同一个插件。
-- 避免每次命令都重新初始化浏览器连接。
-- 新增启动锁，避免多个 CLI 并发启动时重复绑定底层端口。
-- 增加 skill：`skills/agent-browser-cli/SKILL.md`，供 AI 参考使用。
-- 若干优化，缩短命令执行时间。
-- 优化 CDP debugger attach/detach 流程，减少页面闪烁和异常退出后的残留 attach。
-- CLI 端使用 Rust 实现。
-
-## 他能做的事情
-
-1. 自动化测试
-   可以复用真实浏览器环境做页面流程验证、表单提交、按钮点击、跳转检查、登录态页面测试。
-2. 前端页面 Debug
-   可以读取 DOM、执行 JS、查看页面状态、截图确认效果，辅助定位前端交互、渲染和数据问题，对接后端接口。
-3. 页面样式调试
-   可以在真实页面里执行 JS 修改 DOM / CSS，临时验证样式、布局和交互效果，但更偏辅助调试，不是完整设计工具。
-4. 网页数据采集
-   可以读取页面内容、表格、列表、Cookie 和接口相关状态，适合处理需要登录态的页面数据提取。
-5. 浏览器操作脚本化
-   可以把打开页面、切换标签页、执行 JS、截图、上传文件等操作串成脚本，做重复性网页任务。
-6. Agent 辅助操作网页后台
-   适合让 AI Agent 操作管理后台、配置页面、低代码平台、表单系统等已有网页工具。
-7. 页面结构分析
-   可以简化 HTML、识别主要内容区和列表结构，帮助 Agent 更快理解复杂页面。
-8. 安全研究和逆向辅助
-   可以在真实浏览器会话里观察页面行为、执行调试脚本、读取前端状态，辅助分析前端逻辑和接口调用。
-
-## 他的能力
-
-1. 扫描当前 Chrome 标签页，获取页面标题、URL 和标签页 ID。
-2. 切换到指定标签页，复用已有页面和登录态。
-3. 打开新标签页，支持直接访问目标 URL。
-4. 在页面中执行 JavaScript，读取 DOM、表单、状态和页面数据。
-5. 读取当前页面 Cookie，方便处理登录态相关任务。
-6. 调用 Chrome CDP 能力，执行更底层的页面控制。
-7. 截取页面截图，用于视觉检查和页面确认。
-8. 上传本地文件到网页文件选择框。
-9. 操作下拉框、按钮、表单等常见页面元素。
-10. 后台运行：`open --background` 可在后台创建标签页、不抢焦点；异步任务用 `--async` + `job` 系列命令，长任务不阻塞调用方。
-
-## 后台与异步
-
-`open` 默认前台打开（切到新标签页）；加 `--background` 则不切页、不抢焦点，新标签同样会成为后续命令的默认目标。
+## 30 秒上手
 
 ```bash
-agent-browser-cli open https://example.com              # 前台打开
-agent-browser-cli open https://example.com --background # 后台打开
-agent-browser-cli exec 'return location.href'            # 直接作用于新标签页
-agent-browser-cli --async scan --text-only              # 提交后台任务，立刻返回 job_id
-agent-browser-cli job wait <jobId> --timeout 300        # 需要结果时再取
-agent-browser-cli run steps.json                        # 一次进程执行多步
+# 1. 安装 CLI，需要 Node >= 18
+npm i -g @g1728578755/atb
+
+# 2. 加载扩展：chrome://extensions → 开发者模式 → 加载已解压的扩展程序
+#    选 Release 里 chrome-extensions.zip 解压后的目录（该目录直接含 manifest.json）；
+#    源码/npm 包内也有同一份：assets/atb_bridge
+
+# 3. 打开一个页面：目标命令会自动拉起 daemon
+atb open https://example.com
+
+# 4. 确认扩展桥通了
+atb tabs --ids
+
+# 5. 读当前页，或者在页面里执行 JS
+atb read --tab current --max-chars 4000
+atb exec 'return document.title'
+
+# 需要完整健康检查时（status 不会拉起 daemon，先跑上面的命令）
+atb status
 ```
 
-细节与限制见 [docs/ASYNC_BACKGROUND.md](./docs/ASYNC_BACKGROUND.md)；
-已实现 / 下一步 / 边界与性能数据见 [docs/FEATURE_STATUS.md](./docs/FEATURE_STATUS.md)。
+扩展装好后不需要重启浏览器。命令返回 `ok:false` 时，看 `error_code` 与 `hint`（部分超时类只有 `error` / `reason`）；`atb schema --json` 能给 Agent 顶层命令的参数。
 
-扩展有更新时，需要到 `chrome://extensions` 重新加载一次扩展目录；此后（2.3 起）扩展会自己盯着 `background.js` 的内容哈希，磁盘再改动会在空闲时自动重载，不用反复手点。
-不确定浏览器里跑的是不是最新扩展时，运行 `agent-browser-cli status`：`extension.stale: true` 或出现 `warning` 就说明还没重新加载。
+## 与 Selenium / Playwright 的差别
 
-## 目录结构
+| 维度 | atb | Selenium / Playwright |
+| --- | --- | --- |
+| 会话来源 | 复用用户已登录的 Chrome / Edge | 启动全新 profile，登录态为空 |
+| 并发粒度 | 一条命令并发多个标签页 | 需要自己写并发与连接池 |
+| 输出形式 | compact JSON + 结构化 error_code / 退出码 | 语言原生对象与异常 |
+| 检测面 | 读 / 执行 / 等待不 attach；snapshot、纯 CSS 的 click/fill、截图、PDF 默认会 attach（被拒时自动回落，见「页面禁止调试器注入时」） | 默认带自动化特征与 debugger |
+| 适用场景 | Agent 操作用户自己的浏览器 | 从零构建的端到端测试 |
 
-```text
-.
-├── Cargo.toml                    # Rust 工程配置
-├── src/                          # Rust CLI / 常驻服务 / bridge
-├── assets/tmwd_cdp_bridge/       # Chrome MV3 扩展
-├── assets/page_*.js              # 页面脚本主副本
-├── assets/simphtml_opt.js        # 页面简化脚本
-├── scripts/                      # 构建/同步辅助脚本（sync-extension-assets.mjs 等）
-├── npm/                          # npm 启动脚本
-├── skills/agent-browser-cli/     # Agent Skill
-├── tests/                        # Node 侧测试、假扩展与手工验收脚本
-├── docs/                         # 行为说明与能力现状
-└── .github/workflows/            # CI 与发布流水线
-```
+它不替代测试框架：需要隔离环境、并行跑几百个用例时，Playwright 更合适。
 
-`assets/page_*.js` 会由 `npm run sync:extension` 逐字节复制到 `assets/tmwd_cdp_bridge/ops/`：前者供 daemon 打包走 eval 通道，后者在严格 CSP 页面下由扩展注入。**改页面脚本只改 `assets/` 下那份**，然后跑同步脚本；`npm run check:extension` 只比对不写盘，CI 用它做一致性守卫，`prepack` 打包前也会自动同步一次。
+## 能力地图
 
-## 手动安装
+| 域 | 代表命令 | 说明 |
+| --- | --- | --- |
+| 页面读取 | `atb read` | 正文抽取、链接、隐藏节点、iframe，按字符预算截断 |
+| 页面操作 | `atb snapshot` | 生成 `@e1` 引用，供点击、填表、下拉、上传、滚动使用 |
+| 脚本与批处理 | `atb exec` / `atb scrape` | 执行 JS、多步脚本、跨标签批量抓取、异步 job |
+| 网络与调试 | `atb net` / `atb console` / `atb downloads` | 抓请求、mock 响应、console、下载监听 |
+| 挑战与痕迹 | `atb challenge` / `atb stealth` | 挑战页识别与主动求解；痕迹审计与清理 |
+| 多浏览器与运维 | `atb browsers` / `atb doctor` / `atb logs` | 多浏览器 / Profile 选择、诊断与日志 |
 
-### npm 安装
+## 安装
+
+### npm
 
 ```bash
-npm install -g agent-browser-cli2
-agent-browser-cli tabs
+npm i -g @g1728578755/atb
+atb status
 ```
 
-> 安装后主命令仍是 `agent-browser-cli`（兼容既有脚本与 Skill），同时提供 `agent-browser-cli2` 别名；源码构建的二进制名同样为 `agent-browser-cli`。
+预编译二进制按平台从 `optionalDependencies` 安装，不需要 Rust 工具链。npm 包只提供一个命令名 `atb`。若 npm 源上还没有该版本，用下面的 Release 产物或源码构建。
 
-### 本地源码构建
+### 源码构建
 
 ```bash
 cargo build --release
-./target/release/agent-browser-cli tabs
+./target/release/atb status
 ```
 
+自编译产物可用 `ATB_BIN` 指向，避免和全局安装混用。
 
-## Chrome 扩展
+### 加载扩展
 
-1. 推荐从 [最新 Release](https://github.com/1728578755/agent-browser-cli2/releases/latest) 下载 `chrome-extensions.zip`，下载后解压，Chrome 打开 `chrome://extensions`，开启“开发者模式”，点击“加载已解压的扩展程序”，选择解压后的 `tmwd_cdp_bridge` 目录。
+1. 从 [最新 Release](https://github.com/1728578755/atb-cli/releases/latest) 下载 `chrome-extensions.zip`，解压到一个固定目录（zip 根目录就是扩展文件，`manifest.json` 直接在该目录里），或直接用仓库里的 `assets/atb_bridge`。
+2. 打开 `chrome://extensions`（Edge 为 `edge://extensions`），开启开发者模式，点「加载已解压的扩展程序」，选中直接含 `manifest.json` 的那一层目录。
+3. 浏览器里至少留一个正常网页标签页，不要只停在 `about:blank` 或 `chrome://`。
+4. **本版本需要扩展 5.2.9**。覆盖扩展目录后，daemon 在下次握手时会让扩展自动重载；daemon 未运行就到扩展管理页手动点「重新加载」——只覆盖文件不重载，页面里跑的还是旧代码。
 
-2. 本地源码构建时，也可以直接加载扩展目录：
-
-```text
-assets/tmwd_cdp_bridge
-```
-
-3. Chrome 需要至少打开一个正常网页标签页，不要只停留在 `about:blank` 或 `chrome://` 页面。
-4. 扩展连接后会在页面右侧显示 Chrome 插件提示角标。角标支持拖动位置，鼠标悬浮时展开；10 秒无命令后自动隐藏，也可以点击 `本次隐藏` 手动隐藏，本次服务连接周期内不再显示，约 300 秒服务断开并下次重连后恢复。
-5. 默认只校验握手来自某个 Chrome 扩展，即「装了扩展就能连」。需要加固时用 `agent-browser-cli trust-extension <extensionId>` 限定扩展白名单、`--token <value>` 要求握手带 token；两者都配置时同时生效，`--clear` 回到兼容模式。详见 [SKILL.md](./skills/agent-browser-cli/SKILL.md#加固-websocket-身份可选)。
-
-###  自定义Chrome插件的ws监听端口
-
-- `18765`：默认插件 WebSocket 端口，Chrome 扩展连接使用，可通过 `agent-browser-cli set-extension-port <port>` 修改。
-- `18767`：CLI HTTP API 端口，供 CLI 复用会话，不能作为插件端口使用。
-
-CLI 修改插件端口：
+### 验证
 
 ```bash
-agent-browser-cli set-extension-port 18766
+atb tabs --ids           # 先跑它：自动拉起 daemon，也能确认扩展桥通了
+atb status               # 再做健康检查；直接先跑 status 会看到 daemon_not_running
+atb doctor               # 连不上时用它定位端口、token、daemon 状态
 ```
 
-该命令会写入配置文件；如果 daemon 正在运行，会自动重启 daemon，让新端口立即生效。
+### 平台矩阵
 
-也可以手动修改配置文件。配置文件位于 `~/.agent-browser-cli/config.json`，不存在时会自动生成：
+| 平台 | 预编译 | 说明 |
+| --- | --- | --- |
+| macOS arm64 / x64 | 是 | — |
+| Linux glibc x64 / arm64 | 是 | 本机 Chrome / Chromium 需支持安装扩展；WSL 2 也用这个包 |
+| Windows x64 | 是 | 原生 Windows；WSL 不要用 win32 包 |
+| Windows ARM64 | 否 | 需 `cargo build --release`，用 `ATB_BIN` 指向产物 |
+| Alpine / musl | 否 | 同上，需自编译 |
 
-```json
-{
-  "extension_port": 18765
-}
-```
+WSL 需 `WSL 2.0.0+`，建议 Windows 11 22H2+ 并在 `.wslconfig` 开 `networkingMode=mirrored`，让 WSL 能连宿主机 `localhost` 上的桥接服务。
 
-手动修改示例：
+## 核心概念
 
-```json
-{
-  "extension_port": 18766
-}
-```
+### daemon
 
-手动改配置后需要执行 `agent-browser-cli restart`，daemon 才会按新端口重新监听。
+`atb` 二进制发现没有 daemon 时会拉起一个常驻进程，监听 `127.0.0.1:18767` 提供 HTTP API，后续命令复用同一会话。默认空闲 300 秒且没有扩展连接时退出；只要还有扩展连着就不退，扩展断开后有 60 秒重连宽限。`ATB_IDLE_TTL` 可改。日志写在 `~/.atb/logs/daemon.log`。
 
-Chrome 插件 popup 中也可以修改插件端口并立即重连。插件端口必须和 CLI 配置中的 `extension_port` 一致。
+### 扩展桥
 
-### Profile Label
+扩展以 WebSocket 连到 `127.0.0.1:18765`，端口来自 `~/.atb/config.json` 的 `extension_port`。daemon 下发命令，扩展在标签页里执行后回传 JSON。扩展重载或浏览器重启会让该浏览器名下的标签 id 全部失效，此时返回 `session_gone`，重新 `open` 或先 `tabs` 取新列表。
 
-多 Chrome Profile / 多浏览器实例下，`profile_id` 和 `browser_id` 较长。可以给每个 Chrome Profile 设置短 label，之后用 `--profile <label>` 操作。
+### 智能体身份
+
+身份优先级：`--agent` → `ATB_AGENT` → 终端会话标识（`WT_SESSION` / `TMUX_PANE` / `VSCODE_IPC_HOOK_CLI` 等）→ `default`。`open` 只改自己身份的默认目标，`cleanup` 只关自己开出来的标签页，多个 Agent 共用一个 daemon 也不会互相抢页面。
+
+### 目标选择
+
+`--tab` 接受单个 id、`111,222`、`all`、`@1` / `@1-5`、`url:<子串>`、`title:<子串>`、`group:<标题>`、`window:<id>`、`current`。多目标并发执行、按输入顺序返回、单条失败不影响其它；写文件时 `--out` 必须含 `{tab}` 或 `{index}`，否则预检拒绝。
+
+### 协议
+
+三个版本必须配套：CLI ↔ daemon 的 API 协议（当前 **5**）、扩展消息协议（当前 **4**）、扩展文件版本（当前 **5.2.9**）。`atb status` 的 `compatibility` 字段会同时给出期望值与实际值，不配套时带 `fixes[]`。
+
+## 常用工作流
+
+### 读一个页面
 
 ```bash
-agent-browser-cli lookup tab <tabId>
-agent-browser-cli lookup browser <browser_id>
-agent-browser-cli profile-label set work --profile <profile_id>
-agent-browser-cli tabs --profile work
+atb tabs --ids
+atb read --tab <tabId> --max-chars 8000
+atb read --include-hidden          # 连 display:none 的内容一起返回
+atb scan --fast                    # 只要紧凑文本，大页面也快
 ```
 
-也可以在对应 Chrome Profile 的扩展 popup 中设置 Profile Label。label 只作为别名，内部路由仍使用 `browser_id:profile_id:tab_id`；如果当前 daemon 内 label 匹配到多个 profile，CLI 会报歧义。推荐用 CLI 设置 label，因为 CLI 会校验当前 daemon 内跨 Profile 唯一性；popup 是本地便捷入口，不保证跨 Profile 唯一。`tabtree` 默认截断 URL 并省略 `session_key` 以减少 token，需完整字段时加 `--full`。
-
-
-
-
-### 弹窗抑制
-
-扩展不再默认重写页面的 `alert` / `confirm` / `prompt`。只有 CLI 执行页面脚本命令期间会临时抑制原生弹窗，命令结束后恢复，避免长期污染业务页面全局函数。
-
-## 快速自检
+### 填表并提交
 
 ```bash
-agent-browser-cli tabs
-agent-browser-cli open https://www.baidu.com
+atb snapshot --limit 200           # 生成 @e1 / @e2 引用
+atb fill @e2 '张三' --dry-run       # 先预检参数与目标
+atb fill @e2 '张三'
+atb click @e1
+atb wait --selector '.result' --timeout 10
 ```
 
-成功时 `tabs` 会返回（`open` 返回 `opened_tab_id` / `opened_session_key` / `ready`）：
+`snapshot` 默认、纯 CSS 选择器的 `click` / `fill` 会 attach 调试器；用 `snapshot --js` 和 `@e` 引用可走页面内通道，避免调试横幅。
 
-```json
-{
-  "ok": true,
-  "result": {
-    "status": "success",
-    "metadata": {
-      "tabs_count": 1
-    }
-  }
-}
-```
-
-## 常用命令
-
-README 只保留快速入口；完整命令和浏览器操作 SOP 见 [skills/agent-browser-cli/SKILL.md](./skills/agent-browser-cli/SKILL.md)。
+### 批量抓取
 
 ```bash
-agent-browser-cli tabs
-agent-browser-cli scan
-agent-browser-cli exec 'document.title'
-agent-browser-cli snapshot
-agent-browser-cli click @e1
-agent-browser-cli fill @e2 'text'
-agent-browser-cli send-keys Enter --target @e2
-agent-browser-cli mouse-click @e1
-agent-browser-cli screenshot --full-page
-agent-browser-cli save-pdf
-agent-browser-cli network start
-agent-browser-cli network list
-agent-browser-cli console start
-agent-browser-cli console list
-agent-browser-cli cookies
-agent-browser-cli upload 'input[type=file]' ./a.pdf
-agent-browser-cli run steps.json
-agent-browser-cli batch steps.json --concurrency 8   # 并发批量（跨标签）
-agent-browser-cli read --max-chars 8000 --links      # 结构化读页面
-agent-browser-cli find 'a[href]' --limit 20           # 找元素
-agent-browser-cli find --text '登录'                   # 按可见文本找
-agent-browser-cli hover '#menu'
-agent-browser-cli select '#city' --value sh
-agent-browser-cli check 'input[name=agree]'
-agent-browser-cli scroll --to bottom
-agent-browser-cli wait --selector '.result' --timeout 10
-agent-browser-cli back
-agent-browser-cli reload
-agent-browser-cli frames                              # 列出 iframe
-agent-browser-cli exec --frame <frameId> '...'        # 在 iframe 内执行
-agent-browser-cli inject 'window.__x = 1'             # 一次性注入
-agent-browser-cli inject --persist hook --match '*://*.example.com/*' '...'
-agent-browser-cli inject --list
-agent-browser-cli inject --remove hook
-
-# 读取：隐藏内容 / 大页面 / iframe
-agent-browser-cli read --include-hidden                  # 连 display:none 的内容一起返回
-agent-browser-cli read --max-nodes 20000 --budget-ms 800 # 超大页面限流
-agent-browser-cli scan --fast                            # 只取紧凑文本，十万级页面也快
-agent-browser-cli read --frame <frameId>                 # 读 iframe 内的内容
-
-# 页面网络：发请求 / 记录 / mock
-agent-browser-cli net fetch https://api.example.com/me -H 'Accept: application/json'
-agent-browser-cli net hook --capture-bodies
-agent-browser-cli net hook --persist                      # 刷新后仍生效
-agent-browser-cli net mock /api/user --request-header 'x-token: t' --response-status 201
-agent-browser-cli net log --limit 20
-agent-browser-cli net mock /api/user --status 200 --body '{"id":1,"name":"mock"}'
-agent-browser-cli net routes
-agent-browser-cli net unroute /api/user                      # 删页面规则
-agent-browser-cli net unroute /api/user --engine cdp          # 删 CDP 规则
-agent-browser-cli net reset
-
-# 验证码 / CF 挑战：只识别、等待、转人工（不做自动破解）
-agent-browser-cli challenge status
-agent-browser-cli challenge solve                             # 默认最多等 120s
-agent-browser-cli challenge wait                              # 默认最多等 30s
-agent-browser-cli challenge focus
-
-# 下载监听
-agent-browser-cli downloads --limit 10
-agent-browser-cli download https://example.com/report.pdf --filename report.pdf
-agent-browser-cli download-wait --id 7 --timeout 120
-
-# 多浏览器编排（Chrome / Edge 各装一份扩展）
-agent-browser-cli browsers
-agent-browser-cli broadcast exec --script 'return location.href'
-agent-browser-cli broadcast read --args '{"max_chars":2000}' --browser chrome --browser edge
-agent-browser-cli open https://a.com https://b.com https://c.com --background  # 并发开多个标签
-agent-browser-cli tabs --full
-agent-browser-cli open https://example.com --window --focus
-agent-browser-cli open https://example.com --group-title demo
-agent-browser-cli close --tab <tabId>
-agent-browser-cli --async exec 'return document.title'
-agent-browser-cli job list
-agent-browser-cli job wait <jobId>
-agent-browser-cli tabtree
-agent-browser-cli tabtree --full
-agent-browser-cli tabtree --profile <profile_label>
-agent-browser-cli tabtree --tab <tabId>
-agent-browser-cli lookup tab <tabId>
-agent-browser-cli lookup browser <browser_id>
-agent-browser-cli profile-label set work --profile <profile_id>
-agent-browser-cli profile-label clear --profile <profile_id>
-agent-browser-cli status
-agent-browser-cli doctor
-agent-browser-cli logs --tail 100
-agent-browser-cli install-skill --dry-run
-
-# WebSocket 身份加固（可选，默认不启用）
-agent-browser-cli trust-extension <extensionId>   # 只允许名单内扩展连接
-agent-browser-cli trust-extension --token <value> # 握手必须带 ?token=<value>
-agent-browser-cli trust-extension --list
+atb scrape --urls urls.txt --out out.jsonl
+atb scrape --urls urls.txt --js-file grab.js --out out.jsonl --batch 6 --concurrency 6 --retry 2
 ```
 
-> **这项加固是单向的，别把它当安全边界。** `trust-extension` 校验的是「谁可以连 daemon」；反方向没有校验——**扩展不会确认它连上的是不是真的 daemon**。
->
-> daemon 空闲 5 分钟会自动退出，18765 端口随之空出来。这段时间里本机其它进程可以抢占该端口，扩展按自己的重试节奏连上去之后，仍会执行对方下发的命令（包括读取任意站点 cookie、调用任意 CDP method）。也就是说：**配置 token 只能防「别的扩展连你的 daemon」，防不住「你的扩展连上别的进程」**。
->
-> 实际影响与建议：这是本地提权/横向移动的放大器，需要攻击者已经能在本机执行代码。敏感操作请在有你在场时进行；不使用时 `agent-browser-cli stop` 关掉 daemon，能显著缩短空窗期。
+`--urls` 收文件（每行一个）或逗号分隔列表；缺省脚本取 `{title, url, text}`。全部在 CLI 侧编排，复用 daemon 的 open / exec / close。
 
-## 退出码
-
-命令返回 `ok:false` 时退出码非 0，脚本和智能体可以直接用 `$?` / `&&` 判断成败，不必解析 JSON。
-
-```text
-0    成功
-1    业务失败（ok:false）；含 challenge wait/solve 超时、exec --monitor 里页面脚本抛错
-3    等待超时：job wait 超时、download-wait 超时
-130  任务被取消：job wait 等到 cancelled
-```
-
-`status` 的 `ok` 跟随 `healthy` —— daemon 未运行、端口不一致、扩展未连接、没有可用页面时都是 `ok:false` + 非 0 退出码。需要旧的「恒 0」行为时设置环境变量 `AGENT_BROWSER_CLI_EXIT0`（值任意，含 `0`）；不依赖旧行为就不要设。
-
-daemon 默认空闲 5 分钟退出，可用 `AGENT_BROWSER_CLI_IDLE_TTL`（秒）覆盖；缩短空窗期可降低本机端口被抢占的风险。
-
-## 更新
-
-完整版本记录见 [CHANGELOG.md](./CHANGELOG.md)。
-
-ai一句话更新
-```text
-请阅读 https://github.com/1728578755/agent-browser-cli2/blob/main/AI_INSTALL.md，按说明更新 CLI、重新下载插件 zip 到用户指定位置，用户手动加载 Chrome 扩展，并更新相关 SKILL.md。
-```
-
-如果 Chrome 扩展有更新，在 `chrome://extensions` 中重新下载 zip 覆盖，然后重新加载 `assets/tmwd_cdp_bridge` 扩展。
-
-### 从更早版本升级时注意
-
-- **`change.top_change` 已移除**：`--monitor` 现在只返回 `change = {changed, added, removed, attributes, text, samples}`。解析过 `top_change` 的脚本要改读 `changed` / `samples`；观察失败时还会带 `monitor.reason`（`navigated` / `superseded` / `unsupported`）。
-- **`status` 的退出码变了**：`ok` 跟随 `healthy`，daemon 不健康时不再退出 0。CI / 脚本里用 `status && ...` 做前置检查的要改成看 `summary`，或临时设 `AGENT_BROWSER_CLI_EXIT0=1`。
-- **`--monitor` / 等待类命令的失败不再伪装成功**：`exec --monitor` 里页面脚本抛错、`job wait` 等到 `failed`/`cancelled`、`download-wait` 超时、`challenge wait/solve` 超时都会给出非 0 退出码。
-- **`trust-extension` 是可选的**：不配置时仍是「装扩展即用」。多人共用一台机器、或多个扩展共存时建议配白名单 / token。注意它只约束「谁能连 daemon」，不约束「扩展连的是谁」——详见上面的加固说明。
-- **扩展资源要一起更新**：`assets/page_*.js` 与 `assets/tmwd_cdp_bridge/ops/` 是同一份脚本的两个副本，从源码构建时先 `npm run sync:extension`，否则严格 CSP 页面会跑旧代码。
-
-
-## 卸载
-
-先停止常驻服务：
+### 多标签并发
 
 ```bash
-agent-browser-cli stop
+atb open https://a.com https://b.com --background
+atb read --tab all --max-chars 2000
+atb exec --tab @1-3 'return location.href'
+atb screenshot --tab all --out 'shots/{index}-{tab}.png'
 ```
 
-然后按需清理：
+#### 页面禁止调试器注入时（自动降级）
+
+Chrome 不允许 `chrome.debugger` attach 到「内嵌了其它扩展 iframe」的页面（助手类扩展常这么做）。
+以前这类页面上的截图/PDF 直接报错；现在自动降级，不需要你先去关扩展：
+
+| 命令 | 降级后的通道 | 返回标记 |
+| --- | --- | --- |
+| `screenshot` | 可见区域 `chrome.tabs.captureVisibleTab`（不 attach 调试器） | `via:"captureVisibleTab"` |
+| `screenshot --full-page` | 逐屏滚动 + OffscreenCanvas 拼长图 | `via:"captureFullPageStitched"`、`stitched:true`、`slices`、`truncated` |
+| `save-pdf` | 整页长图包成单页 PDF（文字不可选中） | `via:"stitched-image-pdf"`、`text_selectable:false` |
+| `mouse-click` | 页面内合成鼠标事件 | `synthetic:true`、`trusted:false` |
+
+`--max-height` 限制长图高度（设备像素，默认 20000），超出按上限截断并标 `truncated:true`。
+拼接方案的固有限制：`position:fixed/sticky` 元素会在每一屏重复出现；`save-pdf` 的文字不可检索。
+需要真实输入事件或可检索 PDF 时，再考虑临时关闭注入 iframe 的扩展。
+
+### 多智能体
 
 ```bash
-npm uninstall -g agent-browser-cli2
-rm -rf ~/.agent-browser-cli
-rm -rf ~/.agents/skills/agent-browser-cli
+atb --agent reviewer open https://a.com
+ATB_AGENT=reviewer atb read
+atb cleanup --dry-run      # 先看会关哪些
+atb cleanup                # 只关本智能体 open 的标签页
 ```
 
-`~/.agent-browser-cli/` 存放 `config.json`、`api-token`、`ws-trust.json`、`net-hooks.json`、`daemon.lock` 与日志；删除前请确认其中没有还要保留的配置或凭据。
+### 挑战页
 
-最后在 Chrome 扩展管理页中移除 `Agent Browser CLI Bridge` 扩展，或删除已加载的 `assets/tmwd_cdp_bridge` 扩展配置。
+```bash
+atb open https://example.com                 # 默认 --challenge auto：命中后先主动求解，再等放行
+atb challenge status                         # 看是否仍在挑战页、组件位置与求解结论
+atb challenge solve --timeout 120            # 手动再跑一次主动求解
+atb challenge widget                         # 求解失败：拿组件坐标
+atb challenge click --at 320,410             # 智能体自己点，不需要人工
+atb challenge focus                          # 只有图片/短信等必须人做的验证才转人工
+```
 
-## 隐私与数据
+`open` 与 `challenge solve` 不是干等：它们会定位挑战组件、用带轨迹的可信鼠标事件点击，再等 token 或跳转。求解失败时，智能体可以用 `widget` + `click --at` 自己兜底；`challenge wait` 才是纯等待，`focus` 是最后的人工通道。不保证通过，也不绕过访问控制。细节见 [docs/ANTI_DETECTION_AND_CHALLENGE.md](./docs/ANTI_DETECTION_AND_CHALLENGE.md)。
 
-本项目只在本机工作：CLI 与常驻 daemon 通过 `127.0.0.1` 通信，扩展只连接本机端口，不上传页面内容、Cookie 或截图。
+## 命令速查
 
-需要了解的数据边界：
+```bash
+# 读取
+atb tabs --ids                            # 精简列表，方便选目标
+atb read --max-chars 8000 --links
+atb snapshot --limit 200                  # 元素引用 @e1 / @e2
+atb find --text '登录' --limit 5
 
-- **Cookie 与页面内容**：`cookies`、`read`、`exec` 等命令会把读取结果返回给调用方，通常进入 Agent 的对话上下文，并可能被发送给对应的模型服务商。敏感站点请自行评估。
-- **网络拦截**：`net hook --capture-bodies` 会记录请求/响应体，`net mock` 会改写响应；内容仅在本机流转，可用 `net reset` 清除。
-- **本地文件**：配置、token、持久化网络规则与日志位于 `~/.agent-browser-cli/`；日志可能包含 URL 与错误信息。
-- **扩展权限**：详见 [PRIVACY.md](./PRIVACY.md)，包括 `cookies`、`debugger`、`downloads` 等权限的用途。
+# 操作
+atb open https://example.com --background
+atb click @e1
+atb fill @e2 'text'
+atb select '#city' --value sh
+atb upload 'input[type=file]' ./a.pdf
+atb wait --selector '.result' --timeout 10
+atb close --tab <tabId>
 
-## 合规使用
+# 脚本与批处理
+atb exec 'return document.title'
+atb run steps.json                        # 一个进程跑多步
+atb batch steps.json --concurrency 8
+atb scrape --urls urls.txt --out out.jsonl
+atb --async scan --text-only              # 立刻返回 job_id
+atb job wait <jobId> --timeout 300
 
-本工具用于自动化测试、前端调试、数据采集与授权范围内的安全研究。使用者应遵守目标网站的服务条款、robots 协议与所在地法律，不得用于未授权的访问、绕过访问控制或侵犯他人数据。项目不提供验证码自动破解能力，`challenge` 系列只做识别、等待与转人工。
+# 网络与调试
+atb net fetch https://api.example.com/me
+atb net hook --capture-bodies
+atb net mock /api/user --status 200 --body '{"id":1}'
+atb console start
+atb downloads --limit 10
 
-## 参与贡献
+# 挑战与痕迹
+atb challenge status
+atb stealth audit
+atb stealth scrub
 
-欢迎 Issue 与 PR。提交前请阅读 [CONTRIBUTING.md](./CONTRIBUTING.md)；安全问题请按 [SECURITY.md](./SECURITY.md) 私下报告，不要公开提交可利用细节。
+# 运维
+atb status
+atb doctor --fix
+atb capabilities
+atb schema --json                         # 顶层命令的参数 schema（子命令细节用 --help）
+atb logs --tail 100
+```
 
-## 友情链接
+完整参数以 `atb schema --json` 为准，按域整理的表格在 [skills/atb/references/commands.md](./skills/atb/references/commands.md)。
 
-- [LINUX DO - 新的理想型社区](https://linux.do/)
-- [GenericAgent--复旦团队研发|仅仅~3K行代码 Self-Evolving Agent](https://github.com/lsdefine/GenericAgent/tree/main)
+### 退出码
+
+| 码 | 含义 | 怎么处理 |
+| --- | --- | --- |
+| `0` | 成功 | — |
+| `1` | 执行失败 | 看 `error_code`；可重试的按 `retry_after_ms` 等待 |
+| `2` | 命令写错 | 改选择器 / JS / 参数 / 目标，不要重试 |
+| `3` | `job wait` / `download-wait` 超时 | 加 `--timeout`，或稍后再查询；普通 `wait` 超时是 `1` |
+| `4` | 结果未知 | 动作可能已执行；带同一个 `--idempotency-key` 重发 |
+| `130` | 任务被取消 | `job wait` 等到 `cancelled` |
+
+## 版本与配套
+
+| 项 | 值 |
+| --- | --- |
+| CLI / daemon | `0.7.1` |
+| CLI ↔ daemon API 协议 | `5` |
+| 扩展消息协议 | `4` |
+| 扩展文件版本 | `5.2.9` |
+| 最低 Chrome | `120` |
+
+- 当前版本：`0.7.1`
+- 配套扩展：`5.2.9`（显示名 `ATB`）
+
+```bash
+atb status
+# compatibility: { ok, cli_protocol, daemon_protocol,
+#                  extension_protocol_expected, extension_protocol_connected, fixes[] }
+```
+
+| 症状 | 处理 |
+| --- | --- |
+| `compatibility.ok:false`，两个协议号不等 | `atb restart`；仍旧则结束占用 `18767` 的进程 |
+| `error_code:"extension_outdated"` | 用 `assets/atb_bridge` 覆盖扩展目录，再到扩展管理页点「重新加载」 |
+| `status` 里 `upgrade_recommended:true` | 核心命令仍可用，按 `next_steps` 更新扩展 |
+| `stealth` 返回 `extension_ok:false` | 扩展低于 5.0.0，或覆盖后没重载；按 `fixes` 处理后复核 |
+
+升级注意：CLI 与 daemon 协议不一致时新版 CLI 会直接拒绝连旧 daemon 并给出修复步骤；配置目录有意保持 `~/.atb` 不变，改目录会让新旧 daemon 各占一套端口。
+
+## 运维
+
+```bash
+atb status                       # ok 跟随 healthy，不健康时退出码非 0
+atb doctor                       # 诊断端口、token、daemon 版本
+atb doctor --fix                 # 自动修复；加 --force 才会杀进程
+atb logs --tail 100
+atb restart                      # 协议或配置变更后重启 daemon
+atb stop                         # 停止 daemon；会释放 18765，扩展仍在时会继续重连
+atb set-extension-port 18766     # 改扩展端口，写 config.json 并重启 daemon
+atb install-skill --dry-run      # 先看会把 skill 装到哪
+atb install-skill                # 主目录 ~/.agents/skills/atb；五个 Agent 目录建软链接
+```
+
+`18767` 是 CLI 的 HTTP API 端口，固定不可改，也不能拿来当扩展端口。`ATB_EXIT0=1` 可让 `status` 恢复旧版恒返回 0 的行为，仅在有脚本依赖旧行为时使用。
+
+升级 CLI：`npm i -g @g1728578755/atb@latest`，然后按「加载扩展」一节更新扩展文件。完整版本记录见 [CHANGELOG.md](./CHANGELOG.md)，交给 AI 执行的升级流程见 [AI_INSTALL.md](./AI_INSTALL.md)。
+
+## 安全与隐私
+
+- CLI、daemon、扩展之间的通信都在 `127.0.0.1`；无遥测、无远程代码、无广告 SDK。你操作的网页仍会按站点自身逻辑联网。
+- `trust-extension` 是单向的：只约束「谁能连 daemon」，不校验「扩展连的是不是真 daemon」。
+- daemon 在没有扩展连接且空闲 300 秒后退出；只 `atb stop` 会释放 18765 而扩展仍会重连，要收口就同时禁用扩展或关闭浏览器。
+- 扩展声明了 `<all_urls>`、`cookies`、`debugger`、`scripting`、`management`、`contentSettings` 等权限；页面数据只在你或 CLI 主动下命令时读取；`management` 用于扩展自身重载，以及在调试器被拒时把「挡路的扩展」名字报出来（`blockingExtensions`）。
+- `challenge` 会主动与页面上的验证组件交互（点击并等待），但不保证通过；图片判读、短信/邮箱验证仍需人工。
+
+报告漏洞见 [SECURITY.md](./SECURITY.md)，本地数据清单与删除方式见 [PRIVACY.md](./PRIVACY.md)。两者都只承诺代码能保证的事，其余写作「边界」。
+
+## 平台与限制
+
+支持：macOS arm64 / x64、Linux glibc x64 / arm64、Windows x64、WSL 2（用 Linux 包）、Chrome 与 Edge 120 及以上。
+
+明确做不到的事：
+
+- 不提供 Windows ARM64（`win32-arm64`）与 Alpine / musl 预编译包，需要自编译。
+- 调试横幅是 Chrome 自己的 UI，运行时去不掉；唯一开关是启动参数，只能通过 `atb launch --restart` 重开浏览器生效。
+- 不接管 Firefox / Safari，只支持 Chromium 系浏览器加扩展。
+- 不伪装指纹：UA、canvas、WebGL、硬件参数保持浏览器原样，`stealth` 只清本工具自己写进页面的东西。
+- 不绕过验证码与访问控制；能自动处理的是 JS 挑战和可点击的 Turnstile，图片点选与短信验证仍需人工。
+- 扩展桥断开时无法操作任何标签页，这是设计而非缺陷。
+
+## 文档地图
+
+| 读者 | 文档 | 内容 |
+| --- | --- | --- |
+| 想让 AI 代装 | [AI_INSTALL.md](./AI_INSTALL.md) | 可复制的 prompt、分步流程、失败分支、卸载回滚 |
+| 写 Agent 的人 | [skills/atb/SKILL.md](./skills/atb/SKILL.md) | 标准循环、按意图选命令、失败处理 |
+| 查参数的人 | [commands.md](./skills/atb/references/commands.md) | 按域的命令与关键参数表 |
+| 找配方的人 | [recipes.md](./skills/atb/references/recipes.md) | 可直接照抄的场景脚本 |
+| 排障的人 | [troubleshooting.md](./skills/atb/references/troubleshooting.md) | 症状 → 判断 → 处理 |
+| 深入用法 | [docs/BEST_PRACTICES.md](./docs/BEST_PRACTICES.md) | 选择器、等待、token 预算等实践 |
+| 长任务 | [docs/ASYNC_BACKGROUND.md](./docs/ASYNC_BACKGROUND.md) | 异步 job、后台标签页与限制 |
+| 检测与挑战 | [docs/ANTI_DETECTION_AND_CHALLENGE.md](./docs/ANTI_DETECTION_AND_CHALLENGE.md) | 痕迹审计、清理、挑战页处理 |
+| Edge 加载失败 | [docs/EDGE_TROUBLESHOOTING.md](./docs/EDGE_TROUBLESHOOTING.md) | 扩展加载报错逐条排查 |
+| 功能状态 | [docs/FEATURE_STATUS.md](./docs/FEATURE_STATUS.md) | 已实现 / 下一步 / 性能与边界 |
+| 版本记录 | [CHANGELOG.md](./CHANGELOG.md) | 0.4.0 以来的变更摘要 |
+| 历史记录 | [docs/CHANGELOG_ARCHIVE.md](./docs/CHANGELOG_ARCHIVE.md) | 0.3.7 及更早、重构前的逐条记录 |
+| 参与开发 | [CONTRIBUTING.md](./CONTRIBUTING.md) | 分层、测试矩阵、不能破坏的契约 |
+| 社区准则 | [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md) | 期望行为、举报渠道 |
+| 安全 / 隐私 / 来源 | [SECURITY.md](./SECURITY.md) · [PRIVACY.md](./PRIVACY.md) · [SOURCES.md](./SOURCES.md) | 威胁模型、本地数据、上游与依赖 |
+
+## 贡献
+
+改代码前先读 [CONTRIBUTING.md](./CONTRIBUTING.md)：退出码、`error_code`、JSON 字段与两个协议都是对外契约，不能随手改。提交前跑 `cargo fmt --all -- --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`node --test tests/*.test.mjs`。
+
+文档改动同 PR，中文与英文 README 必须同步，版本字符串由 `npm run sync-version` 统一写入。
+
+## 致谢
+
+浏览器控制能力提取并改造自 [GenericAgent](https://github.com/lsdefine/GenericAgent) 的 Web 工具链，包括 `TMWebDriver`、`simphtml` 与 `atb_bridge` 扩展的思路与实现。上游来源与依赖许可见 [SOURCES.md](./SOURCES.md)。
 
 ## 许可证
 
-MIT License. See [LICENSE](./LICENSE).
+MIT License，Copyright (c) 2026 1728578755。上游归属见 [NOTICE](./NOTICE)。

@@ -1,184 +1,240 @@
-# AI 安装说明
+# AI 安装手册
 
-把下面这段话发给 AI，让 AI 在你的本机环境里完成安装、配置 skill 和验证。
+适用对象：希望由编码 Agent 在本机完成 atb 安装、扩展加载、skill 安装与验证的用户。
+
+当前文档对应 CLI `0.7.1`、扩展文件版本 `5.2.9`、CLI ↔ daemon 协议 `5`。版本号以 `package.json` 与 `assets/atb_bridge/manifest.json` 为准；CLI 与扩展独立发版，不要假设两者同号。用 `@latest` 安装时如果装到更新的版本，以 `atb --version` 与 `atb status` 的输出为准。
+
+## 复制给 AI 的一段话
 
 ```text
-请帮我安装 agent-browser-cli：https://github.com/1728578755/agent-browser-cli2
+请在这台机器上安装或升级 atb（仓库 https://github.com/1728578755/atb-cli，npm 包 @g1728578755/atb）。
 
-要求：
-1. 优先使用 npm 安装：npm install -g agent-browser-cli2。
-2. 先询问我希望把 Chrome 扩展解压到哪个本地目录。
-3. 从 GitHub 最新 Release 下载 `chrome-extensions.zip`，解压到我指定的目录，并指导我在 Chrome 中加载解压后的 `tmwd_cdp_bridge` 扩展目录。
-4. 如果之前已经加载过扩展，必须在 chrome://extensions 里重新加载该扩展，确保最新 `config.js`、`content.js` 和 `background.js` 生效。
-5. skill 从 npm 包内置的 `skills/agent-browser-cli` 复制安装，不需要从 GitHub 下载 SKILL.md；先执行 `agent-browser-cli install-skill --dry-run` 展示安装计划，向我确认后再执行 `agent-browser-cli install-skill`。
-6. 执行 agent-browser-cli status、doctor、tabs、open 验证可用。
-7. 如果 npm 平台包暂不支持当前系统，再回退到源码构建：cargo build --release。
+目标：安装最新版 atb（本文写作时为 CLI 0.7.1、扩展 5.2.9），最低 Chrome/Edge 120，Node >= 18。若实际版本更新，以命令输出为准。
+
+执行要求：
+1. 先做前置检查并告诉我结果：操作系统与 CPU 架构、node -v、npm -v、Chrome/Edge 版本、PATH 上是否已有 atb 及其版本、~/.atb 是否已存在。
+2. 安装 CLI 优先用 npm install -g @g1728578755/atb@latest；只有预编译包缺失或安装失败时才回退到源码构建 cargo build --release，并用 ATB_BIN 指向产物。
+3. 安装扩展前先问我：解压目录放在哪里。从 GitHub 最新 Release 下载 chrome-extensions.zip，解压后扩展文件直接位于该目录（manifest.json、background.js、content.js 在同一层，没有再套一层 atb_bridge）。指导我在 chrome://extensions 开启开发者模式、加载已解压的扩展程序，选择这个直接包含 manifest.json 的目录。如果之前装过，必须在扩展卡片上点“重新加载”。
+4. 安装 skill 前先问我是否需要安装、装给哪些 Agent。先运行 atb install-skill --dry-run，把输出原样贴给我，我确认后再执行 atb install-skill；不要用 --yes 跳过确认。
+5. 验证依次运行：atb tabs --pretty、atb status --pretty、atb doctor、atb open https://example.com --pretty、atb read --tab <tabId> --pretty。先跑 tabs 是为了自动拉起 daemon；直接先跑 status 会得到 daemon_not_running，这不是安装失败。把完整 JSON 贴给我。成功判据：tabs 的 count 大于 0；status 的 healthy 为 true 且 summary 为 ready；open 返回 targets[0].tab_id；read 返回非空 title 或 text。
+6. 任何一步失败：先停下，贴出完整命令、退出码、JSON 错误与 daemon 日志末尾，再给出下一步方案，等我确认后再动手。不要反复重试同一条命令，不要自行删除文件、改系统配置或重装浏览器。统一使用 atb，不要与旧命令 agent-browser-cli 混用。
 ```
 
-## 1. 安装 CLI
+## AI 执行流程
 
-优先使用 npm 全局安装：
+每一步拿到输出再进入下一步；需要用户操作浏览器时，停下来等用户确认，不要假定“应该已经加载好了”。
+
+### 0. 前置检查
 
 ```bash
-npm install -g agent-browser-cli2
-agent-browser-cli --help
+node -v
+npm -v
+node -p "process.platform + '-' + process.arch + ' ' + (process.platform !== 'linux' ? 'n/a' : (process.report.getReport().header.glibcVersionRuntime ? 'glibc' : 'musl'))"
+atb --version 2>/dev/null || echo "atb 未安装"
 ```
 
-当前 npm 包按平台安装原生二进制：
+浏览器版本在 `chrome://version` 或 `edge://version` 第一行读取，需 `>= 120`。`~/.atb` 已存在说明装过旧版，记录 `atb --version`；如果 daemon 正在运行，再记 `atb status` 的 `summary`，然后升级。
 
-```text
-agent-browser-cli2
-agent-browser-cli2-darwin-arm64
-agent-browser-cli2-darwin-x64
-agent-browser-cli2-linux-x64
-agent-browser-cli2-linux-arm64
-agent-browser-cli2-windows-x64
-```
+WSL 额外确认：WSL `2.0.0+`、Windows 11 22H2+、`.wslconfig` 中 `networkingMode=mirrored`。不满足时，浏览器桥接可能连不上。
 
-Windows ARM64 没有预编译包，需要自行 `cargo build --release`，再用 `AGENT_BROWSER_CLI_BIN` 指向生成的二进制。
-
-安装后主命令为 `agent-browser-cli`，同时提供 `agent-browser-cli2` 别名。
-
-Linux 使用前请确认本机 Chrome / Chromium 支持安装扩展。
-
-如果在 WSL 中使用，当前版本依赖 WSL 访问宿主机 `localhost` 上的 Chrome 桥接服务。建议环境：
-
-```text
-WSL 2.0.0+
-Windows 11 22H2+
-.wslconfig 中启用 networkingMode=mirrored
-```
-
-如果当前平台包暂未发布或安装失败，使用源码构建：
+### 1. 安装 CLI
 
 ```bash
-git clone https://github.com/1728578755/agent-browser-cli2.git
-cd agent-browser-cli
+npm install -g @g1728578755/atb@latest
+atb --version
+```
+
+`atb --version` 应输出 `atb 0.7.1`（或你实际安装的更新版本）。npm 安装会按平台拉取可选依赖子包；平台清单：
+
+| 平台 | 预编译 | 说明 |
+| --- | --- | --- |
+| macOS arm64 / x64、Linux glibc x64 / arm64、Windows x64 | 有 | 分别拉取对应的 `@g1728578755/atb-<platform>-<arch>` |
+| WSL 2 | 有 | 用 Linux 包（linux-x64 / arm64），需要 mirrored 网络连宿主机 Chrome |
+| Windows ARM64 | 无 | 需自编译，或改用 x64 Node 走系统仿真 |
+| Alpine / musl | 无 | 需自编译，或换 glibc 基础镜像 |
+
+不要用 `--ignore-optional` / `--no-optional`，否则原生二进制不会安装。macOS、Linux 上全局安装报 `EACCES` 时，改用 nvm 或把 npm 前缀设到用户目录，不要直接 `sudo npm install`。
+
+预编译包缺失时改用源码：
+
+```bash
+git clone https://github.com/1728578755/atb-cli.git
+cd atb
 cargo build --release
-./target/release/agent-browser-cli --help
+export ATB_BIN="$PWD/target/release/atb"
 ```
 
-## 2. 加载 Chrome 扩展
+Windows PowerShell 用 `$env:ATB_BIN = "$PWD\target\release\atb.exe"`。`ATB_BIN` 只对当前 shell 生效，需要长期使用就写进 shell 配置。
 
-先询问用户希望把扩展解压到哪个本地目录，例如：
+### 2. 加载扩展
 
-```text
-请告诉我 Chrome 扩展希望解压到哪个目录，例如 ~/agent-browser-cli-extension。
-```
+先问用户解压到哪个目录，例如 `~/atb-extension`。不要替用户决定路径。
 
-然后下载最新 Release 中的 `chrome-extensions.zip` 并解压到该目录。zip 解压后内部目录仍是 `tmwd_cdp_bridge`：
+macOS / Linux：
 
 ```bash
-EXT_PARENT="$HOME/agent-browser-cli-extension"
+EXT_PARENT="$HOME/atb-extension"
 mkdir -p "$EXT_PARENT"
-ZIP_URL="$(curl -fsSL https://api.github.com/repos/1728578755/agent-browser-cli2/releases/latest | grep -o '"browser_download_url": "[^"]*chrome-extensions.zip"' | head -n 1 | cut -d '"' -f 4)"
+ZIP_URL="$(curl -fsSL https://api.github.com/repos/1728578755/atb-cli/releases/latest | grep -o '"browser_download_url": "[^"]*chrome-extensions.zip"' | head -n 1 | cut -d '"' -f 4)"
 curl -fL "$ZIP_URL" -o "$EXT_PARENT/chrome-extensions.zip"
 unzip -o "$EXT_PARENT/chrome-extensions.zip" -d "$EXT_PARENT"
 ```
 
-解压后扩展目录应为：
+没有 `unzip` 的 Linux 先装 `unzip`，或用 `python3 -m zipfile -e "$EXT_PARENT/chrome-extensions.zip" "$EXT_PARENT"`。
 
-```text
-$EXT_PARENT/tmwd_cdp_bridge
+Windows PowerShell：
+
+```powershell
+$ExtParent = "$env:USERPROFILE\atb-extension"; New-Item -ItemType Directory -Force $ExtParent | Out-Null
+$release = Invoke-RestMethod https://api.github.com/repos/1728578755/atb-cli/releases/latest
+$zip = ($release.assets | Where-Object name -eq 'chrome-extensions.zip').browser_download_url
+Invoke-WebRequest $zip -OutFile "$ExtParent\chrome-extensions.zip"
+Expand-Archive "$ExtParent\chrome-extensions.zip" -DestinationPath $ExtParent -Force
 ```
 
-在 Chrome 打开：
-
-```text
-chrome://extensions
-```
-
-开启“开发者模式”，加载已解压扩展目录：
-
-```text
-$EXT_PARENT/tmwd_cdp_bridge
-```
-
-如果之前已经安装过旧版 GenericAgent 的 `tmwd_cdp_bridge` 扩展，可以继续使用同协议旧扩展；但建议加载最新 Release 解压出来的 `tmwd_cdp_bridge` 并点击“重新加载”。
-
-当前扩展配置应包含：
-
-```js
-const TID = '__agent_browser_cli_bridge_26c9f1';
-```
-
-Chrome 至少需要打开一个正常网页标签页，不要只停留在 `about:blank` 或 `chrome://` 页面。
-
-## 3. 安装 skill
-
-`agent-browser-cli install-skill` 使用 CLI 包内置的 skill 目录作为来源。npm 全局安装时，来源位于 npm 包内部的 `skills/agent-browser-cli`，不会联网，也不会从 GitHub 拉取 `SKILL.md`。源码构建时，来源为仓库内的同名目录。
-
-默认实体安装目录：
-
-```text
-~/.agents/skills/agent-browser-cli
-```
-
-Codex、Claude、Kimi CLI、Cursor、Gemini 等目录只创建指向主安装目录的软链接，不复制多份实体文件：
-
-```text
-~/.codex/skills/agent-browser-cli -> ~/.agents/skills/agent-browser-cli
-~/.claude/skills/agent-browser-cli -> ~/.agents/skills/agent-browser-cli
-~/.config/agents/skills/agent-browser-cli -> ~/.agents/skills/agent-browser-cli
-~/.cursor/skills/agent-browser-cli -> ~/.agents/skills/agent-browser-cli
-~/.gemini/skills/agent-browser-cli -> ~/.agents/skills/agent-browser-cli
-```
-
-安装前必须先展示真实计划，并让用户确认。dry-run 输出中的“复制内置 skill 目录”就是本次安装的实际来源：
+解压后确认目录结构（macOS / Linux）：
 
 ```bash
-agent-browser-cli install-skill --dry-run
+ls "$EXT_PARENT/manifest.json" "$EXT_PARENT/background.js" "$EXT_PARENT/content.js"
+node -p "require('$EXT_PARENT/manifest.json').version"
 ```
 
-确认后再执行：
+第二行应为 `5.2.9`；Windows 用 `Get-Content "$ExtParent\manifest.json"` 查看 `version` 字段。加载时选择 `$EXT_PARENT` 这一层：它必须直接包含 `manifest.json`、`background.js`、`content.js`。解压工具若自动多建了一层子目录，就往下选到直接含 `manifest.json` 的那一层，不要把父目录交给浏览器。
+
+在 Chrome 打开 `chrome://extensions`（Edge 为 `edge://extensions`），开启“开发者模式”，点“加载已解压的扩展程序”，选择该目录。已装过旧版的：覆盖目录后回到扩展页点“重新加载”。仅覆盖文件不重载，浏览器仍跑旧 Service Worker。加载完成后至少打开一个 `http://` 或 `https://` 页面；停在 `about:blank`、`chrome://` 页面时扩展不会上报可用标签页。
+
+### 3. 安装 skill
+
+`atb install-skill` 的来源是 CLI 包内置的 `skills/atb`，不联网、不从 GitHub 拉取。先展示计划，把输出交给用户确认后再执行：
 
 ```bash
-agent-browser-cli install-skill
+atb install-skill --dry-run
+atb install-skill
 ```
 
-`--yes` 只适合脚本化安装，不建议默认使用：
+实体目录是 `~/.agents/skills/atb`，每次安装都会整体更新该目录；如果里面有你改过的内容，先备份。对已存在的 `~/.codex/skills`、`~/.claude/skills`、`~/.config/agents/skills`、`~/.cursor/skills`、`~/.gemini/skills` 建 `atb` 软链接，不复制多份实体文件。这五个位置若已有**实体目录**（不是软链接），会跳过并提示手动处理，`--yes` 也不会覆盖。`--yes` 只用于脚本化安装，不要默认加。
+
+WorkBuddy 的 `~/.workbuddy/skills/atb` 不在写入范围内，需要手动同步。npm 全局安装时：
 
 ```bash
-agent-browser-cli install-skill --yes
+SKILL_SRC="$(npm root -g)/@g1728578755/atb/skills/atb"
+mkdir -p ~/.workbuddy/skills/atb
+cp -r "$SKILL_SRC/." ~/.workbuddy/skills/atb/
 ```
 
-安装命令不会覆盖 Codex/Claude/Kimi CLI/Cursor/Gemini 目录下已存在的非软链接实体路径；即使使用 `--yes` 也会跳过并提示用户手动处理。
+Windows PowerShell 用 `$SkillSrc = Join-Path (npm root -g) "@g1728578755\atb\skills\atb"`，再用 `Copy-Item "$SkillSrc\*" "$env:USERPROFILE\.workbuddy\skills\atb" -Recurse -Force`。
 
-## 4. 验证
+### 4. 验证
 
 ```bash
-agent-browser-cli status
-agent-browser-cli doctor
-agent-browser-cli tabs
-agent-browser-cli open https://www.baidu.com
+atb tabs --pretty         # 先跑：自动拉起 daemon，并确认扩展桥
+atb status --pretty       # 再做健康检查
+atb doctor
+atb open https://example.com --pretty
+atb read --tab <tabId> --pretty
 ```
 
-成功时，`status` 应返回 `healthy: true` 和 `summary: "ready"`；`tabs` 会返回 `ok: true`，并包含当前 Chrome 标签页数量。
-`open` 应能原生新开标签页，不应使用 `exec --monitor` 或 `window.open` 代替。
+首次安装后不要先跑 `status`：它只读、不会拉起 daemon，会返回 `daemon_not_running`。先跑 `tabs` 或 `open`，再看 `status`。
 
-如果常驻服务需要重载最新代码：
+| 命令 | 成功判据 |
+| --- | --- |
+| `status` | `ok:true`、`healthy:true`、`summary:"ready"`、`compatibility.ok:true`；扩展版本用 `atb capabilities` 核对为 `5.2.9` |
+| `doctor` | 各检查项无报错；有可修复项时按输出建议处理 |
+| `tabs` | `ok:true`，`count` 大于 0 |
+| `open` | `ok:true`，`targets[0].ok:true` 且有 `tab_id` |
+| `read` | `ok:true`，`title` 或 `text` 非空 |
+
+`status` 的退出码跟随 `healthy`，不健康时为非 0。脚本里不要用 `atb status && ...` 判断，直接读 JSON 的 `summary`；需要临时恢复恒 0 行为时设 `ATB_EXIT0=1`。`doctor` 只诊断并打印修复建议，加 `--fix` 会尝试修正（例如清理旧 daemon 占用的 `18767`），终止进程需要再加 `--force`。
+
+### 5. 升级
+
+CLI：
 
 ```bash
-agent-browser-cli restart
+atb stop
+npm install -g @g1728578755/atb@latest
+atb --version
+atb restart
 ```
 
-## 5. 使用入口
+CLI ↔ daemon 协议为 `5`。换二进制后必须 `atb restart`，否则新 CLI 会拒绝连接旧 daemon，`status` 的 `compatibility` 会报不配套。`doctor --fix` 能定位占用 `18767` 的进程，`doctor --fix --force` 才会实际结束它。
 
-拿到标签页 ID 后，可以执行：
+扩展：重新下载 `chrome-extensions.zip`，解压到同一目录并覆盖旧文件，回 `chrome://extensions` 点“重新加载”，再对比卡片版本与磁盘 `manifest.json` 的 `5.2.9`，不一致就再重载一次。
+
+skill：
 
 ```bash
-agent-browser-cli scan --tab <tabId> --text-only
-agent-browser-cli exec --tab <tabId> 'return document.title'
+atb install-skill --dry-run   # 先确认计划
+atb install-skill
 ```
 
-完整命令和浏览器操作 SOP 见安装后的：
+`--dry-run` 显示 `update_main` 时，表示 `~/.agents/skills/atb` 会被整体更新；如果该目录有你自己的修改，先备份再执行。显示 `skip_existing_entity` 的是五个 Agent 目录下的同名实体目录，需要你手动移走或改造成软链接。WorkBuddy 用户按第 3 节再同步一次。升级后重跑第 4 节全部验证命令。
 
-```text
-~/.agents/skills/agent-browser-cli/SKILL.md
+## 失败分支
+
+| 症状 | 原因 | 处理 |
+| --- | --- | --- |
+| 运行 `atb` 报“原生二进制缺失（可选依赖 …）” | 平台子包未装或被 `--ignore-optional` 跳过 | `npm install -g @g1728578755/atb@latest --force`；仍失败则源码构建并设 `ATB_BIN` |
+| 报“未提供 linux-x64 / darwin-arm64 的预编译包” | 平台不在预编译矩阵内 | 按提示执行 `cargo build --release`，用 `ATB_BIN` 指向 `target/release/atb` |
+| Alpine 上安装后无法启动或提示缺少预编译包 | musl libc 与 glibc 预编译包不兼容 | 源码编译，或改用 `node:20-bookworm-slim` 一类 glibc 镜像 |
+| Windows ARM64 安装后无二进制 | 未发布 `win32-arm64` 包 | 改装 x64 版 Node 走系统仿真，或源码编译后设 `ATB_BIN` |
+| 扩展页报 `Service worker registration failed. Status code: 2` | 加载了错的目录层、文件名异常、浏览器低于 120，或覆盖文件时读到半截 `background.js`；zip 带 `__MACOSX` / `_metadata` 也会失败 | 确认选的是含 `manifest.json` 的目录；看扩展“错误”详情；升级浏览器；删掉垃圾目录；点“重新加载” |
+| 端口被占，`status` 连不上或 daemon 起不来 | `18765` 被其它进程占用，或旧 daemon 仍占 `18767` | `atb doctor --fix` 看 PID；`atb set-extension-port <port>` 换端口并在扩展 popup 填同一端口；旧 daemon 用 `atb restart --force` |
+| `status` 的 `compatibility.ok:false`，提示 daemon 协议不配套 | 升级 CLI 后旧 daemon 仍在跑（协议 4 对 5） | `atb stop` 后 `atb restart`；仍失败看 `atb logs --tail 50` |
+| `extension_not_connected` / `count` 为 0 | 没有 http/https 页面、扩展未重载、端口不一致 | 打开一个正常网页；重载扩展；核对 `18765`；daemon 刚重启时等 30-60 秒重连 |
+| WorkBuddy 里 skill 不生效或仍是旧内容 | `atb install-skill` 不写 `~/.workbuddy/skills` | 按第 3 节手动复制，重启 WorkBuddy 会话，检查 `SKILL.md` 中的扩展版本为 `5.2.9` |
+
+失败时先收集这些信息再改配置：`atb status --pretty`、`atb doctor`、`atb logs --tail 50`、扩展页错误详情全文、`chrome://version` 第一行。
+
+## 人工安装
+
+不经过 AI 的最短路径：
+
+1. 安装 Node 18+ 和 Chrome 120+。
+2. 执行 `npm install -g @g1728578755/atb@latest`，确认 `atb --version` 为 `0.7.1` 或更新版本。
+3. 到 https://github.com/1728578755/atb-cli/releases/latest 下载 `chrome-extensions.zip`，解压到固定目录。
+4. 打开 `chrome://extensions`，开开发者模式，加载解压后的目录（该目录直接含 `manifest.json`），再打开任意一个网页。
+5. 执行 `atb install-skill --dry-run` 确认计划后执行 `atb install-skill`，最后用 `atb tabs`、`atb status`、`atb doctor` 验证（先 `tabs` 拉起 daemon）。
+
+首次使用看 [README.md](README.md)，Agent 操作规范看 [skills/atb/SKILL.md](skills/atb/SKILL.md)。
+
+## 安装清单
+
+- [ ] Node `>=18`、Chrome / Edge `>=120`
+- [ ] `atb --version` 输出 `0.7.1` 或更新版本
+- [ ] `chrome-extensions.zip` 已解压，解压目录下的 `manifest.json` 版本为 `5.2.9`，且与 `background.js` 同层
+- [ ] 扩展已加载，卡片版本与磁盘一致
+- [ ] 至少一个 http/https 页面处于打开状态
+- [ ] `atb tabs` 的 `count` 大于 0（同时拉起 daemon），`atb open` 返回 `tab_id`，`atb read` 返回非空标题或正文
+- [ ] `atb status` 的 `healthy` 为 `true`、`summary` 为 `ready`（在 `tabs` 之后跑）
+- [ ] `atb doctor` 无未处理失败项
+- [ ] `~/.agents/skills/atb/SKILL.md` 存在；WorkBuddy 用户已手动同步
+
+## 卸载与回滚
+
+停止常驻进程并卸载 CLI：
+
+```bash
+atb stop
+npm uninstall -g @g1728578755/atb
 ```
 
-源码仓库中的对应文件为：
+`~/.atb` 下的 `config.json`（扩展端口）、`api-token`（本地 token）、`ws-trust.json`（扩展信任）、`net-hooks.json`（网络规则）、`agent-tabs.json`（标签页归属）、`logs/daemon.log`（日志）都可删；整目录删除等于重置配置。
 
-```text
-skills/agent-browser-cli/SKILL.md
+```bash
+rm -rf ~/.atb
 ```
+
+移除扩展：`chrome://extensions` 找到 ATB，点“移除”。同时把解压目录一并删掉。
+
+移除 skill（只删软链接，`~/.codex/skills/atb` 等位置若是实体目录则保留）：
+
+```bash
+rm -rf ~/.agents/skills/atb
+rm -f ~/.codex/skills/atb ~/.claude/skills/atb ~/.config/agents/skills/atb ~/.cursor/skills/atb ~/.gemini/skills/atb
+rm -rf ~/.workbuddy/skills/atb
+```
+
+回滚：在 `0.7.x` 内回退只需 `npm install -g @g1728578755/atb@<version>` 后 `atb restart`，同一 `5.2.x` 扩展通常可继续使用；若 `atb status` 报协议或扩展不配套，再换回该版本配套的扩展目录与 skill。跨到 `0.6.0` 之前的大版本回滚，必须同时换回该版本配套的扩展目录与 skill。
+
+相关文档：[README.md](README.md)、[CHANGELOG.md](CHANGELOG.md)、[skills/atb/SKILL.md](skills/atb/SKILL.md)、[SECURITY.md](SECURITY.md)、[docs/EDGE_TROUBLESHOOTING.md](docs/EDGE_TROUBLESHOOTING.md)、[docs/BEST_PRACTICES.md](docs/BEST_PRACTICES.md)。

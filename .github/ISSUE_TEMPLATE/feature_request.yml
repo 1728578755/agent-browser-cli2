@@ -1,0 +1,46 @@
+name: Feature request
+description: Suggest a new capability or behavior for the atb CLI
+title: "[feature] "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the problem first, then the change you would like. Concrete
+        command examples and expected JSON output help a lot.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What workflow is awkward or impossible today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: The command surface, flags, or behavior you expect. Include an example invocation with `atb`.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered (optional)
+    validations:
+      required: false
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context (optional)
+      description: Related commands, docs, or upstream behavior.
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues and discussions for this request.
+          required: true

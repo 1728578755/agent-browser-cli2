@@ -9,8 +9,29 @@
 function __abcRead(opts) {
   opts = opts || {};
   const doc = document;
-  const root = opts.selector ? doc.querySelector(opts.selector) : doc.body;
-  if (!root) return { ok: false, error: 'selector not found: ' + opts.selector };
+  // 非法选择器会让 querySelector 直接抛 DOMException；不包起来的话，调用方拿到的是
+  // 通道级错误（pageOp failed: ...），分不清「选择器写错了」和「注入失败了」。
+  // 与 page_wait.js 的 `invalid selector:` 口径对齐。
+  let root = null;
+  if (opts.selector) {
+    try {
+      root = doc.querySelector(opts.selector);
+    } catch (e) {
+      return { ok: false, error: 'invalid selector: ' + opts.selector + ' (' + ((e && e.message) || e) + ')' };
+    }
+  } else {
+    // XML / SVG 文档没有 body：旧实现让 root 停在 null，下面报出
+    // "selector not found: undefined" —— 既点名了一个不存在的选择器，又没说清
+    // 真实原因是「这份文档没有 body」（P3）。退回 documentElement 仍能读正文。
+    root = doc.body || doc.documentElement;
+  }
+  if (!root) {
+    return {
+      ok: false,
+      error: opts.selector ? 'selector not found: ' + opts.selector : 'document has no body or documentElement',
+      error_code: opts.selector ? 'selector_not_found' : 'no_document_body'
+    };
+  }
 
   const now = () => (typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now());
   const started = now();
@@ -51,6 +72,16 @@ function __abcRead(opts) {
   function clipped(text, max) {
     const value = String(text || '').replace(/\s+/g, ' ').trim();
     return value.length > max ? value.slice(0, max) : value;
+  }
+
+  // 口令/支付类字段的值不返回明文。
+  // read 是 LLM 代理最常走的路径：fill 完登录表单再 read 一次确认，
+  // 明文口令就会顺着「daemon 响应 → CLI 输出 → agent 上下文 → 日志」一路留痕。
+  function secretField(el) {
+    const type = String((el.type || '')).toLowerCase();
+    if (type === 'password') return true;
+    const autocomplete = String(el.getAttribute && el.getAttribute('autocomplete') || '').toLowerCase();
+    return /current-password|new-password|cc-number|cc-csc|one-time-code/.test(autocomplete);
   }
 
   // 走一次 TreeWalker 收集文本；includeAll=false 时粗略跳过明显隐藏的子树。
@@ -154,10 +185,12 @@ function __abcRead(opts) {
         const fields = [];
         for (const f of el.querySelectorAll('input,textarea,select')) {
           if (fields.length >= 50) break;
+          const secret = secretField(f);
           fields.push({
             name: f.name || '',
             type: (f.type || f.tagName).toLowerCase(),
-            value: typeof f.value === 'string' ? f.value.slice(0, 200) : '',
+            value: typeof f.value === 'string' ? (secret ? (f.value ? '•••' : '') : f.value.slice(0, 200)) : '',
+            redacted: secret || undefined,
             placeholder: f.placeholder || '',
             required: !!f.required
           });

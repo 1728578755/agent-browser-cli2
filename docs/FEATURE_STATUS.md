@@ -1,12 +1,103 @@
-# 能力现状：已实现 / Roadmap / 边界
+# 能力现状：已实现 / 下一步 / 边界
 
-适用版本：扩展 3.4，CLI 0.3.8
+更新时间：2026-11-04（扩展 5.2.9 ATB，CLI 0.7.1，CLI↔daemon 协议 5，扩展协议 4）
 
-这份文档回答三个问题：现在能做什么、Roadmap 有哪些方向、什么做不到。
+顶层命令 **55 个**（`atb --help`，不含 `help`；另有 `net` / `job` / `challenge` / `stealth` / `network` / `console` / `lookup` / `profile-label` / `trust-extension` 等子命令）。主命令名为 `atb`。
+
+这份文档回答三个问题：现在能做什么、下一步做什么、什么做不到。
 
 ---
 
 ## 1. 已实现
+
+### 命令面扩展：schema / capabilities / doctor --fix / scrape（0.7.1 之后新增）
+
+| 能力 | 命令 | 说明 |
+|---|---|---|
+| 机器可读命令 schema | `atb schema --json` | 全部命令的参数（名/类型/默认值/可选值）与主要 `error_code`，结构 `{"commands":{"open":{"args":{...},"error_codes":[...]}}}`；静态表实现（`src/cli/cmd_schema.rs`），Agent 一次拿到用法 |
+| 能力门禁一次探测 | `atb capabilities` | 返回 `{"ok", "extension_version", "daemon_version", "features":{core/open_session/group/window/current/challenge}, "thresholds"}`；阈值 CLI 侧写死：open_session≥2.1、group/window/current≥3.5、challenge≥5.0（与 daemon 各自版本校验口径一致）；daemon 不在时报 `daemon_not_running` |
+| 诊断自动修复 | `atb doctor --fix [--force]` | 旧 daemon 占端口（netstat/lsof 找 PID；`--force` 才 taskkill，否则只打印命令）、API token 失配（删 `~/.atb/api-token`）、扩展过旧（打印带实际路径的重载指引）；每条输出 `{fix, executed, result}` |
+| 批量抓取 | `atb scrape` | `--urls` 文件/逗号列表（去重）→ 分批后台开页（`--batch`，默认 4）→ 并发执行 JS（`--concurrency`，默认 4）→ 结果写 `--out`（JSONL：`{url, tab_id, ok, data, error, elapsed_ms, attempts, outcome_unknown}`）→ 批完关页 → 失败退避重试（3s/5s/7s，`--retry` 默认 3 轮）→ 摘要；默认每个 URL 只写一条最终记录（诊断「第几次才成功」用 `--record-attempts` 逐次写）；`outcome_unknown` 的 URL 不重试、最终退出码 4；`--batch/--concurrency` 超出 1..=32 退出 2；`--js-file` 缺省取 `{title,url,text(前9000字)}`；全部 CLI 侧编排，复用 open/exec/close，不改 daemon |
+
+### 反检测与挑战自动等待（0.6.0 新增）
+
+| 能力 | 命令 | 说明 |
+|---|---|---|
+| 命令改名 | `atb` | Cargo `[[bin]]`、clap `name`/`bin_name` 均为 `atb`；npm `bin` 提供 `atb`，指向 `npm/bin/atb.js`；配置目录仍为 `~/.atb`（有意不改，避免新旧 daemon 各用一套目录与端口） |
+| 环境变量新前缀 | `ATB_AGENT` / `ATB_EXIT0` / `ATB_IDLE_TTL` / `ATB_NO_DEBUGGER` / `ATB_BIN` / `ATB_PACKAGE_DIR` | 新名优先，旧前缀 `AGENT_BROWSER_CLI_*` 继续生效 |
+| 痕迹审计 | `stealth audit`（默认） | MAIN world 审计站点可读信号，输出 `score`(0-100) / `level`(clean/low/medium/high) / `headline` / `findings[]` / `env` / `self_fixable` / `extension_version` / `extension_ok` / `fixes` |
+| 审计项 scope | `findings[].scope` | `self`=本工具自身（own_globals / own_dom_badge / own_net_hook）；`browser`=启动方式与窗口状态（webdriver / Headless UA / plugins 空 / 窗口 0 / SwiftShader / 时区空 / Notification 权限不一致 / **tab_hidden 后台标签**）；`unknown`=框架残留与被他人改写的 fetch/XHR |
+| 自查清理 | `stealth scrub` | 只清本工具痕迹：先 `__abcNet({action:'reset'})` 还原 fetch/XHR，再删注入全局与角标节点，返回 `restored` / `removed` / `remaining`；不动 `scope:"browser"` |
+| 扩展 5.x 隐蔽化 | 自动生效 | 页面操作脚本默认 ISOLATED world（只有 `net` / `stealth` 在 MAIN）；角标默认关闭 + closed Shadow DOM（宿主 id `atb-status-host`）；网络状态槽改为不可枚举 `window['__atb_net_<随机>']`，包装函数做 `toString()` 伪装与 `name`/`length` 对齐 |
+| 打开即处理挑战 | `open --challenge auto\|wait\|off` | 默认 auto：标题判别（`Just a moment` / `Attention required` / `Checking your browser` / `请稍候` / `安全验证` 等，标题为空也探一次）→ 正常页面零额外往返；命中后**一律先跑一次元素驱动的主动求解**（不再拿「页面脚本说有没有可点组件」当门，因为组件是异步渲染进 closed shadow root 的），拿不到再退被动等待，默认 `--challenge-timeout 15`；拿到 token / 离开挑战页返回 `cleared:true`；需要人点时返回 `need_human` + `hints` |
+| 判定只认可见证据 | `challenge status` | `blocking` 只由**看得见的拦截页**（标题 / `#challenge-stage` / 正文）判定；CF 的 `challenge-platform` 脚本与 `_cf_chl_opt`、各家 WAF 的 SDK 脚本在正常页面上也常驻，只记进 `signals`，不再据此判拦截（否则已放行的站点会被永久当成挑战页，`wait` 白等到超时） |
+| 挑战页零注入 | 自动 | `challenge` 的页面侧调用一律走扩展 ISOLATED world（`PAGE_OP_WORLD.challenge`），脚本不写任何 `window.*`。旧实现用 eval 进 MAIN world 写 `window.__abcChlSeenAt`，成了可读的自动化指纹：点击被接收但 Turnstile 永不给 token（实测修好后同站点 7 次过 6 次）|
+| 组件在 closed shadow root 里 | `challenge status` 的 `turnstile` | CF 把 Turnstile iframe 挂在页面的 **closed shadow root**：页面 JS 的 `querySelectorAll('iframe')` 恒为 0、`#challenge-stage` 也不存在，但组件其实已经渲染。判据只用 DOM：「CF 挑战页 + 隐藏的 `cf-turnstile-response` 字段 + 无可见 iframe/stage」→ `turnstile.shadow_widget:true`、`interactive:true`，不再误报 `stalled: turnstile_not_rendered` |
+| 硬拦截快速失败 | `challenge wait/solve/auto` | CF 的 `Sorry, you have been blocked`（error 1020/1015）点也点不了、等也不放行，识别到 `kind:"blocked"` 立刻返回 `error_code:"challenge_blocked"` 与处置建议，不再空耗 `--timeout` |
+| 卡住时兜底 reload | `challenge wait --reload-after <秒>` | 默认 0 = 不 reload；挑战 cookie 可能已下发、页面脚本没走完时整页 reload 一次再继续等 |
+| 标题误判收敛 | `challenge status` 的 `suspected` | 标题分两档：CF 专属文案（`Just a moment` / `Attention required` / `Verifying you are human` 等）直接判拦截；通用文案（`One more step` / `Access Denied`）只记 `suspected:true` + `signals:title-only-suspect`，必须等到 DOM/脚本实锤（`#challenge-stage` / orchestrate 脚本 / `#sec-if-cpt-container`）才升级，避免把 403 页当验证码页白等一轮 |
+
+### 多浏览器身份、连接稳定与调试横幅（0.7.0 新增）
+
+| 能力 | 命令/字段 | 说明 |
+|---|---|---|
+| 可读浏览器标签 | `browser_label` | 扩展上报 `品牌 · 系统 · 自定义名 · #短码`（如 `Edge · Windows · #5531`）；`tabs` / `browsers` / `lookup` 都带这个字段，多浏览器并行时不用再记 UUID |
+| 按标签选浏览器 | `--browser Edge` | 支持完整 `browser_id`、id 前缀（≥8 字符）、标签子串（大小写不敏感） |
+| 连接不抖 | 自动 | daemon 有空闲 TTL，但**只要还有扩展连着就不退出**；扩展侧 `onclose` 后按 0.3→0.6→1.2→2.5→5s 退避重连（alarms 只做长期兜底）。daemon 重启后 2~4s 恢复 |
+| 调试横幅 | 自动 | `chrome.debugger` attach 的「已开始调试此浏览器」横幅只停留约 1.2s（`setTimeout` detach），不再挂满 30s |
+| 横幅**彻底**不出现 | `atb launch --restart` | 横幅是 Chrome 自己的 UI，运行时无 API 可去；唯一开关是启动参数 `--silent-debugger-extension-api`（Chrome 156 仍支持，实测：带参数 attach 无横幅、不带参数有横幅）。`launch` 用这条参数重启浏览器；默认不动正在用的窗口，只有显式 `--restart` 才温和关闭（`taskkill` 不带 `/F`，等同点关闭按钮）并轮询确认退出；浏览器由 daemon 拉起，命令结束不会被回收 |
+| 挑战提速 | `open --challenge auto` | 判定拦截后**无论前后台都切 active**（`allowFocus:false`）；不再自动 reload；求解器每轮先看元素（token / 是否离开挑战页 / 组件在不在）再决定动作，没有组件时很快返回，不白耗预算 |
+| 挑战失败可诊断 | `reason` / `auto_solve.reason` / `env` / `turnstile` | 没放行时说明**为什么**：`no-widget-frame`（压根没出现组件）、`click-no-effect`（点了但页面毫无反应）、`verifying_not_completed`（点了、页面已进入「正在验证」但 CF 一直不给 token／不跳转）、`widget-removed-no-nav`（组件被摘掉但没跳转）、`turnstile_not_rendered` / `window_not_visible` / `timeout`。`auto_solve` 里带 `clicks` / `evidence` / `tried` / `diag` |
+| 卡死提前收口 | 自动 | 只有「确实没有组件」才报 `turnstile_not_rendered`；组件藏在 closed shadow root 里时不再误判（见上一条）。真的没下发时 10s 收口，不耗满 `--challenge-timeout` |
+| 智能体自己点（兜底） | `challenge widget` / `challenge click --at X,Y` | `widget` 返回组件的 `rect`/`url`/`click{x,y}`（含 local 坐标），`click --at` 按坐标发一次可信鼠标事件并立刻回 status。自动求解失效时不必转人工，三步自查自点：`widget` → `click --at` → `status` |
+| 点一次就不再碰 | `challenge auto` | 组件出现即点（不预热）；iframe 消失 / src 换新 / 正文变「正在验证」= 点击被接收，立刻停手；3s 内毫无变化才算被吞、允许重点（上限 6 次）。旧实现固定偏移 (30,h/2) + 隔 5s 重点，把组件反复重置 |
+| 别的扩展挡住 CDP | 自动 | 页面里有别的扩展注入的 `chrome-extension://` iframe 时，Chrome 拒绝 `chrome.debugger` attach（"Cannot access a chrome-extension:// URL of different extension"），定位／点击／截图全废。求解器识别这个错误后先摘掉这类 iframe 再重试 attach，`diag` 里记 `step:attach / stripped:<n>` |
+| 窗口最小化修正 | 自动 | `--background` 或窗口被最小化时 `outerWidth=0` / `visibility=hidden`，CF 的 Turnstile 不会执行 → 等待期间发现环境不可见就先 `tabs switch`（不抢焦点）恢复窗口 |
+| Cookie 清理 | `cookies --clear [--url <页面>] [--domain <域>]` | 按 url 清能删到分区 cookie（`cf_clearance`）；单站点 >200 条直接拒绝，防误删 |
+
+### 页面脚本健壮性（页面脚本修复）
+
+| 问题 | 现在的行为 |
+|---|---|
+| CSS 路径不唯一导致点错元素 | `find` / `snapshot` 生成的选择器**逐层验唯一**（`querySelectorAll(path).length === 1`），不唯一就继续加祖先到 `documentElement`；`snapshot @e37` 不会再落到第 1 张卡片的同位按钮上 |
+| 口令进入命令行/上下文 | `read` / `find` / `snapshot` / `scan` 对 `type=password` 与 `autocomplete=current-password/new-password/cc-number/cc-csc/one-time-code` 一律返回 `•••` + `redacted:true`，明文不出页面 |
+| 点击「假成功」 | 目标中心点被遮罩盖住时（cookie 弹窗 / 登录浮层 / 全屏 click-catcher），`click` / `mouse-click` 结果带 `blocked:true` + `covered_by`，顶层另有 `warnings:[{code:"action_target_covered"}]`；事件仍派发到目标，但调用方能看见「真实鼠标点不到」 |
+| React 受控 checkbox 静默失效 | `check` / `uncheck` 改走**原生 `click()`**（React 的 onChange 对 checkbox 挂的是 click），返回 `via:"click"`；已等于目标状态时 `unchanged:true`，disabled 或页面回滚时报 `ok:false` |
+| `--capture-bodies` 挂死页面 | body 读取改成旁路（日志先落 `body_capture_pending`，preview 后补）；`text/event-stream` 与 >4MB 响应直接标 `body_capture_skipped`，页面自己的 fetch 不再被拖住 |
+| 响应改写丢字段 / 整段缓冲 | 只改 status/headers 时**透传 body 流**（`body_stream_passthrough`）并补回 `url`/`type`/`redirected`（补不上标 `url_lost`）；目标状态码是 204/304 时显式置空 body（`body_dropped:"null_body_status"`），不会因 `new Response(stream,{status:204})` 抛错 |
+| mock 构造异常打断页面 | 非法 status / 204 带 body 不再把 `TypeError` 抛给页面：记 `mock_invalid` 并放行真实请求；XHR 的 abort 现在置 `readyState=4`、`status=0` 并派发 `ProgressEvent`，复用同一个 xhr 时清掉上一次的 `readyState` 补丁 |
+| 规则匹配口径不一致 | 相对 URL 先解析成绝对 URL 再匹配（页内 `fetch('/api/x')` 能命中 `match:"host/api/x"`）；默认**子串**匹配，`regex:true` 才按正则（`app.js` 不再命中 `appXjs`）；`net route` 更新同 (match,method) 规则改为**原位替换**，不改变命中优先级；重放超 50 条时返回 `routes_dropped` |
+| `net fetch` 自我欺骗 | 诊断请求改用 hook 之前的原始 `fetch`，命中不了自己写的 mock，返回体标 `bypassed_hooks:true` |
+| scan 的浮层剔除失效 | `nodeInfo` WeakMap 现在真的写入（此前从未 `set`，整条 `R:covered`/`R:floatingAd` 链路是死代码）；固定定位的图片广告会被剔出 scan 结果 |
+| 超深 DOM 让 scan 崩掉 | 页面侧克隆与分析加了 512 层上限（与 `html.rs` 的 `MAX_DOM_DEPTH` 同阈值），超限返回 `…truncated: DOM deeper than 512 levels`；其它异常统一成 `__ABC_SCAN_ERROR__<msg>` 由 daemon 转结构化错误 |
+| 页面污染全局函数 | 扩展每次调用都重新注入页面脚本（不再「探测到同名函数就跳过」），并对 MAIN world 的 `__abcNet` / `__abcStealth` 校验不可枚举标记 `__abcOwn`；被页面抢占时明确报错，不执行页面提供的实现 |
+| 调试日志污染页面 | `simphtml_opt` 的 `console.log`（含遗留的 `area/totalArea` 调试语句）默认全关，需要时传 `{debug:true}`；文件末尾多余的 `optHTML()` 裸调用已删，注入不再白白整页克隆一遍 |
+| `--interval` 对 `wait --js` 无效 | daemon 传的键名由 `intervalMs` 改为 `minIntervalMs`，`wait --js --interval 5` 实测 11s 内只巡检 3 次（此前被静默按 50ms 巡检） |
+| 列表容器被改 id | `find_list` 不再给页面容器写 `id='_ljq..'`，改用不落地 DOM 的 nth-of-type 路径 |
+
+### 多智能体 / 版本配套 / 多窗口（0.5.0 新增）
+
+| 能力 | 命令 | 说明 |
+|---|---|---|
+| 身份隔离 | `--agent <名字>` / `ATB_AGENT`（旧名 `AGENT_BROWSER_CLI_AGENT`） | 每个身份独立默认标签页，互不抢目标 |
+| 收尾清理 | `cleanup [--dry-run] [--all-agents]` | 只关本工具 `open` 过的标签页，不按 URL 猜 |
+| 多窗口 | `--tab window:<id>` | `tabs --ids` 带 `window` 字段；需扩展 4.0+ |
+| 版本配套 | `status` 的 `compatibility` | CLI/daemon/扩展三方协议比对 + `fixes` |
+| 能力门禁 | `extension_outdated` | window/group/current 在旧扩展上直接报版本错 |
+| 非接触截图 | `screenshot`（可见区域） | 走 `captureVisibleTab`，不附加调试器 |
+| 禁用调试器 | `ATB_NO_DEBUGGER=1`（旧名 `AGENT_BROWSER_CLI_NO_DEBUGGER`） | CDP 命令返回替代方案 |
+
+### 多目标并发与命令预检（0.4.0 新增）
+
+| 能力 | 命令 | 说明 |
+|---|---|---|
+| 多标签并发 | `--tab all / a,b / @1-5 / url: / title: / group:` | 一次请求内并发（默认 8 路），单条失败不影响其它；结果逐条带 `error_code` + `hint` |
+| 精简目标列表 | `tabs --ids` | 只回 `tab_id/title/url/active/group`，选目标不再翻长 JSON |
+| 预检 | 自动执行 | 选择器/JS 括号与引号配平、`--tab` 语法、URL/文件、数值范围、输出路径冲突、`--async` 组合 |
+| 只检查不执行 | `<命令> --dry-run` | 输出解析后的目标与计划；不产生页面副作用 |
+| 退出码 | — | `0` 成功 / `1` 执行失败 / `2` 命令写错 / `3` 等待超时 / `4` 结果未知（动作可能已执行，带同一 `--idempotency-key` 重发）/ `130` 取消 |
+| 输出占位符 | `screenshot/save-pdf --out 'shots/{index}-{tab}.png'` | 多目标写同一文件会在预检阶段被拒绝 |
+| 长图高度上限 | `screenshot --full-page --max-height N` / `save-pdf --max-height N` | 仅拼图回落通道使用；单位是**设备像素**（与 `scrollH × dpr` 比较），默认 20000，超出按上限截断并标 `truncated:true` |
 
 ### 会话与标签
 
@@ -15,8 +106,9 @@
 | 列出标签 | `tabs [--full] [--browser] [--profile]` | 默认截断 URL，`--full` 给完整 URL |
 | 标签树 | `tabtree` | 按 browser/profile 分组，省略 session_key 省 token |
 | 定位单个标签 | `lookup tab/browser/profile` | 精确查询 |
-| 打开 | `open <url...> [--background] [--focus] [--group-title]` | **支持一次给多个 URL 并发打开**，返回 `elapsed_ms` |
-| 关闭 | `close --tab <id>` | |
+| 打开 | `open <url...> [--background] [--focus] [--group-title]` | **多 URL 由 daemon 内部并发打开（单请求）**，逐条返回 `tab_id/ready/elapsed_ms` |
+| 关闭 | `close --tab <id>[,<id>...]` | 支持批量；不接受 `all`，避免误关用户标签页 |
+| 多目标 | `--tab all \| a,b \| @1-3 \| url:xx \| title:xx \| group:xx \| current` | 所有页面命令通用；并发执行、按输入顺序汇总 |
 | 默认路由 | 任意命令省略 `--tab` | 命中最近一次 `open` 的标签；并发任务用显式 `--tab` |
 
 ### 页面读取
@@ -25,13 +117,13 @@
 |---|---|---|
 | 结构化读取 | `read [--selector] [--max-chars] [--links] [--no-forms] [--include-hidden] [--budget-ms N] [--max-nodes N] [--frame N]` | 标题/URL/正文/元信息/标题层级/各类计数/表单结构；单遍遍历 + 时间预算，超大页面不卡 |
 | 隐藏文本 | `read --include-hidden` | 走 `textContent` 语义，把 `display:none` / `hidden` / `aria-hidden` / CSS 隐藏的内容也返回；默认仍只返回可见文本（`text_mode` 标明 `visible` / `visible-approx` / `all`） |
-| 元素查找 | `find <selector>` / `find --text <文本>` / `find --xpath <expr>` | 命中数 + 每个元素的可操作信息（tag/text/value/href/rect/disabled/checked/selector） |
-| 页面扫描 | `scan [--tabs-only] [--text-only] [--fast] [--max-nodes N]` | 精简 HTML、纯文本或快速文本；超大页面（>6 万元素）自动改走文本并注明 |
+| 元素查找 | `find <selector>` / `find --text <文本>` / `find --xpath <expr>` | 命中数 + 每个元素的可操作信息（tag/text/value/href/rect/disabled/checked/selector）；`selector` 保证文档内**唯一**；口令/支付类字段的 `value` 返回 `•••` 并标 `redacted:true` |
+| 页面扫描 | `scan [--tabs-only] [--text-only] [--fast] [--max-nodes N]` | 精简 HTML、纯文本或快速文本；超大页面（>6 万元素）自动改走文本并注明；固定浮层广告/被遮挡层会被剔除，超 512 层嵌套截断并注明 |
 | 页面网络 | `net fetch <url> [--method] [-H k:v] [--body] [--response-type]` | 在页面上下文发请求（带 cookie / 同源策略 / 页面 CSP 视角），返回 status/headers/body/json |
 | 网络 hook | `net hook [--capture-bodies] [--persist] [--match <pattern>]` / `net log` / `net reset` | 包装 `fetch` 与 `XMLHttpRequest`，记录 URL/方法/状态/耗时；`--persist` 把「库 + 规则」注册成 document_start 注入，**刷新/跳转后自动重装** |
-| 网络 mock | `net mock <片段\|正则> [--status N] [--body JSON] [--method GET] [--abort]` / `net routes` / `net unroute` | 命中规则的 `fetch`/XHR 直接返回伪造响应（或网络错误），不真的发出去；规则按 **profile 共享**，同 profile 的新标签自动继承；`net unroute --engine page\|cdp` 可单独删除某一类规则，CDP 放行默认不写 `net log` |
+| 网络 mock | `net mock <片段\|正则> [--status N] [--body JSON] [--method GET] [--abort]` / `net routes` / `net unroute` | 命中规则的 `fetch`/XHR 直接返回伪造响应（或网络错误），不真的发出去；规则按 **profile 共享**，同 profile 的新标签自动继承。默认按子串匹配、相对 URL 先解析成绝对 URL（`fetch('/api/x')` 也能命中 `match:"host/api/x"`），`regex:true` 才按正则；同 (match,method) 规则原位替换以保持优先级 |
 | 网络层拦截 | `net mock <pattern> --engine cdp [--response-status N] [--response-body B] [-H 'k: v']` | 走扩展 `chrome.debugger` 的 `Fetch` 域，能改 **blob / 二进制体**、也能拦 `<img>` / `<script>` / JSONP；不换 body 时用 `continueResponse` 原地放行；CDP 被占用时明确报错且不落库。干净 profile 真机 15 条断言通过（`tests/live_cdp_net.mjs`） |
-| 挑战页/验证码 | `challenge status` / `challenge wait` / `challenge solve` / `challenge focus` | 识别 CF/Cloudflare Turnstile/reCAPTCHA/hCaptcha/PerimeterX/Akamai/DataDome/AWS WAF 与通用验证码，滑块/点选类（阿里云 noCaptcha、极验、腾讯防水墙、顶象、数美）单独标 `kind:"slider"`；`wait` 等自动放行（页面内 MutationObserver，4 秒一片重注入），超时前可自动把标签页带到前台交给人工。**不做自动破解**（不打码平台、不自动点复选框、不模拟滑块/点选）；`solve` 是「自动放行 / 等 token / 转人工」的接力：CF managed 与隐形 Turnstile 会自己通过并产出 token，需要人点时聚焦标签页、人完成后立即返回 `passed:true`。`read` 命中挑战特征时会附带 `challenge` 字段 |
+| 挑战页/验证码 | `challenge status` / `wait` / `solve` / `auto` / `widget` / `click` / `focus`；`open --challenge` 默认 auto | 识别 CF/Cloudflare Turnstile/reCAPTCHA/hCaptcha/PerimeterX/Akamai/DataDome/AWS WAF 与通用验证码，滑块/点选类（阿里云 noCaptcha、极验、腾讯防水墙、顶象、数美）单独标 `kind:"slider"`；`open --challenge auto` 命中后先主动求解（元素驱动、带轨迹点击）再等 token/跳转；`challenge solve` 手动跑同一路径，`auto` 只求解一次，`wait` 只等待。失败时 `widget` 拿坐标、`click --at` 由智能体自己点，`focus` 才是转人工；`--reload-after <秒>` 卡住时整页 reload 一次再等。`open` 命中挑战页时结果里带 `challenge` 字段 |
 | 请求改写 | `net mock <pattern> --request-header 'x-a: 1' --request-body JSON` | 放行真实请求，但按规则改请求头 / 请求体（GET/HEAD 不写 body）；日志标记 `request_rewritten` |
 | 响应改写 | `net mock <pattern> --response-status 201 --response-body JSON [-H 'x-a: 1']` | 放行真实请求后替换状态码 / 响应体 / 响应头；**fetch 与 XHR 都可靠**（XHR 走访问器接管，与页面监听器注册顺序无关），支持 `text` / `json` / `arraybuffer` / `document` / `blob`（blob 需规则显式给 body） |
 | 结果限流 | `exec --max-bytes N` | 返回值超限时给截断预览（`truncated:true`），避免一条命令塞满上下文 |
@@ -47,17 +139,17 @@
 
 | 能力 | 命令 | 实现路径 |
 |---|---|---|
-| 点击 | `click <target> [--frame N]` | CDP `DOM.resolveNode` + 真实事件；`@e` 来自 JS 快照或指定 `--frame` 时走页面内点击 |
-| 鼠标点击 | `mouse-click <target>` | CDP `Input.dispatchMouseEvent` |
+| 点击 | `click <target> [--frame N]` | CDP `DOM.resolveNode` + 真实事件；`@e` 来自 JS 快照或指定 `--frame` 时走页面内点击；命中点被遮罩盖住时顶层返回 `warnings:[{code:"action_target_covered", covered_by}]` |
+| 鼠标点击 | `mouse-click <target>` | CDP `Input.dispatchMouseEvent`；同样带遮挡告警（此时点击真的落在遮罩上，页面可能收不到） |
 | 填写 | `fill <target> <value> [--clear] [--append] [--frame N]` | CDP；`@e` 来自 JS 快照或指定 `--frame` 时走页面内 setValue |
 | 键盘 | `send-keys <keys> [--target] [--frame N]` | CDP（frame 只影响 focus 目标） |
 | 悬停 | `hover <target>` | 页面内单往返（pointer/mouse 六事件） |
 | 下拉选择 | `select <target> --value V` / `--label L` | 页面内单往返，触发 `input`+`change` |
-| 勾选 | `check <target>` | 页面内单往返 |
+| 勾选 | `check <target>` / `uncheck` | 页面内单往返，走**原生 click**（React 受控组件能收到 onChange），返回 `via:"click"` / `unchanged:true` / 失败原因 |
 | 滚动 | `scroll [<target>] [--dy N] [--to top\|bottom]` | 页面内单往返 |
 | 等待 | `wait [--selector S] [--text T] [--js C] [--visible] [--frame N]` | 全部**一次注入**完成：`--selector`/`--text` 走页面内 MutationObserver（`mode:"observer"`）；`--js` 谓词在页面内编译一次、DOM 变化由观察器触发（`mode:"js-observer"`，`injections` 通常为 1） |
 | 前进/刷新 | `back` / `reload` | 先返回再触发导航，避免白等超时 |
-| 截图 / PDF | `screenshot` / `save-pdf` | 需要 CDP |
+| 截图 / PDF | `screenshot` / `save-pdf` | 优先 CDP；被拒时自动回落（可见区域 `captureVisibleTab`、整页拼图、图片型 PDF），返回 `via` 标出通道 |
 | 上传 | `upload <target> <files...>` | 需要 CDP |
 
 所有 `target` 支持 CSS 选择器，`hover/select/check/scroll` 还支持 `text=可见文本` 与 `--index`。
@@ -70,7 +162,7 @@
 | 并发批量 | `batch <steps.json> --concurrency N` | 一次请求内最多 N 个并发（适合跨标签批量读取/操作） |
 | 异步任务 | `--async <cmd>` + `job list/get/wait/cancel` | 立即返回 job_id，daemon 内继续执行 |
 | 单次分发 | `open a b c` | 客户端并发打开多个标签 |
-| 浏览器清单 | `browsers` | 列出所有 (browser_id, profile) 与代表标签，多浏览器编排前先看这里 |
+| 浏览器清单 | `browsers` | 列出所有 (browser_id, profile) 与代表标签，多浏览器编排前先看这里；`count` 是**浏览器数**，`profile_count` 是 (browser, profile) 对数；扩展刚连上、快照未到时返回 `warning_code:"snapshot_pending"` + `retryable`，不是「没有浏览器」 |
 | 跨浏览器广播 | `broadcast <op> [--script S\|--args JSON] [--browser B] [--profile P] [--concurrency N]` | 一次在**所有**匹配的 browser/profile 上并发执行同一操作，逐目标返回结果与耗时 |
 | 下载监听 | `downloads [--limit] [--state] [--id]` / `download <url> [--filename] [--dir]` / `download-wait [--id] [--timeout]` | 扩展 `chrome.downloads`，list/start/wait；wait 在 daemon 侧轮询 |
 
@@ -82,7 +174,9 @@
 
 `chrome.scripting.executeScript` 注入函数本身不受页面 CSP 限制，但函数内部 `eval` 会。于是给固定操作准备了一条不 eval 的路径：扩展注入 `ops/page_*.js`（与 daemon 侧同源），再调用其全局函数。
 
-> `ops/` 与 `assets/` 两处副本由脚本维护：`npm run sync:extension` 生成/更新副本，`npm run check:extension` 在 CI 里守卫一致性。改过 `assets/page_*.js` 后必须跑一次 sync，否则扩展实际注入的还是旧副本。
+> **5.0.0 起**：这条通道默认注入 **ISOLATED world**，`window.__abcRead` 之类的全局只存在于扩展的隔离世界，站点读不到。只有 `net`（要包装页面 `fetch`）和 `stealth`（要在页面视角审计）仍走 MAIN world。
+
+> **2026-11-01 更新**：`ops/` 与 `assets/` 两处副本不再靠手工同步——`npm run sync:extension` 生成/更新副本，`npm run check:extension` 在 CI 里守卫一致性。改过 `assets/page_*.js` 后必须跑一次 sync，否则扩展实际注入的还是旧副本。
 
 | 能力 | 走法 | 说明 |
 |---|---|---|
@@ -94,6 +188,7 @@
 ### 扩展自更新与诊断
 
 - `status`：`extension.stale` / `warning` 直说浏览器里跑的是不是最新扩展。
+- `stealth`：`extension_ok` 判定扩展是否 ≥ 5.0.0，false 时附 `fixes`（覆盖扩展目录 + 重新加载）。
 - `doctor`：`extension_fresh` 等检查项。
 - daemon 发现扩展版本落后会主动发 `management.reload`（同版本只发一次）。
 - 扩展每 60 秒比对 `background.js` 哈希，磁盘有改动且空闲时自我重载。
@@ -104,7 +199,7 @@
 
 ## 2. 性能数据
 
-环境：Windows + Chrome（140+），本地 daemon，真实浏览器，页面为 `example.com`。
+环境：Windows + Chrome 156，本地 daemon，真实浏览器，页面为 `example.com`。
 测量工具：`node tests/concurrency_bench.mjs --tabs N --rounds M`。
 
 | 场景 | 实测（多次运行区间） |
@@ -118,12 +213,12 @@
 | 每步平均（并行，warm） | 2 ~ 4 ms |
 | 同一标签 12 条并发命令 | 38 ~ 48 ms，失败 0 |
 | `read` 单次（warm daemon） | 7 ~ 115 ms，取决于正文大小 |
-| `exec --monitor` 额外开销 | 约 1 ms（只记录变更，不做整页序列化） |
-| `wait --selector`（800ms 后出现） | **856 ms 命中，2 次检查** |
+| `exec --monitor` 额外开销（改观察器后） | 约 1 ms（旧实现两次整页序列化，抓取成本随页面大小线性增长） |
+| `wait --selector`（800ms 后出现） | **856 ms 命中，2 次检查**（旧实现约 9 次注入） |
 | `wait --selector`（已存在） | 20 ms 命中，1 次检查 |
-| `wait --selector` 超时（2s） | 2585 ms 返回 `matched:false`，1 次注入 |
+| `wait --selector` 超时（2s） | 2585 ms 返回 `matched:false`，1 次注入（不再每 100ms 注入） |
 | `wait --js`（条件已成立） | **5 ms 命中，1 次注入，1 次求值** |
-| `wait --js`（DOM 800ms 后出现） | **673 ms 命中，1 次注入** |
+| `wait --js`（DOM 800ms 后出现） | **673 ms 命中，1 次注入**（旧实现约 8~9 次注入） |
 | `wait --js`（定时器条件 800ms） | 722 ms 命中，1 次注入，15 次求值 |
 | `wait --js` 超时（0.8s） | 868 ms 返回 `matched:false`，1 次注入 |
 | `wait --js` 跨导航 | 2 次注入后命中（旧页面销毁后按剩余时间自动重试） |
@@ -131,7 +226,7 @@
 
 超大页面（`tests/gen_huge.mjs`，26 万元素 / 6 MB HTML，同一标签连续测量）：
 
-| 场景 | 早期实现 | 当前实现 |
+| 场景 | 改动前 | 现在 |
 |---|---|---|
 | `read`（默认，可见文本） | `innerText` 单次约 200 ms，再叠加 5~6 次全量 `querySelectorAll` | **270 ~ 300 ms**（单遍遍历，页面内 65 ~ 140 ms） |
 | `scan --text-only` | 4.6 ~ 4.9 s（`optHTML` 逐节点 `getComputedStyle`） | **270 ~ 310 ms** |
@@ -143,24 +238,27 @@
 
 几点说明：
 
-- 串行瓶颈不在页面执行，而在「每条命令一次 CLI 冷启动 + 一次 HTTP」。所以**批量场景必须用 `batch`/`run`**，不要用 shell 循环调 CLI。
+- 串口瓶颈不在页面执行，而在「每条命令一次 CLI 冷启动 + 一次 HTTP」。所以**批量场景必须用 `batch`/`run`**，不要用 shell 循环调 CLI。
 - 并发收益取决于单步是否有实质工作：`read`/`find`/页面脚本这类每步几毫秒以上的任务能到 6x；`exec 'return 1'` 这种 1~2 ms 的步骤会被固定开销淹没，此时并行与串行差别在噪声范围内。基准脚本会先预热每个标签，并对并行取两轮较小值。
 - 扩展侧对同一标签的命令是并发的（`onmessage` 不串行 await），12 条并发仍 47 ms。
 - 隐藏标签页的 `setTimeout` 会被 Chrome 节流，所以等待都放进页面里由 MutationObserver 驱动；`wait --js` 的非 DOM 条件再由 `setInterval` 兜底（后台会被节流到 1s，DOM 类条件不受影响）。
 
 ---
 
-## 3. Roadmap
+## 3. 下一步（按投入产出排序）
 
-以下方向都还没有实现，按「对使用者的价值」排列，不承诺顺序。欢迎在 issue 里讨论方案，或直接提 PR；标注 `good first issue` 的项适合第一次参与。
-
-| 方向 | 现状 | 目标 |
+| 优先级 | 事项 | 价值 |
 |---|---|---|
-| 加载完成语义 | `open` 只保证「会话可操作」 | `open --wait-load` 等到 `readyState === 'complete'` 且网络空闲 |
-| 快照增量与分页 | 折叠已支持（`--interactive-only` / `--max-nodes`），大页面一次返回全部引用仍偏大 | 跨次调用的增量游标与分页，大页面可分片读取 |
-| 下载进度 | 靠轮询 `chrome.downloads.search` | 通过 `onChanged` 推送进度事件，`download-wait` 可报百分比 |
-| 单标签背压 | 同一标签的并发请求排队，但没有上限 | 可配置的并发上限与排队反馈，50+ 并发时给出明确背压 |
-| 动作通道统一 | CSS 选择器的 `click`/`fill` 默认走 CDP，`@e` 与 `--frame` 走页面内 | 全部走页面内动作，减少对 debugger 的依赖，DevTools 打开时也能操作 |
+| P2 | `sessions` map 从 `DriverState` 搬出去 | 已把 `driver` 换成 RwLock（只读路径并发）；`sessions` 仍和默认会话选择共用一把写锁，继续拆要重排 26 处锁顺序 |
+| P2 | `net` 规则的跨会话共享 | 现在持久化配置按标签（session）记录，换标签要重新 `net hook --persist` |
+| P2 | `snapshot` 增量游标 | 折叠已支持（`--interactive-only` / `--max-nodes`）；跨次调用的增量尚未做 |
+| P2 | 下载进度事件 | 现在是轮询 `chrome.downloads.search`；高频进度可用 `onChanged` 推送 |
+| P2 | 统一响应信封 + `timing` 字段 | 现在 `/tabs`、`/scan` 仍是 `{ok,result:{...}}` 双层 |
+| P2 | `snapshot` 增量与分页游标 | 大页面一次返回全部引用仍然偏大 |
+| P2 | 单 tab 并发上限与背压 | 同一标签 50+ 并发时缺少排队策略 |
+| P3 | `click`/`fill` 全面改页面内动作 | 现在只有 `@e`（JS 快照）与 `--frame` 走页面内；CSS 选择器仍默认 CDP |
+
+> **2026-11-01 更新（已变更）**：上表 `net` 规则那一行已不成立——`net` 规则现在按 `browser:profile` 共享（见 §1「网络 mock」），同 profile 下任意标签的 `net routes` / `net mock` / `net reset` 作用于同一套规则，`--persist` 注册的规则在新标签加载时自动生效，换标签不需要重新 hook。另：`net unroute` 现支持 `--engine page|cdp`，CDP 规则可单独删除，不必 `net reset` 全清；CDP 引擎的「放行」默认不再写日志，`net log` 里留下的是真正被拦的请求。
 
 ---
 
@@ -168,8 +266,9 @@
 
 **环境限制（不是代码问题）**
 
-1. Chrome 在页面内嵌**其他扩展** iframe 时拒绝 `chrome.debugger.attach`（crbug 40753571）。受影响：`screenshot`、`save-pdf`、`network`、`console`、`mouse-click`、`upload`。
-   - `snapshot` 已自动回退 DOM 版本（`mode:"js"`），`@e` 仍可用于 `click/fill`。
+1. Chrome 156 在页面内嵌**其他扩展** iframe 时拒绝 `chrome.debugger.attach`（crbug 40753571）。
+   - 已全程有回落：`screenshot` → `captureVisibleTab`（`via:"captureVisibleTab"`）；`screenshot --full-page` → 逐屏滚动 + OffscreenCanvas 拼图（`via:"captureFullPageStitched"`、`stitched:true`、`slices`、`truncated`）；`save-pdf` → 整页长图包成单页图片型 PDF（`via:"stitched-image-pdf"`、`text_selectable:false`）；`mouse-click` → 页面内合成事件（`synthetic:true`、`trusted:false`）；`snapshot` → DOM 版（`mode:"js"`，`@e` 仍可用于 `click/fill`）；`network` / `console` / `upload` / `send-keys` 仍需要调试器，会带 `page_protected` 与替代方案。
+   - 错误文案会点名「页面内嵌了扩展 XX 的 iframe」（扩展命令 `blockingExtensions`）；需要真实输入事件或可检索 PDF 时，让用户临时禁用该扩展。
 2. 页面 CSP 禁止 `eval` 时（GitHub、Google 等），任意 `exec` 不可用；但 `read`/`find`/`snapshot --js`/`action`/`wait` 会**自动切到无 eval 通道**（扩展注入 `ops/page_*.js`），返回里带 `via:"no-eval"`。
 3. 依赖顺序：
    - 允许 eval → 全部能力可用；
@@ -194,15 +293,5 @@
 - `browsers` / `broadcast` 按扩展上报的 `browser_id + profile_id` 分组，Chrome 与 Edge 各装一份扩展即可同时出现在列表里；每个 profile 取「默认标签」作为该目标。
 - `broadcast` 支持 `exec / read / find / scan / net / downloads / click / fill / ...`（与 `batch` 的 op 集合一致）；每个目标上仍是串行执行。
 - 扩展未安装/未连接的浏览器不会出现在 `browsers` 里；`broadcast --browser edge` 在没装 Edge 扩展时会返回 `no_target`。
-
-**网络能力边界**
-
-- `net fetch` 跑在**页面**上下文（MAIN world），因此受页面 CSP 的 `connect-src` 与同源策略约束；跨域请求是否成功取决于目标站点 CORS，和页面里自己 `fetch` 完全一致。
-- `net hook` 默认只在当前页面生效；加 `--persist` 后会注册 document_start 注入，刷新/跳转后自动重装（`net reset` 会移除）。规则变更会自动同步到持久化注入。
-- 响应改写对 `fetch` 与 XHR 都可靠：fetch 返回新的 `Response`；XHR 接管 `responseText` / `response` / `status` / `statusText` / `getAllResponseHeaders` / `getResponseHeader`，页面监听器无论注册多早都读到改写值。`responseType=blob` 在页面引擎下只有「规则显式给了 body」才能构造新 Blob（原始体无法同步读出，日志记 `blob-without-body`）；要改原始二进制体请用 `net mock --engine cdp`。
-- `--engine cdp` 依赖 `chrome.debugger`：页面内嵌其它扩展 iframe 时 Chrome 拒绝 attach（crbug 40753571），此时命令会明确失败且规则不落库，退回 `--engine page` 即可；CDP 模式下的拦截记录暂不进 `net log`（日志仍来自页面 hook）。
-- 验证码只做识别与等待：**不自动破解**。CF 的 JS 挑战通常几秒自动放行，`challenge wait` 足够；需要人点时用 `challenge focus` 把标签页带到前台，处理完再 `challenge wait`。打码平台/自动点复选框/滑块模拟都不提供。
-- `challenge status` 会先等页面从 `about:blank`/`loading` 落到真实文档（最多 2.5s），避免 `open` 后立刻查询误判成「没有验证码」。
-- 网络层能改状态码/头/字节，但**改 `<img>` 的状态码不会让图片失败**：Chrome 的图片解码只看字节与 MIME，404 + 合法图片字节仍会渲染。要让图片失败用 `--abort` 或替换字节（真机已验证字节替换生效）。
-- `net mock` 对 `fetch` 与 XHR 都生效；`--abort` 会让请求以 `TypeError: Failed to fetch` 失败，用于测试错误分支。
-- 下载监听走 `chrome.downloads`，只能看到**本浏览器**的下载；`download-wait` 默认等最近一条，指定 `--id` 更稳。
+- **隐式默认目标有粘性**：默认标签所在连接断开时，daemon 会把这条标签记进 `preferred_default_session_key`（6 小时 TTL），同一标签重连后自动恢复为默认；只有标签真的关了才会永久切走。`read` 在「≥2 个浏览器 + 未显式指定目标」时会附带 `multi_browser_hint`；`/health.connection` 的 `default_session_key` 与 `profiles[].is_default` 可查当前默认落在哪个浏览器。
+- 具名 agent（`--agent`）的默认标签失效时，**动作类命令**直接报 `target_lost` 而不是回退到别人的标签（多智能体不串线）；`open` 例外：它会先清掉失效默认再开新页，所以 `cleanup` 之后仍能继续 `open`。

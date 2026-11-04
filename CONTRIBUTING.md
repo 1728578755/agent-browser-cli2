@@ -1,111 +1,172 @@
-# 参与贡献
+# 贡献指南
 
-欢迎提交缺陷报告、功能建议和代码。提问或开 PR 之前，请先搜索已有 issue，避免重复。
+面向要改 atb 代码或文档的人。动手前先读完本页。
 
-## 开发环境
+atb 由三部分组成：Rust CLI、Rust daemon、Chrome MV3 扩展。一次改动经常横跨两边，先在下面找到对应的层。
 
-| 依赖 | 要求 | 说明 |
-|---|---|---|
-| Rust | stable（edition 2021） | 需要 `rustfmt` 与 `clippy` 组件 |
-| Node.js | >= 18 | 扩展脚本同步、Node 侧契约测试 |
-| Chrome / Edge | 近两年版本 | 只有手工验证需要；自动化测试用假扩展 |
+## 先判断改哪一层
+
+| 你要改的 | 位置 | 怎么验证 |
+| --- | --- | --- |
+| CLI 参数、输出、退出码 | `src/cli/` | `cargo test`；手工跑对应子命令 |
+| daemon 行为、标签页、网络 | `src/server/` | `cargo test`；`node tests/mock_extension.mjs --self-test` |
+| 扩展后台、注入、弹窗 | `assets/atb_bridge/` | `node --check`；浏览器里重载扩展 |
+| 页面脚本 | `assets/page_*.js` | `node tests/check_page_script.mjs`；`npm run sync:extension` |
+| 文档 | 根目录 `*.md`、`skills/`、`docs/` | 相对链接可达；版本锚点逐字存在 |
+
+只改一层时不要顺手改另一层。跨层改动在 PR 描述里写清联动关系。
+
+## 环境准备
+
+- Rust stable，带 `rustfmt` 与 `clippy`：`rustup component add rustfmt clippy`。
+- Node >= 18。CI 用 Node 24，本地结论以 CI 为准。
+- Chrome 120 或更高，扩展用到较新的 MV3 API。
+- 改扩展时在 `chrome://extensions` 打开开发者模式，用「加载已解压的扩展程序」指向 `assets/atb_bridge`。
+
+首次构建：
 
 ```bash
-git clone https://github.com/1728578755/agent-browser-cli2
-cd agent-browser-cli
 cargo build
 ```
 
-跨平台均可开发；CI 在 Linux、macOS、Windows 三套环境跑 Rust 检查。
+## 仓库地图
 
-## 构建
+| 路径 | 内容 |
+| --- | --- |
+| `src/cli/` | 参数解析、输出、退出码、HTTP 客户端、各子命令 |
+| `src/server/` | daemon：标签页、读取、动作、网络、挑战、生命周期 |
+| `assets/page_*.js` | 注入页面的脚本，daemon 通过 `include_str!` 打包 |
+| `assets/atb_bridge/` | MV3 扩展；`ops/` 是页面脚本的生成副本 |
+| `npm/` | npm 包装，`bin/atb.js` 负责定位平台二进制 |
+| `scripts/` | 版本同步、扩展资源同步、打包、发布辅助 |
+| `skills/` | 随 npm 分发的 Agent 技能 |
+| `tests/` | Node 测试、契约测试、假扩展 E2E |
+| `docs/` | 深入文档与历史记录 |
+
+`src/protocol.rs` 定义两个协议版本常量（CLI↔daemon 为 5、扩展为 4）与共享 DTO；请求/响应的具体形状在 `src/server/dto.rs` 与各领域模块里。改协议之前先看「不能破坏的契约」。
+
+## 开发循环
+
+CLI 与 daemon：
 
 ```bash
-cargo build              # debug 二进制
-cargo build --release    # 发布用二进制
-npm run build            # 等价于 cargo build --release
+cargo build
+cargo run -- status
+cargo run -- tabs
 ```
+
+daemon 由 CLI 按需拉起：`tabs`、`open`、`exec`、`scan` 会自动启动。改过 daemon 代码后先 `cargo run -- stop`，再跑下一条命令，确认新进程生效。日志在 `~/.atb/logs/daemon.log`。
+
+扩展：改 `assets/atb_bridge/` 下的文件后，到 `chrome://extensions` 点该扩展的「重新加载」。后台脚本不重载不生效。
+
+页面脚本：只改 `assets/page_*.js`，然后执行：
+
+```bash
+npm run sync:extension
+```
+
+`assets/atb_bridge/ops/` 是生成目录，直接改会在 `--check` 时失败。
+
+文档：改完检查相对链接和版本锚点，规则见「文档规则」。
 
 ## 测试矩阵
 
-提交 PR 前请在本地跑完与改动相关的检查；改到共享代码时跑全量。
+| 命令 | 覆盖什么 | 什么时候跑 |
+| --- | --- | --- |
+| `cargo fmt --all -- --check` | Rust 格式 | 提交前、CI |
+| `cargo clippy --all-targets --all-features -- -D warnings` | 静态检查，告警即失败 | 提交前、CI |
+| `cargo check --all-targets` | 全 target 可编译 | 提交前、CI |
+| `cargo test --all-targets --all-features` | Rust 单元测试 | 提交前、CI |
+| `node --check assets/atb_bridge/background.js`（`content.js`、`popup.js` 同理） | 扩展脚本语法 | 改扩展后、CI |
+| `node tests/check_page_script.mjs` | 页面脚本可解析、入口齐全 | 改页面脚本后、CI |
+| `node --test tests/*.test.mjs` | 页面脚本与接口契约回归 | 提交前、CI |
+| `node tests/mock_extension.mjs --self-test` | 真 daemon + 假扩展端到端 | 改 daemon 或协议后、CI |
+| `node scripts/sync-version.mjs --check` | 版本号在各处一致 | 改版本后、CI |
+| `node scripts/sync-extension-assets.mjs --check` | `ops/` 与主副本逐字节一致 | 改页面脚本后、CI |
+| `npm ci --dry-run` | `package-lock.json` 与 `package.json` 一致 | 改依赖后、CI |
 
-| 命令 | 检查内容 | 备注 |
-|---|---|---|
-| `cargo fmt --all -- --check` | 代码格式 | 不要提交未格式化的改动 |
-| `cargo clippy --all-targets --all-features -- -D warnings` | 静态检查 | `-D warnings` 是硬性要求，告警即失败 |
-| `cargo test --all-targets --all-features` | Rust 单元 / 集成测试 | |
-| `node tests/*.test.mjs` | Node 侧契约测试 | Git Bash / macOS / Linux 可直接用通配符 |
-| `npm run check:extension` | `assets/page_*.js` 与 `ops/` 副本逐字节一致 | 只比对，不写盘 |
-| `node tests/mock_extension.mjs --self-test` | 端到端自检（真 daemon + 假扩展） | 占用 18766 / 18767 端口，必须串行跑 |
+`node --test tests/*.test.mjs` 只收 `*.test.mjs`。`live_*` 需要真浏览器，`*_bench` 是压测，都不在 CI 里跑。
 
-Windows PowerShell 下执行 Node 测试：
+E2E 占用 `18766` 与 `18767` 端口，必须串行执行。并行会互相抢端口，产生假红或假绿。
 
-```powershell
-Get-ChildItem tests/*.test.mjs | ForEach-Object { node $_.FullName }
+## 不能破坏的契约
+
+| 契约 | 内容 |
+| --- | --- |
+| 退出码 | `0` 成功、`1` 执行失败、`2` 命令写错、`3` `job wait` / `download-wait` 超时、`4` 结果未知、`130` 取消 |
+| `error_code` | 已有取值不改名、不改语义；新增时配 `hint` |
+| JSON 字段 | 只增不改。删字段、改类型、改含义都算破坏 |
+| CLI ↔ daemon 协议 | 当前 `5`。不兼容变更要两端同时改并升版本 |
+| 扩展消息协议 | 当前 `4`。同上 |
+
+`status` 的 `ok` 跟随 `healthy`；`ATB_EXIT0=1` 保留旧的「恒 0」行为。动这块前先确认不影响现有脚本。
+
+## 扩展与页面脚本单一真源
+
+- 页面脚本的真相源是 `assets/page_*.js`。扩展里的 `ops/` 是副本，只由脚本生成。
+- 扩展本体只维护 `assets/atb_bridge/` 一份，不要另存副本。
+- 扩展版本以 `assets/atb_bridge/manifest.json` 为准，独立于 CLI 版本。
+
+提交前跑 `npm run check:extension`，它等价于 `node scripts/sync-extension-assets.mjs --check`。
+
+## 提交规范
+
+```
+type(scope): summary
 ```
 
-涉及真实浏览器的用例（`tests/live_*.mjs`）需要本地已装扩展，不属于 CI 必跑项。
+- type：`feat` / `fix` / `docs` / `refactor` / `test` / `chore`。
+- scope：`cli` / `server` / `extension` / `skill` / `docs`。
+- summary 用祈使句，不超过 72 字符，末尾不加句号。
+- 一个提交只做一件事。格式化与逻辑改动分开提交。
 
-## 三条硬约定
+示例：
 
-### 1. 页面脚本只有一个来源
-
-页面侧脚本的源文件是 `assets/page_*.js`，扩展实际注入的是 `assets/tmwd_cdp_bridge/ops/` 下的副本。
-
-- 只改 `assets/page_*.js`，然后执行 `npm run sync:extension` 生成副本。
-- **不要手改 `assets/tmwd_cdp_bridge/ops/`**：它由脚本生成，下次同步会被覆盖，而且两边不一致会让严格 CSP 页面跑到旧代码。
-- `npm run check:extension` 会在 CI 中守卫这条约定；`prepack` 也会在打包前自动同步一次。
-
-### 2. 版本以 `package.json` 为唯一真相源
-
-`package.json` 的 `version` 是版本号来源。发版或调整版本时执行：
-
-```bash
-npm run version
+```
+fix(server): keep paused fetch request resumable
+docs(skill): rewrite failure handling table
 ```
 
-该命令会同步 `package-lock.json`、`Cargo.toml` 与 `README.md` / `README_EN.md` 中的版本展示，并把改动加入暂存区。不要手工分别修改这些文件，否则版本漂移会让 `npm ci` 直接失败。
+## PR 清单
 
-### 3. 扩展资源保持一致
+- [ ] `cargo fmt --all -- --check` 通过
+- [ ] `cargo clippy --all-targets --all-features -- -D warnings` 通过
+- [ ] `cargo test --all-targets --all-features` 通过
+- [ ] `node --test tests/*.test.mjs` 通过
+- [ ] `node scripts/sync-version.mjs --check` 通过
+- [ ] 改过页面脚本时，`npm run sync:extension` 已执行且 `npm run check:extension` 通过
+- [ ] 文档里的版本锚点逐字未变，或已随版本一起更新
+- [ ] 中英 README 同步：改一边就改另一边
 
-`assets/tmwd_cdp_bridge/` 下的 `manifest.json`、`background.js`、`content.js`、`popup.js` 与 `ops/` 副本必须与源码同批提交。改动页面脚本却漏掉同步、或只更新其中一处，都会导致「本机可用、干净安装不可用」。
+PR 描述写清三件事：改了哪一层、为什么改、怎么验证。输出或行为有变化时贴前后对比。
 
-## 提交信息
+## 版本与发布
 
-采用 `type(scope): summary` 形式，summary 用一句话说明改了什么：
+- 版本唯一真相源是 `package.json`。
+- 改版本后跑 `npm run sync-version`，它写 `Cargo.toml`、`README.md`、`README_EN.md`，并 `git add`。
+- 平台包清单必须四处一致：`package.json` 的 `optionalDependencies`、`scripts/sync-optional-deps.mjs`、`.github/workflows/publish.yml` 的 matrix、`npm/bin/atb.js` 的 `platformPackageName`。
+- 扩展版本独立维护：改 `assets/atb_bridge/manifest.json`，同步文档里的版本断言。
+- 发布由 push tag `v*` 触发，也可手动 dispatch。workflow 构建 5 个平台包后发布 npm。
 
-```text
-fix(net): 持久化规则刷新后不再丢失
-feat(wait): 用页面内 MutationObserver 替代定时器轮询
-docs: 补充异步任务的重试语义
-```
+`node scripts/sync-version.mjs` 同时校验 `package-lock.json` 与 `Cargo.lock` 的根包版本。锁文件不由它写入：前者用 `node scripts/sync-optional-deps.mjs`，后者交给 cargo。
 
-常用 type：`feat`、`fix`、`docs`、`refactor`、`perf`、`test`、`chore`。scope 可省略，涉及具体命令时优先用命令名。
+## 文档规则
 
-一个提交只做一件事。格式化、重命名这类纯机械改动尽量单独提交，方便 review 和回滚。
+- 事实以代码为准。命令、默认值、退出码先看 `src/`，不要照抄旧文档。
+- 中英 README 逐节对应，信息量一致。
+- 版本锚点字符串被测试断言，不能手改。升版本走脚本。
+- `CHANGELOG.md` 按 Keep a Changelog 组织；历史版本在 [`docs/CHANGELOG_ARCHIVE.md`](./docs/CHANGELOG_ARCHIVE.md)。
+- 文档之间用相对链接，不写指向本仓库的 `https://github.com/.../blob/main/...`。
 
-## CHANGELOG 约定
+## 需要先讨论的改动
 
-用户可见的变更都要写进 `CHANGELOG.md` 的 `## [Unreleased]` 段，按 `Added` / `Changed` / `Fixed` / `Removed` 分类：
+先在 issue 里说明，拿到结论再写代码：
 
-- 描述「原来的现象 + 现在的行为」，而不是罗列改了哪些函数。
-- 会破坏兼容性的变更（退出码、输出结构、参数语义）必须在条目里显式标注。
-- 纯内部重构、测试补充、注释修正可以不写。
-- 发版时由维护者把 `[Unreleased]` 归档到具体版本号下。
+- 改 CLI ↔ daemon 协议或扩展消息协议。
+- 加扩展权限，或改 `manifest.json` 的 `host_permissions`。
+- 改命令默认值：超时、上限、并发、挑战策略。
+- 删除或重命名 JSON 字段、`error_code`。
+- 改退出码语义。
+- 改 `~/.atb` 下的文件格式。
 
-## PR 检查清单
-
-提交 PR 时请逐项确认：
-
-- [ ] 改动范围与 issue / 描述一致，没有夹带无关重构
-- [ ] 新增或修改的行为有对应测试；修 bug 时优先补一个能复现的用例
-- [ ] `cargo fmt` / `cargo clippy -D warnings` / `cargo test` 全部通过
-- [ ] `node tests/*.test.mjs` 通过
-- [ ] 改过 `assets/page_*.js` 时跑过 `npm run sync:extension`，且 `npm run check:extension` 通过
-- [ ] 没有手改 `assets/tmwd_cdp_bridge/ops/`
-- [ ] `CHANGELOG.md` 已更新（用户可见变更）
-- [ ] 涉及命令、参数、输出结构时，`README.md` 与 `README_EN.md` 已同步
-- [ ] 涉及版本号时使用 `npm run version`，没有手工散改
-
-维护者可能会要求拆分过大的 PR，或在合并前 squash 提交。
+参与讨论前请读 [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md)。

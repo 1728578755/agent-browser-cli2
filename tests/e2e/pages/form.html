@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>ATB E2E Form</title>
+</head>
+<body>
+<h1>登录表单</h1>
+
+<form id="login" action="/submit" method="post">
+  <p>
+    <label for="name">账号</label>
+    <input id="name" name="username" type="text" value="alice" autocomplete="username">
+  </p>
+  <p>
+    <label for="pass">密码</label>
+    <!-- password 字段：read / find / snapshot 必须把它标成 redacted 且值打码。 -->
+    <input id="pass" name="password" type="password" value="hunter2" autocomplete="current-password">
+  </p>
+  <p>
+    <label for="note">备注</label>
+    <textarea id="note" name="note">e2e</textarea>
+  </p>
+  <p><button id="submit" type="submit">登录</button></p>
+</form>
+</body>
+</html>

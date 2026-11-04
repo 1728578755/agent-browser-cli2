@@ -1,4 +1,4 @@
-// page_net.js 的返回字段契约（的上游）。
+// page_net.js 的返回字段契约（上游）。
 //
 // daemon 侧持久化规则时要读「真实数组」，而页面脚本在不同 action 下把数组放在
 // 不同字段里：
@@ -6,7 +6,7 @@
 //   hook    / routes  → routes_list:<array>  （hook 没有 all）
 // 且 hook 的 routes 历史上是**计数**（数字），保留它只是为了不打断旧调用方。
 //
-// 这几条一旦漂移，daemon 要么存进一个数字、要么永远读到空数组——就是
+// 这几条一旦漂移，daemon 要么存进一个数字、要么永远读到空数组—— 就是
 // 「把 hook 的 routes 计数当数组存下去」造成的规则丢失。这里不靠读源码猜，直接
 // 把 page_net.js 放进 vm 执行，调用 __abcNet 观察真实回包。
 import { readFileSync } from 'node:fs';
@@ -33,7 +33,7 @@ class FakeXhr {
   abort() {}
 }
 
-function loadPageNet() {
+function createContext(beforeRun) {
   const context = vm.createContext({
     window: {},
     location: { href: 'https://example.com/' },
@@ -53,9 +53,18 @@ function loadPageNet() {
     Date,
     URL,
   });
+  // beforeRun 用来在加载脚本之前布置页面现场（例如放一个 getter 型假槽位）。
+  if (beforeRun) beforeRun(context);
   vm.runInContext(readFileSync(PAGE_NET, 'utf8'), context, { filename: PAGE_NET });
+  return context;
+}
+
+function loadPageNet() {
+  const context = createContext();
   const fn = context.__abcNet || context.window.__abcNet;
   if (typeof fn !== 'function') throw new Error('page_net.js 未暴露 __abcNet');
+  // 入口挂的是 context.window 这个普通对象，不是 vm 全局；后续属性断言要用到它。
+  fn.__context = context;
   return fn;
 }
 
@@ -102,6 +111,37 @@ check('routes 的 count 等于数组长度', routes.count === routes.routes.leng
 const unroute = net({ action: 'unroute', match: rule.match });
 check('unroute 返回 removed 与 all 数组', typeof unroute.removed === 'number' && Array.isArray(unroute.all), JSON.stringify(unroute));
 check('unroute 之后 rules 为空', net({ action: 'routes' }).count === 0, JSON.stringify(net({ action: 'routes' })));
+
+// ---- 入口属性：stealth scrub 依赖的三个描述符位 ----
+//
+// 站点能不能发现我们，取决于 __abcNet 是不是「可枚举」；scrub 能不能删干净，
+// 取决于它是不是「可配置」；旧版本在页面上留下过不可配置绑定，那条路径靠
+// writable 赋值把实现换掉。三个位缺一，反检测就是纸面上的。
+const entryContext = net.__context;
+const entry = entryContext.window && Object.getOwnPropertyDescriptor(entryContext.window, '__abcNet');
+check('__abcNet 挂在 window 上且不可枚举', !!entry && entry.enumerable === false, JSON.stringify(entry));
+check('__abcNet 可配置（scrub 的 delete 才能真的成功）', !!entry && entry.configurable === true, JSON.stringify(entry));
+check('__abcNet 可写（旧版不可配置绑定时靠赋值兜底）', !!entry && entry.writable === true, JSON.stringify(entry));
+check('Object.keys(window) 里看不到 __abcNet', !Object.keys(entryContext.window).includes('__abcNet'), Object.keys(entryContext.window).join(','));
+
+// ---- 状态槽定位不能读值：getter 型槽位一次都不能被触发 ----
+//
+// 槽位定位是「按名字 + 描述符找」，不能退化成 window[name] 读取。否则页面放一个
+// 求值即报错/计数的 getter，我们每条命令都会踩上去 —— 那本身就是可检测的行为。
+let slotReads = 0;
+const probeContext = createContext((context) => {
+  Object.defineProperty(context.window, '__atb_net_deadbeef', {
+    get() { slotReads += 1; return {}; },
+    enumerable: false,
+    configurable: true,
+  });
+});
+const probeNet = probeContext.__abcNet;
+if (typeof probeNet === 'function') probeNet({ action: 'routes' });
+check('加载/调用时不读取状态槽的值（getter 未被触发）', slotReads === 0, 'reads=' + slotReads);
+
+// 放最后：前面已经用过 entry，删掉不影响上面的断言。
+check('delete 能真的删掉 __abcNet', delete entryContext.window.__abcNet === true);
 
 const failed = results.filter((item) => !item.ok);
 console.log(`\n${results.length - failed.length}/${results.length} passed`);

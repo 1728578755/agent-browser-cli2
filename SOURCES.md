@@ -1,153 +1,115 @@
-# 来源与依据
+# 来源与依赖
 
-本文件记录 `agent-browser-cli` 的项目性质、二次开发基线、代码派生来源、规范依据与第三方依赖，便于使用者核对出处、许可证与改造范围。
+本文件说明 `atb` 的代码来源、第三方依赖与许可边界，供审计和再分发时核对。
 
-- 项目版本：0.3.8
-- 更新日期：2026-11-02
+## 三类来源
 
-## 1. 项目性质与二次开发基线
+| 类别 | 内容 | 位置 |
+| --- | --- | --- |
+| 原创 | Rust daemon、CLI 命令面、协议与错误契约、构建发布脚本 | `src/`、`scripts/`、`.github/` |
+| 改造自上游 | 浏览器桥接、页面简化、扩展雏形 | `assets/atb_bridge/`、`assets/page_*.js`、`assets/simphtml_*.js` |
+| 第三方依赖 | Rust crates | `Cargo.toml` |
 
-**本项目是 [sleepinginsummer/agent-browser-cli](https://github.com/sleepinginsummer/agent-browser-cli) 的非官方二次开发；该上游项目又派生自 [GenericAgent](https://github.com/lsdefine/GenericAgent) 的 Web 工具链。本项目与两者均无隶属或背书关系。**
+## 上游项目
 
-| 项 | 说明 |
-|---|---|
-| 直接上游 | `sleepinginsummer/agent-browser-cli`，MIT，Copyright (c) 2026 sleepinginsummer |
-| 间接上游 | `GenericAgent`，MIT，Copyright (c) 2025 lsdefine |
-| 二次开发基线 | 直接上游的 **0.3.7** 代码（`package.json` / `Cargo.toml` 均为 0.3.7） |
-| 追溯参考 | 核对时（2026-11-02）直接上游 `main` HEAD 为 [`bcb43ea`](https://github.com/sleepinginsummer/agent-browser-cli/commit/bcb43ea0311278828bd3ea9d758bc80c18637e12)，仅作时间点参考，不代表逐行对应 |
-| 复用方式 | 在 0.3.7 代码基础上继续开发，未保留上游 Git 提交历史；本仓库不是 GitHub Fork 关系 |
-| 二次开发范围 | 见第 3 节；0.3.7 基线内容见第 2.1 节 |
-| 本仓库 npm 包 | `agent-browser-cli2`（平台子包 `agent-browser-cli2-*`）；CLI 命令仍为 `agent-browser-cli` |
+浏览器控制能力提取并改造自 GenericAgent：<https://github.com/lsdefine/GenericAgent>。
 
-本仓库的版本号从 0.3.7 升到 0.3.8，0.3.7 及更早的代码与文档基线来自直接上游；0.3.8 的增量是本项目的二次开发成果。
+沿用的思路与实现：
 
-## 2. 代码派生来源
+- `TMWebDriver`：扩展与本地进程之间的桥接、CDP 控制的组织方式。
+- `simphtml`：页面简化与正文/列表识别的思路。
+- `atb_bridge`：Chrome 扩展的雏形与消息形态。
 
-### 2.1 直接上游：sleepinginsummer/agent-browser-cli
+本仓库做的改造：
 
-| 项 | 内容 |
-|---|---|
-| 仓库 | <https://github.com/sleepinginsummer/agent-browser-cli> |
-| 许可证 | MIT License，Copyright (c) 2026 sleepinginsummer |
-| 基线版本 | 0.3.7 |
-| 上游定位 | 面向 Agent 的浏览器感知与控制 CLI，Rust daemon + Chrome 扩展桥 |
+- CLI 化：一条命令一个进程，输出 compact JSON，带稳定 `error_code` 与退出码。
+- daemon 用 Rust 实现，不依赖 Python 运行时。
+- 多标签、多智能体隔离（`--agent`、`agent-tabs.json`）。
+- 协议版本化（CLI↔daemon API `5`、扩展消息 `4`）与兼容性检查。
+- 端口配置、`api-token`、`trust-extension` 等本地信任机制。
+- 平台打包、npm 分发与 CI。
 
-本仓库的 0.3.7 基线整体来自该仓库，包括：
+上游许可以其仓库声明为准，本文件不做转述。当前仓库内的派生文件没有内嵌上游版权头；再分发或大幅改造这些文件前，请先核对上游仓库的许可与署名要求。
 
-| 范围 | 内容 |
-|---|---|
-| `src/` | Rust CLI、daemon、HTTP/WebSocket 服务、配置与协议 |
-| `assets/` | Chrome 扩展、页面脚本、`simphtml` 页面简化 |
-| `scripts/` / `npm/` | 构建、版本同步、扩展资源同步、npm 启动脚本 |
-| `tests/` | Node 合约测试、假扩展、手工验收脚本 |
-| `skills/` / `docs/` | Agent Skill、行为说明与能力现状 |
-| 根目录 | `package.json`、`Cargo.toml`、README、CHANGELOG、LICENSE 等 |
+## Rust 依赖
 
-该上游项目的 README 同样声明其浏览器控制能力派生自 GenericAgent。
+| crate | 用途 | 许可 |
+| --- | --- | --- |
+| anyhow | 错误上下文与错误链 | MIT OR Apache-2.0 |
+| axum | 本地 HTTP API 与 WebSocket 服务 | MIT |
+| clap | 命令行解析（derive） | MIT OR Apache-2.0 |
+| dirs | 跨平台配置目录 | MIT OR Apache-2.0 |
+| dunce | Windows 路径规范化 | CC0-1.0 OR MIT-0 OR Apache-2.0 |
+| fs2 | 文件锁，保护配置原子写 | MIT OR Apache-2.0 |
+| html5ever | HTML 解析 | MIT OR Apache-2.0 |
+| libc | Unix 系统调用与信号 | MIT OR Apache-2.0 |
+| markup5ever_rcdom | DOM 树，供页面简化使用 | MIT OR Apache-2.0 |
+| path-clean | 路径规范化 | MIT OR Apache-2.0 |
+| reqwest | HTTP 客户端（`rustls-tls`，无 OpenSSL） | MIT OR Apache-2.0 |
+| serde | 序列化框架 | MIT OR Apache-2.0 |
+| serde_json | JSON 读写 | MIT OR Apache-2.0 |
+| tokio | 异步运行时 | MIT |
+| url | URL 解析 | MIT OR Apache-2.0 |
+| uuid | 生成 v4 标识 | Apache-2.0 OR MIT |
+| windows-sys | Windows 文件系统与原子替换 | MIT OR Apache-2.0 |
 
-### 2.2 间接上游：GenericAgent
+`windows-sys` 仅 Windows 目标启用。许可取自各 crate 的发布元数据，升级版本后可能变化，复核时以 crate 自身声明为准。
 
-| 项 | 内容 |
-|---|---|
-| 仓库 | <https://github.com/lsdefine/GenericAgent> |
-| 许可证 | MIT License，Copyright (c) 2025 lsdefine |
-| 上游定位 | 自演化 Agent，通过 TMWebDriver 注入真实浏览器，保留登录态 |
+`Cargo.lock` 固定了传递依赖的具体版本；完整依赖树以该文件为准。
 
-GenericAgent 的 Web 工具链经直接上游传入本仓库，主要对应：
+## 构建与发布
 
-| 本仓库路径 | GenericAgent 对应 | 派生内容 |
-|---|---|---|
-| `assets/tmwd_cdp_bridge/` | `tmwd_cdp_bridge/` | Chrome MV3 扩展骨架、WebSocket 桥接、CDP attach/detach、标签页与会话标识 |
-| `assets/simphtml_opt.js` | `simphtml` | 页面简化与去噪算法（固定浮层处理、可见性判定、文本抽取） |
-| `assets/tmwd_cdp_bridge/background.js` | `TMWebDriver.py` / `tmwd_cdp_bridge` | 本地 WebSocket 客户端与命令分发思路 |
+| 脚本 | 作用 |
+| --- | --- |
+| `scripts/sync-version.mjs` | 以 `package.json` 为准，同步 `Cargo.toml`、README 版本行与徽章 |
+| `scripts/sync-optional-deps.mjs` | 同步平台包的可选依赖 |
+| `scripts/sync-extension-assets.mjs` | 同步扩展与页面脚本副本；`--check` 只校验 |
+| `scripts/package-platform.mjs` | 生成单平台 npm 包 |
+| `scripts/deploy-extension.mjs` | 把扩展部署到浏览器加载目录，逐文件原子替换并校验 |
 
-> 两个上游的版权声明与 MIT 许可全文均收录于仓库根目录 [NOTICE](./NOTICE)；本项目自身的 MIT 许可见 [LICENSE](./LICENSE)（保留了两层上游版权行）。
+GitHub Actions：
 
-### 2.3 本项目新增/重写
+- `ci.yml`：Rust 构建与测试、扩展语法检查、Node 测试、端到端测试、仓库卫生检查。
+- `publish.yml`：push `v*` 标签或手动触发，矩阵构建 5 个平台包（macOS arm64/x64、Linux glibc x64/arm64、Windows x64），随后发布主包。
 
-0.3.7 基线之上，本项目完成的重写与新增集中在 `src/`、`assets/page_*.js`、`tests/`、`scripts/`、`docs/`、`skills/` 与构建发布配置，范围见第 3 节。这些增量以 MIT 许可证发布，但仍需保留上游版权与许可声明。
+npm 发布开启 provenance（`publishConfig.provenance = true`），主包通过 `optionalDependencies` 拉取对应平台包。
 
-## 3. 二次开发新增内容
+## 扩展与页面脚本
 
-相对 0.3.7 基线，本项目在二次开发中新增或重写了以下能力（详细行为见 [CHANGELOG.md](./CHANGELOG.md) 的 v0.3.8 段）：
+- `assets/atb_bridge/`：MV3 扩展，`manifest.json` 是扩展版本的唯一真相源。
+- `assets/page_*.js`：页面脚本的唯一真源，直接修改这里。
+- `assets/atb_bridge/ops/`：页面脚本的构建副本，由 `sync-extension-assets.mjs` 生成，不要手改。
+- `assets/simphtml_*.js`：改造自上游的页面简化脚本。
 
-| 领域 | 二次开发内容 | 主要落点 |
-|---|---|---|
-| 运行时 | 本机 HTTP API、启动锁、会话路由、空闲退出、job 队列 | `src/server.rs`、`src/cli.rs`、`src/config.rs` |
-| 页面读取 | `read` / `find` / `scan --fast` / `snapshot --js`，单遍遍历、预算限流、隐藏内容读取 | `assets/page_read.js`、`page_find.js`、`page_snapshot.js` |
-| 页面动作 | `click` / `fill` / `hover` / `select` / `check` / `scroll` / `wait`，支持 iframe 与单次注入 | `assets/page_action.js`、`page_wait.js` |
-| CSP 兼容 | `eval` 被拦截时改用扩展注入 `ops/page_*.js` 的无 eval 通道，结果标记 `via:"no-eval"` | `src/server.rs`、`background.js` |
-| 网络拦截 | `net fetch` / `hook` / `log` / `mock` / `routes`；页面引擎与 CDP `Fetch` 双通道，支持请求/响应改写 | `assets/page_net.js`、`background.js` |
-| 挑战页 | `challenge status` / `wait` / `solve` / `focus`，只识别、等待与转人工，不提供自动破解 | `assets/page_challenge.js`、`src/server.rs` |
-| 异步与批量 | `--async` + `job list/get/wait/cancel`、`run`、`batch`、`broadcast` | `src/server.rs`、`src/cli.rs` |
-| 多浏览器 | `browsers`、`tabtree`、Profile Label、按 `browser:profile` 隔离会话与网络规则 | `src/server.rs`、`background.js` |
-| 安全加固 | `trust-extension` 白名单与握手 token、token 指纹、配置原子写、fail-closed | `src/config.rs`、`src/cli.rs` |
-| 工程化 | Node 合约测试、假扩展 E2E、真机验收脚本、扩展资源同步守卫、CI/发布流水线、Agent Skill | `tests/`、`.github/workflows/`、`scripts/`、`skills/` |
+## 素材
 
-## 4. 规范与平台依据
+`assets/atb_bridge/icons/bot-*.png`（16/32/48/128）随仓库以 MIT 分发，不单独声明原创作者。替换图标时保持这四个尺寸与文件名。
 
-二次开发所依据的公开规范与平台文档：
+`tests/fixtures/live/vendor/react*.production.min.js` 是 React 官方构建产物，仅用于本地测试页，版权归 Meta Platforms, Inc. 及其关联方，按 MIT 许可随附，文件头保留了原始许可声明。
 
-| 依据 | 用途 | 链接 |
-|---|---|---|
-| Chrome DevTools Protocol（CDP） | `Page` / `Runtime` / `Network` / `Fetch` / `DOM` / `Input` / `Target` 等域；截图、网络拦截、控制台、文件上传 | <https://chromedevtools.github.io/devtools-protocol/> |
-| Chrome Extensions Manifest V3 | 扩展清单、Service Worker、`chrome.scripting` / `debugger` / `alarms` / `storage` / `downloads` | <https://developer.chrome.com/docs/extensions/reference/manifest> |
-| WebSocket（RFC 6455） | 扩展与本机 daemon 之间的桥接传输 | <https://www.rfc-editor.org/rfc/rfc6455> |
-| HTML Living Standard | 页面解析与序列化（`html5ever` / `markup5ever_rcdom` 实现） | <https://html.spec.whatwg.org/> |
-| URL Standard | URL 解析、规范化与本地文件路径判定 | <https://url.spec.whatwg.org/> |
-| HTTP Semantics（RFC 9110） | 本机 HTTP API 与页面内 `fetch` 语义 | <https://www.rfc-editor.org/rfc/rfc9110> |
+## 规范参考
 
-扩展最低版本 `minimum_chrome_version: 120` 的推导依据记录在 `assets/tmwd_cdp_bridge/background.js` 文件头：`scripting.executeScript` 的 `world: "MAIN"`、`storage.session`、`alarms` 的 30 秒最小粒度等能力下限。
+- `CHANGELOG.md` 的结构参考 Keep a Changelog。
+- 版本号遵循 Semantic Versioning。
+- 行为准则参考 Contributor Covenant 2.1。
 
-## 5. 第三方依赖
+这些是写作与流程参考，不改变本项目自身的许可。
 
-### 5.1 Rust 直接依赖
+## 许可证边界
 
-版本以 `Cargo.toml` 为准，实际锁定版本见 `Cargo.lock`。
+- 本项目以 MIT 许可发布，Copyright (c) 2026 1728578755，全文见 [LICENSE](./LICENSE)。本项目派生自 MIT 许可的上游项目，上游版权声明见 [NOTICE](./NOTICE)。
+- 上游项目与第三方 crate 各自保留其许可，不因本项目采用 MIT 而改变。
+- 再分发二进制或源码时，保留 `LICENSE`、上游版权声明与依赖许可文本；如需对外分发，建议同时生成第三方许可清单。
+- 修改派生自上游的文件时，不要移除已有的版权或来源注释；如果上游许可要求署名，在该文件顶部补上。
 
-| crate | 版本约束 | 许可证 | 用途 |
-|---|---|---|---|
-| `anyhow` | 1.0 | MIT OR Apache-2.0 | 错误上下文 |
-| `axum` | 0.7 | MIT | 本机 HTTP / WebSocket 服务 |
-| `clap` | 4.5 | MIT OR Apache-2.0 | CLI 参数解析 |
-| `dirs` | 6.0 | MIT OR Apache-2.0 | 用户配置目录 |
-| `dunce` | 1.0 | CC0-1.0 OR MIT-0 OR Apache-2.0 | Windows 路径规范化 |
-| `fs2` | 0.4 | MIT OR Apache-2.0 | 文件锁 |
-| `html5ever` | 0.27 | MIT OR Apache-2.0 | HTML 解析 |
-| `libc` | 0.2 | MIT OR Apache-2.0 | Unix 权限与进程控制 |
-| `markup5ever_rcdom` | 0.3 | MIT OR Apache-2.0 | DOM 树 |
-| `path-clean` | 1.0 | MIT OR Apache-2.0 | 路径清理 |
-| `reqwest` | 0.12 | MIT OR Apache-2.0 | 本机 HTTP 客户端 |
-| `serde` | 1.0 | MIT OR Apache-2.0 | 序列化 |
-| `serde_json` | 1.0 | MIT OR Apache-2.0 | JSON |
-| `tokio` | 1.48 | MIT | 异步运行时 |
-| `url` | 2.5 | MIT OR Apache-2.0 | URL 解析 |
-| `uuid` | 1.18 | Apache-2.0 OR MIT | 会话 / token 生成 |
+## 维护方式
 
-传递依赖的版本与许可证可由 `cargo metadata` 或 `cargo deny` 复核。
+新增或升级依赖、扩大上游派生范围、替换素材、变更许可证时，同步更新本文件。
 
-### 5.2 Node 侧
+CI 不校验本文件内容，由维护者人工确认。
 
-- 运行时无第三方 npm 依赖；`package.json` 只有本项目的 5 个平台二进制子包（`optionalDependencies`）。
-- CI 使用 GitHub Actions 官方 action 与 `dtolnay/rust-toolchain`、`Swatinem/rust-cache`。
+## 相关文档
 
-## 6. 名称与商标
-
-- `GenericAgent`、`TMWebDriver`、`simphtml`、`tmwd_cdp_bridge` 的名称与相关权利归上游项目及其作者所有。
-- `agent-browser-cli` 直接上游的名称与相关权利归 `sleepinginsummer` 所有。
-- `Chrome`、`Google Chrome` 是 Google LLC 的商标。
-- 本项目与上述项目/公司相互独立；提及名称仅用于说明来源与兼容性，不构成背书。
-
-## 7. 许可合规
-
-- 本项目以 MIT License 发布，全文见 [LICENSE](./LICENSE)；其中保留 `sleepinginsummer` 与 `1728578755` 两行版权声明。
-- 两个上游的 MIT 版权声明与许可全文收录于 [NOTICE](./NOTICE)。
-- 如果你分发修改后的版本，请保留 `LICENSE`、`NOTICE` 与本文件，并在派生文件头保留来源说明。
-
-## 8. 变更记录
-
-| 日期 | 变更 |
-|---|---|
-| 2026-11-02 | 首次整理并公开来源、规范依据与依赖清单 |
-| 2026-11-02 | 补充二次开发基线、上游追溯参考与二次开发新增范围 |
-| 2026-11-02 | 补回直接上游 `sleepinginsummer/agent-browser-cli`（0.3.7）与双层版权声明 |
+- 隐私与本地数据：[PRIVACY.md](./PRIVACY.md)
+- 安全边界与威胁模型：[SECURITY.md](./SECURITY.md)
+- 贡献流程：[CONTRIBUTING.md](./CONTRIBUTING.md)

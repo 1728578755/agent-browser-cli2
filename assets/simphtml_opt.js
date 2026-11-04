@@ -1,7 +1,35 @@
-// Derived from GenericAgent's simphtml (MIT, Copyright (c) 2025 lsdefine).
-// See SOURCES.md and NOTICE for the upstream license.
-function optHTML(text_only=false, opts) {
+// 页面侧递归克隆必须和 Rust 侧同阈值（html.rs 的 MAX_DOM_DEPTH = 512）。
+// 构造成本极低的超深嵌套 DOM 会让 cloneNode 抛 RangeError: Maximum call stack
+// size exceeded，而 optHTML 没有任何兜底 → scan 直接报错。
+// 另外整个函数套一层 try/catch，异常统一变成 `__ABC_SCAN_ERROR__<msg>` 哨兵，
+// 由 daemon 转成结构化错误，而不是一句通道级 "pageOp failed"。
+const __ABC_MAX_DOM_DEPTH = 512;
+
+/// 口令类字段的值不写进 scan 结果：scan 的 HTML 会进 CLI 输出
+/// 与 agent 上下文，autofill 出来的口令同样是明文。
+function __abcOptSecret(el) {
+  if (!el || el.nodeType !== 1) return false;
+  const type = String(el.type || '').toLowerCase();
+  if (type === 'password') return true;
+  const autocomplete = String(el.getAttribute && el.getAttribute('autocomplete') || '').toLowerCase();
+  return /current-password|new-password|cc-number|cc-csc|one-time-code/.test(autocomplete);
+}
+
+function optHTML(text_only = false, opts) {
+  try {
+    return __abcOptHTMLBody(text_only, opts);
+  } catch (e) {
+    return '__ABC_SCAN_ERROR__' + ((e && e.message) ? e.message : String(e));
+  }
+}
+
+function __abcOptHTMLBody(text_only=false, opts) {
   opts = opts || {};
+  // 调试日志默认关闭：这些 console.log 打在**第三方页面**的控制台里，
+  // 既污染用户页面，也把「有人在用自动化工具」写在了明处；而且 console 会持有
+  // 节点引用导致不可回收。需要时传 {debug:true}。
+  const __debug = opts.debug === true;
+  let __depthCapHit = false;
   // 超大页面上「克隆 + 逐节点 getComputedStyle/getBoundingClientRect」会到秒级，
   // 这里加一个硬预算：超过后不再深入，返回带截断标记的部分结果。
   const __nodeBudget = opts.nodeBudget > 0 ? Math.floor(opts.nodeBudget) : 0;
@@ -22,8 +50,11 @@ function optHTML(text_only=false, opts) {
 function createEnhancedDOMCopy() {  
   const nodeInfo = new WeakMap();  
   const ignoreTags = ['SCRIPT', 'STYLE', 'NOSCRIPT', 'META', 'LINK', 'COLGROUP', 'COL', 'TEMPLATE', 'PARAM', 'SOURCE'];  
-  const ignoreIds = ['agent-browser-cli-ind'];
-  function cloneNode(sourceNode, keep=false) {  
+  // 扩展状态角标是纯 UI，不该出现在 scan 的正文里。
+  // atb-status-host 是 5.0 起的 Shadow DOM 宿主，atb-ind 是历史版本留下的节点。
+  const ignoreIds = ['atb-ind', 'atb-status-host'];
+  function cloneNode(sourceNode, keep=false, depth=0) {  
+    if (depth > __ABC_MAX_DOM_DEPTH) { __depthCapHit = true; return null; }
     if (__nodeBudget) {
       __visited += 1;
       if (__visited > __nodeBudget) { __budgetHit = true; return null; }
@@ -37,7 +68,15 @@ function createEnhancedDOMCopy() {
     }  
     if (sourceNode.nodeType === 3) return sourceNode.cloneNode(false);  
     const clone = sourceNode.cloneNode(false);
-    if ((sourceNode.tagName === 'INPUT' || sourceNode.tagName === 'TEXTAREA') && sourceNode.value) clone.setAttribute('value', sourceNode.value);
+    // 派生文本与默认属性同样算敏感面：secret 字段**无条件**改写 value。
+    // 旧写法 `&& sourceNode.value` 有两处漏：① cloneNode(false) 会把源节点上的
+    // value="明文" 属性一起复制，value 为空/未定义时这层保护整个不生效；
+    // ② 未聚焦时 property 可能还没同步过来。所以 secret 判断优先、不看有没有值。
+    const __secretField = __abcOptSecret(sourceNode);
+    if (sourceNode.tagName === 'INPUT' || sourceNode.tagName === 'TEXTAREA') {
+      if (__secretField) clone.setAttribute('value', '•••');
+      else if (sourceNode.value) clone.setAttribute('value', sourceNode.value);
+    }
     if (sourceNode.tagName === 'INPUT' && (sourceNode.type === 'radio' || sourceNode.type === 'checkbox') && sourceNode.checked) clone.setAttribute('checked', '');
     else if (sourceNode.tagName === 'SELECT' && sourceNode.value) clone.setAttribute('data-selected', sourceNode.value);  
     try { if (sourceNode.matches && sourceNode.matches(':-webkit-autofill')) { clone.setAttribute('data-autofilled', 'true'); if (!sourceNode.value) clone.setAttribute('value', '⚠️受保护-读tmwebdriver_sop的autofill章节提取'); } } catch(e) {}
@@ -47,11 +86,16 @@ function createEnhancedDOMCopy() {
     const _ddItems = isDropdown ? sourceNode.querySelectorAll('a, button, [role="menuitem"], li').length : 0;
     const isSmallDropdown = _ddItems > 0 && _ddItems <= 7 && sourceNode.textContent.length < 500;  
 
-    const childNodes = [];  
-    for (const child of sourceNode.childNodes) {  
-      const childClone = cloneNode(child, keep || isSmallDropdown);  
-      if (childClone) childNodes.push(childClone);  
-    }  
+    const childNodes = [];
+    // secret 的 TEXTAREA 正文就是明文：value 属性改了也没用，子文本节点会照样
+    // 序列化进 <textarea>…</textarea>。这类节点的子节点整段跳过。
+    if (!(__secretField && sourceNode.tagName === 'TEXTAREA')) {
+      for (const child of sourceNode.childNodes) {  
+        const childClone = cloneNode(child, keep || isSmallDropdown, depth + 1);  
+        if (childClone) childNodes.push(childClone);  
+      }  
+    }
+    let iframeWrapper = null;
     if (sourceNode.tagName === 'IFRAME') {
       try {
         const iDoc = sourceNode.contentDocument || sourceNode.contentWindow?.document;
@@ -59,16 +103,19 @@ function createEnhancedDOMCopy() {
           const wrapper = document.createElement('div');
           wrapper.setAttribute('data-iframe-content', sourceNode.src || '');
           for (const ch of iDoc.body.childNodes) {
-            const c = cloneNode(ch, keep);
+            const c = cloneNode(ch, keep, depth + 1);
             if (c) wrapper.appendChild(c);
           }
-          if (wrapper.childNodes.length) childNodes.push(wrapper);
+          if (wrapper.childNodes.length) {
+            childNodes.push(wrapper);
+            iframeWrapper = wrapper;
+          }
         }
       } catch(e) {}
     }
     if (sourceNode.shadowRoot) {
       for (const shadowChild of sourceNode.shadowRoot.childNodes) {
-        const shadowClone = cloneNode(shadowChild, keep);
+        const shadowClone = cloneNode(shadowChild, keep, depth + 1);
         if (shadowClone) childNodes.push(shadowClone);
       }
     }
@@ -141,6 +188,14 @@ function createEnhancedDOMCopy() {
       }
     }
 
+    // **关键**：把 info 真正写回 WeakMap。以前只算不写（全文件没有 nodeInfo.set），
+    // 于是 analyzeNode 的入口守卫 `!getNodeInfo(node)` 永远命中 → K:main / R:covered /
+    // R:floatingAd 一个都不打，`[data-mark^="R:"]` 删不掉任何节点，顶层 fixed 对话框
+    // 提升也全被 `!info?.rect` 过滤掉 —— scan 的「剔除被遮挡内容 / 浮层广告」整条
+    // 链路是死代码，每次都白做分析还照样输出广告层。
+    nodeInfo.set(clone, info);
+    if (iframeWrapper) nodeInfo.set(iframeWrapper, info);
+
     if (sourceNode.nodeType === 1 && sourceNode.tagName === 'DIV') {    
       if (!hasValidChildren && !sourceNode.textContent.trim()) return null; 
     }  
@@ -182,7 +237,8 @@ if (text_only) {
 }
 const viewportArea = window.innerWidth * window.innerHeight; 
 
-function analyzeNode(node, pPathType='main') {  
+function analyzeNode(node, pPathType='main', depth=0) {  
+    if (depth > 64) return;
     // 处理非元素节点和叶节点  
     if (node.nodeType !== 1 || !node.children.length) {  
       node.nodeType === 1 && (node.dataset.mark = 'K:leaf');  
@@ -197,7 +253,7 @@ function analyzeNode(node, pPathType='main') {
     const children = Array.from(node.children);  
     if (children.length === 1) {  
       node.dataset.mark = 'K:container';  
-      return analyzeNode(children[0], pathType);  
+      return analyzeNode(children[0], pathType, depth + 1);  
     }  
     if (children.length > 10) return;
     
@@ -216,21 +272,24 @@ function analyzeNode(node, pPathType='main') {
     if (isOverlay) handleOverlayContainer(childrenInfo, pathType);  
     else handlePartitionContainer(childrenInfo, pathType);  
 
-    console.log(`${isOverlay ? '覆盖' : '划分'}容器:`, node, `子元素数量: ${children.length}`);  
-    console.log('子元素及标记:', children.map(child => ({   
-      element: child,   
-      mark: child.dataset.mark || '无',  
-      info: getNodeInfo ? getNodeInfo(child) : undefined  
-    })));  
+    if (__debug) {
+      console.log(`${isOverlay ? '覆盖' : '划分'}容器:`, node, `子元素数量: ${children.length}`);
+      console.log('子元素及标记:', children.map(child => ({
+        element: child,
+        mark: child.dataset.mark || '无',
+        info: getNodeInfo ? getNodeInfo(child) : undefined
+      })));
+    }
     for (const child of children)  
-      if (!child.dataset.mark || child.dataset.mark[0] !== 'R') analyzeNode(child, pathType);  
+      if (!child.dataset.mark || child.dataset.mark[0] !== 'R') analyzeNode(child, pathType, depth + 1);  
   }  
   
   // 处理划分容器  
   function handlePartitionContainer(childrenInfo, pathType) {  
     childrenInfo.sort((a, b) => b.area - a.area);
     const totalArea = childrenInfo.reduce((sum, item) => sum + item.area, 0);  
-    console.log(childrenInfo[0].area / totalArea);
+    // 遗留调试语句（原 console.log(childrenInfo[0].area / totalArea)）已删：
+    // 它每处理一个划分容器就往**被访页面**的控制台打一行，属可见污染。
     const hasMainElement = childrenInfo.length >= 1 &&   
                           (childrenInfo[0].area / totalArea > 0.5) &&   
                           (childrenInfo.length === 1 || childrenInfo[0].area > childrenInfo[1].area * 2);  
@@ -250,14 +309,9 @@ function analyzeNode(node, pPathType='main') {
         else child.node.dataset.mark = 'K:nonEssential';  
       }  
     } else {  
-      return; // relaxed: skip equalmany filtering, list truncation handles token budget
-      const uniqueClassNames = new Set(childrenInfo.map(item => item.node.getAttribute('class') || '')).size;  
-      const highClassNameVariety = uniqueClassNames >= childrenInfo.length * 0.8;  
-      if (pathType !== 'main' && highClassNameVariety && childrenInfo.length > 5) {
-        childrenInfo.forEach(child => child.node.dataset.mark = 'R:equalmany');  
-      } else {
-        childrenInfo.forEach(child => child.node.dataset.mark = 'K:equal');  
-      }
+      // relaxed 模式刻意跳过 equalmany 去重，避免误删结构不同的容器；
+      // token 预算由后续的列表截断兜底。
+      return;
     }  
   }  
 
@@ -273,7 +327,7 @@ function analyzeNode(node, pPathType='main') {
     const _efp = document.elementFromPoint(window.innerWidth/2, window.innerHeight/2);
     if (_efp) { let _el = _efp; while (_el) { const _h = childrenInfo.find(c => c.node.id && c.node.id === _el.id); if (_h) { _h.zIndex = 9999; break; } _el = _el.parentElement; } }
     const sorted = [...childrenInfo].sort((a, b) => b.zIndex - a.zIndex);  
-    console.log('排序后的子元素:', sorted);
+    if (__debug) console.log('排序后的子元素:', sorted);
     if (sorted.length === 0) return;  
     
     const top = sorted[0];  
@@ -343,7 +397,19 @@ const _fc = [...domCopy.querySelectorAll('*')].filter(el => {
 }).filter((el, _, arr) => !arr.some(o => o !== el && o.contains(el)))
   .sort((a, b) => (getNodeInfo(b).rect.width * getNodeInfo(b).rect.height) - (getNodeInfo(a).rect.width * getNodeInfo(a).rect.height))
   .slice(0, 2);
-_fc.forEach(el => { const r = getNodeInfo(el).rect; console.log('[simphtml] Hoisted fixed dialog:', el.tagName + (el.id ? '#'+el.id : '') + (el.className ? '.'+String(el.className).split(' ')[0] : ''), Math.round(r.width)+'x'+Math.round(r.height), Math.round(100*r.width*r.height/viewportArea)+'%'); el.parentNode.removeChild(el); domCopy.appendChild(el); });
+_fc.forEach(el => {
+  const r = getNodeInfo(el).rect;
+  if (__debug) {
+    console.log(
+      '[simphtml] Hoisted fixed dialog:',
+      el.tagName + (el.id ? '#' + el.id : '') + (el.className ? '.' + String(el.className).split(' ')[0] : ''),
+      Math.round(r.width) + 'x' + Math.round(r.height),
+      Math.round(100 * r.width * r.height / viewportArea) + '%'
+    );
+  }
+  el.parentNode.removeChild(el);
+  domCopy.appendChild(el);
+});
 const result = analyzeNode(domCopy); 
 domCopy.querySelectorAll('[data-mark^="R:"]').forEach(el=>el.parentNode?.removeChild(el));  
 let root = domCopy;  
@@ -368,6 +434,10 @@ const __html = root.outerHTML;
 const __notes = [];
 if (__skipLayout) __notes.push('layout skipped: ' + __totalElements + ' elements > ' + __layoutLimit + ' (visibility by attributes only; use read/scan --fast for text)');
 if (__budgetHit) __notes.push('truncated: scanned ' + __visited + ' nodes (budget ' + __nodeBudget + ')');
+if (__depthCapHit) __notes.push('truncated: DOM deeper than ' + __ABC_MAX_DOM_DEPTH + ' levels');
 return __notes.length ? '<!-- scan: ' + __notes.join(' | ') + ' -->\n' + __html : __html;
     }
-optHTML()
+
+// 这里**不要**再写一个裸的 `optHTML()` 调用。历史上文件末尾就多这一句，
+// 于是每次把这段脚本注入页面（哪怕只是准备调用 optHTML）都会先对整页做一遍
+// 全量克隆：多付一次秒级开销，还会在页面上留下一次多余的布局读取。

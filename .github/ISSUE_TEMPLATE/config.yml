@@ -1,5 +1,8 @@
-blank_issues_enabled: true
+blank_issues_enabled: false
 contact_links:
-  - name: 报告安全漏洞
-    url: https://github.com/1728578755/agent-browser-cli2/security/advisories/new
-    about: 安全问题请走私密渠道，不要开公开 issue。
+  - name: Security report
+    url: https://github.com/1728578755/atb-cli/security/policy
+    about: Please report vulnerabilities privately through the security policy.
+  - name: Usage questions
+    url: https://github.com/1728578755/atb-cli#readme
+    about: See the README for installation, commands, and configuration.

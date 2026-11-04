@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>ATB E2E SPA</title>
+</head>
+<body>
+<h1>ATB E2E SPA</h1>
+<p>点按钮 → <code>history.pushState</code> 换页 → 300ms 后异步渲染列表。</p>
+<p>当前视图：<span id="view">home</span></p>
+
+<button id="go" type="button">进入详情</button>
+<ul id="list"></ul>
+
+<script>
+  document.getElementById('go').addEventListener('click', function () {
+    // 只有 pushState，不发请求：验证「URL 变了但页面没重载」的场景。
+    history.pushState({ view: 'detail' }, '', '/spa/detail');
+    document.getElementById('view').textContent = 'detail';
+    setTimeout(function () {
+      const list = document.getElementById('list');
+      list.innerHTML = '';
+      ['alpha', 'beta', 'gamma'].forEach(function (name) {
+        const li = document.createElement('li');
+        li.textContent = name;
+        list.appendChild(li);
+      });
+    }, 300);
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Covered fixture</title>
+  <style>
+    body { font-family: sans-serif; margin: 0; height: 100vh; display: grid; place-items: center; }
+    #target { padding: 12px 24px; font-size: 16px; }
+    #overlay { position: fixed; inset: 0; background: rgba(0, 0, 0, .28); z-index: 99999; }
+  </style>
+</head>
+<body>
+  <!-- 按钮被一层全屏遮罩盖住（真实 cookie 弹窗/登录浮层的形态）。
+       合成事件仍会派发到按钮本身，所以「命令成功」和「用户点不到」会同时成立。 -->
+  <main>
+    <h1>Covered</h1>
+    <button id="target">Submit order</button>
+  </main>
+  <div id="overlay"></div>
+  <script>
+    window.__targetClicked = 0;
+    document.getElementById('target').addEventListener('click', () => { window.__targetClicked += 1; });
+  </script>
+</body>
+</html>

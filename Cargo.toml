@@ -1,12 +1,19 @@
 [package]
-name = "agent-browser-cli"
-version = "0.3.8"
+name = "atb"
+version = "0.7.1"
 edition = "2021"
 license = "MIT"
+description = "Agent-oriented browser CLI with multi-tab and multi-agent isolation, backed by a native Rust daemon."
+repository = "https://github.com/1728578755/atb-cli"
 
 [[bin]]
-name = "agent-browser-cli"
+name = "atb"
 path = "src/main.rs"
+
+[target.'cfg(windows)'.dependencies]
+# 只为 config 的「真原子替换」（MoveFileExW）而加；windows-sys 已经在依赖图里
+# （tokio/mio 的传递依赖），所以这里不会新增下载，也不明显增加体积。
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [dependencies]
 anyhow = "1.0"

@@ -36,13 +36,47 @@ pub fn js_page_wait() -> &'static str {
     include_str!("../assets/page_wait.js")
 }
 
-/// 挑战页 / 验证码识别（只识别与等待，不自动破解）。
+/// 挑战页 / 验证码识别（识别与等待）。
 pub fn js_page_challenge() -> &'static str {
     include_str!("../assets/page_challenge.js")
 }
 
+/// 自动化痕迹审计与自查清理（stealth audit / scrub）。
+pub fn js_page_stealth() -> &'static str {
+    include_str!("../assets/page_stealth.js")
+}
+
+/// 输入 HTML 的字节上限。
+///
+/// 超过这个量级就不再交给 html5ever：8MB+ 的文档既可能是几百万层嵌套，也可能是
+/// 生成式页面吐出来的巨型内联脚本，解析出来的 DOM 本身就能把内存和栈吃满（R1-01）。
+/// 降级成纯文本仍然可用，且成本只是 O(n) 的字节扫描，不会有栈深度问题。
+const MAX_HTML_INPUT_BYTES: usize = 8 * 1024 * 1024;
+
+/// 解析后允许的 DOM 节点数上限。
+///
+/// 输入字节上限挡不住「节点爆炸」：2 MB 的 `<div></div>` 重复串就能生成 30 万个
+/// 元素节点，而每个节点都要分配 `Node` + `Vec<Handle>` + 属性表，实际内存是输入的
+/// 十几倍；再叠加后续 `clean_node` 和序列化，很容易把 daemon 的常驻内存顶穿。
+/// 20 万节点已经远超正常页面正文的量级（真实页面通常在几千到几万），
+/// 超限时降级成纯文本比「优化到一半 OOM」更可用。
+const MAX_HTML_NODES: usize = 200_000;
+
 pub fn optimize_html_for_tokens(html: &str) -> String {
+    if html.len() > MAX_HTML_INPUT_BYTES {
+        // 超限**不解析**：直接给纯文本降级结果，并显式标注原因，避免调用方以为
+        // 拿到的是「优化过但内容完整」的 HTML。
+        return format!("[html truncated: input > 8MB] {}", strip_tags(html));
+    }
     let dom = parse_document(RcDom::default(), ParseOpts::default()).one(html.to_string());
+    if count_nodes(&dom.document) > MAX_HTML_NODES {
+        // 超限**不继续优化**：直接给纯文本降级结果，并显式标注原因。
+        //
+        // 丢弃前必须先迭代拆链：`RcDom` 的节点是 `Rc<Node>`，直接让它离开作用域会沿
+        // children 递归析构，深链/宽树都可能把栈打爆（R1-01 的同一类问题）。
+        discard_subtree(&dom.document);
+        return format!("[html nodes > 200k] {}", strip_tags(html));
+    }
     clean_node(&dom.document);
     let mut bytes = Vec::new();
     let serializable = SerializableHandle::from(dom.document.clone());
@@ -51,6 +85,40 @@ pub fn optimize_html_for_tokens(html: &str) -> String {
     } else {
         html.to_string()
     }
+}
+
+/// 迭代遍历统计节点数（深度优先 + 显式栈），超过上限立刻返回。
+///
+/// 刻意不递归：这个函数的调用点正是「树可能极深」的场景，递归在数完之前就会先栈溢出。
+/// 提前返回也顺手把宽树的遍历成本砍到上限附近。
+fn count_nodes(root: &Handle) -> usize {
+    let mut count = 0usize;
+    let mut pending: Vec<Handle> = vec![root.clone()];
+    while let Some(node) = pending.pop() {
+        count += 1;
+        if count > MAX_HTML_NODES {
+            return count;
+        }
+        pending.extend(node.children.borrow().iter().cloned());
+    }
+    count
+}
+
+/// 超限输入的降级：只保留标签外的文本。
+///
+/// 不解析 DOM、不递归，栈深度恒定为 1；也不做实体解码（降级路径只要求「可读」）。
+fn strip_tags(html: &str) -> String {
+    let mut out = String::with_capacity(html.len() / 8);
+    let mut in_tag = false;
+    for ch in html.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' if in_tag => in_tag = false,
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out.trim().to_string()
 }
 
 /// DOM 递归下钻的深度上限。
@@ -68,7 +136,11 @@ fn clean_node(handle: &Handle) {
 fn clean_node_at(handle: &Handle, depth: usize) {
     if depth >= MAX_DOM_DEPTH {
         // 极端嵌套（恶意/生成式 DOM）：停止下钻，保留该层节点本身但丢弃子树，避免进程 panic。
-        handle.children.borrow_mut().clear();
+        //
+        // 不能直接 `children.borrow_mut().clear()`：清空会把整棵子树交给 `Rc` 递归析构，
+        // 10k+ 层的深链照样把栈打爆（R1-01）。改成分批摘链 + 迭代 drop，每层 Drop 时
+        // 它的 children 已经是空的，析构深度恒为 O(1)。
+        discard_subtree(handle);
         return;
     }
     if let NodeData::Element { name, attrs, .. } = &handle.data {
@@ -84,7 +156,9 @@ fn clean_node_at(handle: &Handle, depth: usize) {
                     || key.starts_with("data-test")
             });
             for attr in attrs.iter_mut() {
-                if attr.value.len() > 100 {
+                // 阈值与截断必须同一口径（都按字符）：`len()` 是字节数，中文属性值
+                // 会被提前截断成半截观感（R1-02）。
+                if attr.value.chars().count() > 100 {
                     let short: String = attr.value.chars().take(50).collect();
                     attr.value.clear();
                     attr.value.push_slice(&format!("{} ...", short));
@@ -99,7 +173,7 @@ fn clean_node_at(handle: &Handle, depth: usize) {
             for child in children.iter() {
                 if let NodeData::Text { contents } = &child.data {
                     let mut text = contents.borrow_mut();
-                    if text.len() > 120 {
+                    if text.chars().count() > 120 {
                         let short: String = text.chars().take(80).collect();
                         text.clear();
                         text.push_slice(&short);
@@ -143,25 +217,28 @@ fn clean_node_at(handle: &Handle, depth: usize) {
         for attr in attrs.iter_mut() {
             let key = attr.name.local.as_ref();
             let value = attr.value.to_string();
+            // 全部按字符计数：UTF-8 下 `len()` 是字节数，和 `chars().take()` 混用会让
+            // 中文 URL / 属性值在没超阈值时就被替换成占位符（R1-02）。
+            let value_chars = value.chars().count();
             if key == "src" {
                 if value.starts_with("data:") {
                     attr.value.clear();
                     attr.value.push_slice("__img__");
-                } else if value.len() > 30 {
+                } else if value_chars > 30 {
                     attr.value.clear();
                     attr.value.push_slice("__url__");
                 }
-            } else if (key == "href" || key == "action") && value.len() > 30 {
+            } else if (key == "href" || key == "action") && value_chars > 30 {
                 attr.value.clear();
                 attr.value
                     .push_slice(if key == "href" { "__link__" } else { "__url__" });
-            } else if matches!(key, "value" | "title" | "alt") && value.len() > 100 {
+            } else if matches!(key, "value" | "title" | "alt") && value_chars > 100 {
                 attr.value.clear();
                 attr.value.push_slice(&format!(
                     "{} ...",
                     value.chars().take(50).collect::<String>()
                 ));
-            } else if key.starts_with("data-") && !key.starts_with("data-v") && value.len() > 20 {
+            } else if key.starts_with("data-") && !key.starts_with("data-v") && value_chars > 20 {
                 attr.value.clear();
                 attr.value.push_slice("__data__");
             }
@@ -173,6 +250,19 @@ fn clean_node_at(handle: &Handle, depth: usize) {
     }
 }
 
+/// 迭代拆链：把 `handle` 的整棵子树拆散后丢弃。
+///
+/// 关键点是**先把自己的 children 摘空，再让节点被 drop**：这样 `Rc<Node>` 归零时
+/// `Node::drop` 只会析构一个空的 `Vec<Handle>`，不会再沿深链递归（R1-01）。
+fn discard_subtree(handle: &Handle) {
+    let mut pending: Vec<Handle> = handle.children.borrow_mut().drain(..).collect();
+    while let Some(node) = pending.pop() {
+        pending.extend(node.children.borrow_mut().drain(..));
+        // node 在这里离开作用域：它的 children 已经是空的，Drop 不会递归。
+        drop(node);
+    }
+}
+
 pub fn smart_truncate(html: String, budget: usize) -> String {
     // budget 是「字符」预算（下游按 token/可见字数设计），而 String::len() 是 UTF-8 字节数。
     // 用字节数比较会让中文页面提前约 3 倍截断，这里统一按 chars().count() 计算。
@@ -180,11 +270,20 @@ pub fn smart_truncate(html: String, budget: usize) -> String {
     if html.chars().count() <= budget {
         return html;
     }
-    let keep = budget.saturating_sub(32);
+    const MARKER: &str = " [TRUNCATED]";
+    let marker_len = MARKER.chars().count();
+    // 预算装不下标记时直接返回按字符截断的前缀（不加标记）：
+    // 旧实现固定留 32 个字符给标记，budget < 32 时算出的 keep 是 0，
+    // 结果变成 13 字符的 " [TRUNCATED]" —— 比预算还长，内容全丢（P3）。
+    if budget <= marker_len {
+        return html.chars().take(budget).collect();
+    }
+    let keep = budget - marker_len;
     let mut result: String = html.chars().take(keep).collect();
-    result.push_str(" [TRUNCATED]");
+    result.push_str(MARKER);
     result
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -197,12 +296,57 @@ mod tests {
         assert!(!smart_truncate(html.clone(), 100).contains("[TRUNCATED]"));
         let truncated = smart_truncate(html, 50);
         assert!(truncated.ends_with(" [TRUNCATED]"));
-        // 保留 budget - 32 个字符 + 标记本身。
-        let keep = 50 - 32;
-        assert_eq!(
-            truncated.chars().count(),
-            keep + " [TRUNCATED]".chars().count()
+        // 结果总长永远不超过预算，内容部分 = 预算 - 标记长度。
+        assert_eq!(truncated.chars().count(), 50);
+        let keep = 50 - " [TRUNCATED]".chars().count();
+        assert!(truncated.starts_with(&"汉".repeat(keep)));
+    }
+
+    #[test]
+    fn smart_truncate_keeps_prefix_when_budget_is_tiny() {
+        // 预算小于标记长度时不能返回比预算更长的 " [TRUNCATED]"，要给真实前缀。
+        let html = "abcdefghij".repeat(10);
+        let out = smart_truncate(html.clone(), 1);
+        assert_eq!(out, "a");
+        let out = smart_truncate(html.clone(), 5);
+        assert_eq!(out, "abcde");
+        assert!(out.chars().count() <= 5);
+    }
+
+    #[test]
+    fn oversized_input_degrades_without_parsing() {
+        // 超过 8MB 的输入必须走降级路径：不解析、不 panic，且返回体量很小（R1-01）。
+        let html = "<div>".repeat(MAX_HTML_INPUT_BYTES / 5 + 1);
+        assert!(html.len() > MAX_HTML_INPUT_BYTES);
+        let out = optimize_html_for_tokens(&html);
+        assert!(out.starts_with("[html truncated: input > 8MB]"), "{out}");
+        // 降级结果必须远小于输入（说明真的没有把整串复制出来）。
+        assert!(out.len() < 1024, "len={}", out.len());
+        assert!(!out.contains("<div>"));
+    }
+
+    #[test]
+    fn oversized_input_keeps_text_content() {
+        let filler = "x".repeat(MAX_HTML_INPUT_BYTES);
+        let out = optimize_html_for_tokens(&format!("<p>hello</p>{filler}"));
+        assert!(out.starts_with("[html truncated: input > 8MB]"));
+        assert!(out.contains("hello"));
+    }
+
+    #[test]
+    fn node_explosion_degrades_to_text() {
+        // 2.4 MB 的重复空 div 能生成 30 万个节点：输入没超 8 MB，但树本身会吃掉
+        // 十几倍内存。必须走纯文本降级并标注原因。
+        let html = "<div></div>".repeat(300_000);
+        assert!(html.len() < MAX_HTML_INPUT_BYTES);
+        let out = optimize_html_for_tokens(&html);
+        assert!(
+            out.starts_with("[html nodes > 200k]"),
+            "{}",
+            &out[..out.len().min(64)]
         );
+        assert!(!out.contains("<div>"), "降级结果里不该再有标签");
+        assert!(out.len() < 1024, "len={}", out.len());
     }
 
     #[test]

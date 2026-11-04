@@ -7,12 +7,31 @@
 // Rust 侧没有更好的可测入口（要起 daemon + 真扩展），所以在源码上做不变式断言：
 // 定位 `action == "routes"` 分支 → 抓出 net_cdp_broadcast 的实参列表 → 断言第 4
 // 个实参是 cdp 规则而不是整份 config。
-import { readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const SERVER_RS = join(HERE, '..', 'src', 'server.rs');
+const SRC_DIR = join(HERE, '..', 'src');
+const SERVER_RS = join(SRC_DIR, 'server.rs');
+
+// 模块化后 `src/server.rs` 变成 `src/server/*.rs`；单文件布局继续支持。
+// 按文件名排序拼接，函数不会被拆到两个文件，所以花括号切分仍然成立。
+function readSourceTree(singleFile, dir) {
+  if (existsSync(singleFile)) return readFileSync(singleFile, 'utf8');
+  if (!existsSync(dir)) throw new Error(`找不到源码：${singleFile} 或 ${dir}`);
+  const files = [];
+  const walk = (current) => {
+    for (const entry of readdirSync(current, { withFileTypes: true })) {
+      const full = join(current, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.name.endsWith('.rs')) files.push(full);
+    }
+  };
+  walk(dir);
+  files.sort();
+  return files.map((file) => readFileSync(file, 'utf8')).join('\n\n');
+}
 
 const results = [];
 function check(name, ok, detail) {
@@ -20,7 +39,7 @@ function check(name, ok, detail) {
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${ok || !detail ? '' : '\n        → ' + detail}`);
 }
 
-const source = readFileSync(SERVER_RS, 'utf8');
+const source = readSourceTree(SERVER_RS, join(SRC_DIR, 'server'));
 
 // 找到 routes 分支的第一个 '{'，再按花括号配平截出整段（跳过字符串与字符字面量）。
 function sliceBlock(text, openIndex) {
@@ -91,6 +110,26 @@ function blockAfter(text, anchorIndex) {
   const open = text.indexOf('{', anchorIndex);
   if (open < 0) return null;
   return sliceBlock(text, open);
+}
+
+/// 定位某个 action 的分支代码块。
+///
+/// 兼容三种写法：`"route" => {}`、`"route" | "mock" => {}`、`action == "route" {}`。
+/// 注意 `[^;{}]*` 限定在 `=>` 之前不能跨过 `{`——否则 `matches!(action.as_str(), "route" | ...) {`
+/// 这种判断语句会被误认成分支，导致对错误位置做断言（v6 P3 的「fixture 与实现脱节」）。
+function findBranchBlock(text, action) {
+  const patterns = [
+    new RegExp(`"${action}"\\s*\\|[^;{}]*=>`),
+    new RegExp(`"${action}"\\s*=>`),
+    new RegExp(`action\\s*==\\s*"${action}"`),
+  ];
+  for (const pattern of patterns) {
+    const matched = pattern.exec(text);
+    if (!matched) continue;
+    const block = blockAfter(text, matched.index);
+    if (block) return block;
+  }
+  return null;
 }
 
 // 拆出某个函数调用的实参（按顶层逗号切分）。
@@ -167,14 +206,19 @@ for (const anchor of ['action == "routes"', '"routes" =>']) {
   }
 }
 
-check('找到 src/server.rs 中 net 的 routes 分支', !!routesBlock, '未匹配到 action == "routes" 或 "routes" =>');
+check('找到 src/server 中 net 的 routes 分支', !!routesBlock, '未匹配到 action == "routes" 或 "routes" =>');
 
 if (routesBlock) {
   const calls = findCalls(routesBlock, 'net_cdp_broadcast');
 
   if (calls.length === 0) {
-    // 如果后续把「routes 时重新下发」整个删掉，也算满足只读语义。
-    check('routes 分支不直接下发 CDP 规则（或不下发）', true);
+    // 旧写法在这里 check(..., true)：一旦实现改了、fixture 找不到调用，断言自动通过，
+    // 守卫彻底失效（v6 P3）。「找不到」必须失败，并把原因说清楚。
+    check(
+      'routes 分支仍能定位到 net_cdp_broadcast 调用',
+      false,
+      '分支存在但没有 net_cdp_broadcast：要么实现删除了下发（需人工确认只读语义），要么测试锚点与实现脱节',
+    );
   } else {
     const offenders = calls
       .map((call) => call.args || [])
@@ -208,16 +252,27 @@ if (routesBlock) {
   );
 }
 
-// 2) 其他 action（rule/unroute）下发时必须用 rules 数组，不能整份 config。
+// 2) 其他 action（route/unroute）下发时必须用 rules 数组，不能整份 config。
 for (const [action, label] of [
-  ['"route"', 'route'],
-  ['"unroute"', 'unroute'],
+  ['route', 'route'],
+  ['unroute', 'unroute'],
 ]) {
-  const at = source.indexOf(action);
-  if (at < 0) continue;
-  const block = blockAfter(source, at);
-  if (!block) continue;
+  const block = findBranchBlock(source, action);
+  // 旧写法 `if (!block) continue;`：一旦分支改名或文件被拆走，这个 action 一条断言
+  // 都不产生，脚本仍然全绿（v6 P3）。找不到分支必须显式失败。
+  if (!block) {
+    check(`找到 net ${label} 分支`, false, `未匹配到 "${action}" 分支（实现可能改名/拆分，测试锚点已脱节）`);
+    continue;
+  }
   const calls = findCalls(block, 'net_cdp_broadcast');
+  if (calls.length === 0) {
+    check(
+      `net ${label} 分支下发的是规则数组`,
+      false,
+      '分支存在但未找到 net_cdp_broadcast：fixture 与实现脱节，无法验证下发实参',
+    );
+    continue;
+  }
   const bad = calls.filter((call) => {
     const args = call.args || [];
     if (args.length < 4) return false;
@@ -226,7 +281,7 @@ for (const [action, label] of [
   check(`net ${label} 分支下发的是规则数组`, bad.length === 0, bad.map((c) => (c.args || []).join(' | ')).join(' ; '));
 }
 
-// 3) 死代码 / 旧字段不该被捡回来（的「腰带」）。
+// 3) 死代码 / 旧字段不该被捡回来（「腰带」）。
 // 真正的行为断言在 mock_extension 的 6c2（走真 daemon 看 change 形状）；
 // 这里只做低成本的静态兜底，防止整页 HTML 对比那套实现复活。
 const html = readFileSync(join(HERE, '..', 'src', 'html.rs'), 'utf8');
@@ -236,7 +291,7 @@ check(
   '旧的「动作前后整页 HTML 对比」实现被恢复了？',
 );
 check(
-  'src/server.rs 不再产出 top_change 字段',
+  'src/server 不再产出 top_change 字段',
   !/"top_change"/.test(source),
   'top_change 回传原始 HTML 片段，是回归点',
 );

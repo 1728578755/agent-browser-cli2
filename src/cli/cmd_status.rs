@@ -1,0 +1,900 @@
+use super::*;
+#[allow(unused_imports)]
+use clap::{Args, Parser, Subcommand};
+
+/// 只读取扩展端口，不创建配置文件。
+///
+/// `status` 是最需要用来诊断「HOME 只读 / 容器里没有配置」的命令，以前它调用
+/// `config::load_or_create` 产生写副作用，只读环境下直接 exit 1 且没有 JSON。
+///
+/// 现在直接复用 `config::load()`（只读、不落盘、目标损坏时回退 `.bak`，并且会
+/// `validate_port`）。以前这里自带**第三份**解析器：不读 `.bak`、不做端口校验、
+/// `as u16` 还是截断转换（配置写 `70000` 会显示成 `4464`），于是 status 显示的
+/// 「configured」可能和 daemon 实际用的值不一致 —— 而 status 正是用来查这件事的
+/// 命令（v8）。解析失败不再静默当成默认值，而是把原因带出去。
+fn configured_extension_port() -> (u16, Option<String>) {
+    match config::load() {
+        Ok(config) => (config.extension_port, None),
+        Err(err) => (config::DEFAULT_EXTENSION_PORT, Some(err.to_string())),
+    }
+}
+
+/// `/health` 探测的客户端超时。
+///
+/// 旧值是 1s：daemon 正在跑大快照/长管道时，/health 排队超过 1s 就会超时，于是
+/// `atb status` 把「daemon 忙」误诊成「daemon 有问题」甚至「token 失配」，把人引去
+/// 杀进程。放宽到 3s：既覆盖排队，又不至于让 status 自己变成慢命令。
+const HEALTH_PROBE_TIMEOUT: f64 = 3.0;
+
+/// 探测失败是否属于「客户端超时」而不是「给了 HTTP 响应但被拒」。
+///
+/// reqwest 的超时链路最终是 io::ErrorKind::TimedOut，Display 里带 "timed out"；
+/// 中文分支兜住我们自己拼的文案。
+fn health_error_is_timeout(err: &anyhow::Error) -> bool {
+    let text = err.to_string().to_lowercase();
+    text.contains("timed out") || text.contains("timeout") || text.contains("超时")
+}
+
+/// 探测失败是否属于 token 不匹配（daemon 活着，但拒绝当前 token → HTTP 401/403）。
+fn health_error_is_token_mismatch(err: &anyhow::Error) -> bool {
+    let text = err.to_string();
+    text.contains("token") || text.contains("Token")
+}
+
+/// 「端口在监听但 /health 拿不到」的统一输出骨架。
+///
+/// 以前这条分支的两份 JSON 各写一遍（重复了 ports/connection 块），改一处容易漏另一处。
+fn unhealthy_value(
+    summary: &str,
+    message: String,
+    hint: &str,
+    error: Option<String>,
+    configured: u16,
+    configured_error: Option<String>,
+) -> Value {
+    let mut value = json!({
+        "ok": false,
+        "healthy": false,
+        "summary": summary,
+        "message": message,
+        "hint": hint,
+        "running": false,
+        "ready": false,
+        "ports": {
+            "api": PORT,
+            "extension": {
+                "configured": configured,
+                "configured_error": configured_error,
+                "listening": null,
+                "matched": false
+            }
+        },
+        "connection": {
+            "extension_connected": false,
+            "active_tabs": 0
+        }
+    });
+    // error 只在「有具体异常」时出现：字段只增不改，daemon_not_running 分支保持原样。
+    if let Some(error) = error {
+        value["error"] = json!(error);
+    }
+    value
+}
+
+pub(crate) fn status_value() -> Result<Value> {
+    let (configured, configured_error) = configured_extension_port();
+    let value = match request("GET", "/health", None, HEALTH_PROBE_TIMEOUT) {
+        Ok(value) => enrich_status(value),
+        Err(err) if is_server_alive() => {
+            // 端口在监听却拿不到 /health：三种成因的下一步完全不同，不能一律归因 token
+            // （token 归因对「401/403」成立，对「没答完」是误诊）。
+            if health_error_is_timeout(&err) {
+                unhealthy_value(
+                    "health_timeout",
+                    format!(
+                        "18767 端口在监听，但 /health 在 {HEALTH_PROBE_TIMEOUT}s 内没有返回：{err}"
+                    ),
+                    "daemon 可能正忙（大页面快照 / 长管道 / 批量抓取）或已卡住：稍后重试 atb status；持续如此用 atb doctor 看逐项诊断与日志，必要时 atb restart",
+                    Some(err.to_string()),
+                    configured,
+                    configured_error,
+                )
+            } else if health_error_is_token_mismatch(&err) {
+                // TCP 通但 HTTP 401/403：最常见的成因是残留的旧 daemon 用了另一份 token。
+                unhealthy_value(
+                    "daemon_token_mismatch",
+                    "18767 端口上有一个 daemon 在监听，但 API token 不匹配（通常是残留的旧实例）"
+                        .to_string(),
+                    "先结束占用 18767 的进程（Windows: netstat -ano | findstr 18767 后 taskkill /PID <pid> /F；macOS/Linux: lsof -i:18767），再重试——新 daemon 启动时会刷新 token",
+                    Some(err.to_string()),
+                    configured,
+                    configured_error,
+                )
+            } else {
+                unhealthy_value(
+                    "health_failed",
+                    format!("18767 端口在监听，但 /health 请求失败：{err}"),
+                    "先运行 atb doctor 看逐项诊断（它不会自动启动 daemon）；若怀疑是残留旧 daemon，用 atb restart --force",
+                    Some(err.to_string()),
+                    configured,
+                    configured_error,
+                )
+            }
+        }
+        Err(_) => unhealthy_value(
+            "daemon_not_running",
+            "daemon 未运行；执行 tabs/open/exec/scan 会自动启动，或运行 atb restart 手动启动"
+                .to_string(),
+            "执行 atb restart，或任意页面命令（tabs/open/exec）自动拉起 daemon",
+            None,
+            configured,
+            configured_error,
+        ),
+    };
+    Ok(value)
+}
+
+pub(crate) fn enrich_status(mut value: Value) -> Value {
+    let running = value
+        .get("running")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let ready = value.get("ready").and_then(Value::as_bool).unwrap_or(false);
+    let matched = value
+        .pointer("/ports/extension/matched")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let extension_connected = value
+        .pointer("/connection/extension_connected")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let active_tabs = value
+        .pointer("/connection/active_tabs")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    // daemon 的插件端口没绑上（os error 10048 之类）：这时「插件未连接」是结果，不是原因。
+    let bind_error = value
+        .pointer("/ports/extension/bind_error")
+        .and_then(Value::as_str)
+        .filter(|err| !err.is_empty())
+        .map(str::to_string);
+    // 版本兼容性：daemon 会在 /health 里带 compatibility 块。
+    let compatibility = value.get("compatibility").cloned().unwrap_or(Value::Null);
+    let compat_ok = compatibility
+        .get("ok")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let compat_fixes: Vec<Value> = compatibility
+        .get("fixes")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let (healthy, summary, message): (bool, &str, String) = if !running {
+        (
+            false,
+            "daemon_not_running",
+            "daemon 未运行；执行 tabs/open/exec/scan 会自动启动，或运行 atb restart 手动启动。\
+             若 18767 已被别的进程/残留 daemon 占用，先结束它再启动"
+                .to_string(),
+        )
+    } else if let Some(err) = bind_error {
+        (
+            false,
+            "extension_port_bind_failed",
+            format!(
+                "插件端口没有监听：{err}。最常见的原因是刚重启过 daemon，旧连接还在 TIME_WAIT\
+                 （Windows 约 2 分钟）；稍等一会重试，或 atb set-extension-port <其它端口> 换端口"
+            ),
+        )
+    } else if !matched {
+        (
+            false,
+            "port_mismatch",
+            "CLI 配置的插件端口和 daemon 实际监听端口不一致；运行 atb restart 让配置生效"
+                .to_string(),
+        )
+    } else if !extension_connected {
+        (
+            false,
+            "extension_not_connected",
+            "浏览器插件未连接；确认 Chrome 已打开、插件已启用，且插件端口和 CLI 配置一致"
+                .to_string(),
+        )
+    } else if active_tabs == 0 || !ready {
+        (
+            false,
+            "no_active_tabs",
+            "没有可用的普通网页标签页；请在 Chrome 打开一个 http/https 页面后重试".to_string(),
+        )
+    } else {
+        (
+            true,
+            "ready",
+            "daemon、插件连接和浏览器标签页均可用".to_string(),
+        )
+    };
+    // 只有真的 healthy 才 ok：否则 status 恒 ok:true，`$?` 永远判不出问题。
+    // 版本不配套不一定「不能用」：旧扩展仍支持 core 命令，只是 window/group/current
+    // 这类新选择器会明确报 extension_outdated。所以 healthy 保持按功能判断，
+    // 兼容性单独给 warning + next_steps，避免升级后所有人先看到一片红。
+    value["ok"] = json!(healthy);
+    value["healthy"] = json!(healthy);
+    value["summary"] = json!(summary);
+    value["message"] = json!(message);
+    value["compatibility"] = compatibility;
+    if !compat_ok {
+        value["upgrade_recommended"] = json!(true);
+        value["warning"] =
+            json!("扩展版本低于 CLI 期望：core 命令可用，window/group/current 选择器会提示更新");
+        value["next_steps"] = json!(if compat_fixes.is_empty() {
+            json!([
+                "执行 atb restart",
+                "打开 chrome://extensions（Edge 为 edge://extensions）重新加载扩展",
+                "再跑 atb status 确认 compatibility.ok=true"
+            ])
+        } else {
+            json!(compat_fixes)
+        });
+    }
+    // 扩展是磁盘上的文件副本：改了不重新加载，Chrome 里跑的还是旧代码，
+    // 表现就是「明明修好了但报错照旧」。这里把它变成显式的一行提示。
+    if value
+        .pointer("/extension/stale")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        if let Some(hint) = value.pointer("/extension/hint").cloned() {
+            value["warning"] = hint;
+        }
+    }
+    value
+}
+
+pub(crate) fn print_logs(tail: usize) -> Result<()> {
+    let path = config::daemon_log_path()?;
+    if !path.exists() {
+        return Err(usage_err!(
+            "日志文件不存在或尚无日志: {}；先运行 atb tabs/open/exec/scan 或 restart 启动 daemon",
+            path.display()
+        ));
+    }
+    if tail == 0 {
+        return Ok(());
+    }
+    let lines =
+        tail_lines(&path, tail).with_context(|| format!("读取日志文件失败: {}", path.display()))?;
+    // 裸 println! 在 `atb logs | head -20` 里会因为 EPIPE **panic**（退出码 101，不在
+    // 对外契约里）。write_stdout 自带换行并忽略 EPIPE，逐行写即可。
+    for line in &lines {
+        write_stdout(line);
+    }
+    Ok(())
+}
+
+/// 只从文件尾部按块倒读，凑够 `tail` 行就停：日志涨到几百 MB 时不必整份读进内存。
+pub(crate) fn tail_lines(path: &Path, tail: usize) -> Result<Vec<String>> {
+    use std::io::{Seek, SeekFrom};
+
+    const CHUNK: u64 = 64 * 1024;
+    let mut file = fs::File::open(path)?;
+    let mut end = file.metadata()?.len();
+    if end == 0 {
+        return Ok(Vec::new());
+    }
+    // 多要一个换行：文件末尾没有换行时，最后一行也要算一行。
+    let mut newlines = 0usize;
+    let mut chunks: Vec<Vec<u8>> = Vec::new();
+    while end > 0 && newlines < tail.saturating_add(1) {
+        let start = end.saturating_sub(CHUNK);
+        let mut chunk = vec![0u8; (end - start) as usize];
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut chunk)?;
+        newlines += chunk.iter().filter(|byte| **byte == b'\n').count();
+        chunks.push(chunk);
+        end = start;
+    }
+    let mut buffer = Vec::new();
+    for chunk in chunks.into_iter().rev() {
+        buffer.extend_from_slice(&chunk);
+    }
+    // 没读到文件头时，第一条一定是被块边界切断的半行（也可能切断多字节字符），
+    // 用 from_utf8_lossy 兜住非法字节后整行丢弃。
+    let text = String::from_utf8_lossy(&buffer);
+    let all: Vec<&str> = text.lines().collect();
+    let skip = usize::from(end > 0 && !all.is_empty());
+    let lines = &all[skip..];
+    let from = lines.len().saturating_sub(tail);
+    Ok(lines[from..].iter().map(|line| line.to_string()).collect())
+}
+
+pub(crate) fn doctor_value() -> Result<Value> {
+    let exe_ok = env::current_exe().map(|p| p.is_file()).unwrap_or(false);
+    let config_path = config::config_path()?;
+    let config_exists = config_path.exists();
+    let config_result = config::load_existing();
+    let (configured_port, config_ok, config_hint) = match config_result {
+        Ok(cfg) => (Some(cfg.extension_port), true, Value::Null),
+        Err(err) => (None, false, json!(err.to_string())),
+    };
+    let api_reachable = tcp_listening(PORT);
+    // 与 status 同口径：1s 会把「daemon 正忙」判成「health 不通」。
+    let health = request("GET", "/health", None, HEALTH_PROBE_TIMEOUT).ok();
+    let listening_port = health
+        .as_ref()
+        .and_then(|v| v.pointer("/ports/extension/listening"))
+        .and_then(Value::as_u64)
+        .and_then(|p| u16::try_from(p).ok());
+    let extension_port_to_check = listening_port.or(configured_port);
+    let extension_port_ok = extension_port_to_check.map(tcp_listening).unwrap_or(false);
+    let extension_connected = health
+        .as_ref()
+        .and_then(|v| v.pointer("/connection/extension_connected"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let active_tabs = health
+        .as_ref()
+        .and_then(|v| v.pointer("/connection/active_tabs"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let file_scheme_profiles = health
+        .as_ref()
+        .and_then(|v| v.pointer("/connection/profiles"))
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let extension_stale = health
+        .as_ref()
+        .and_then(|v| v.pointer("/extension/stale"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let extension_bundled = health
+        .as_ref()
+        .and_then(|v| v.pointer("/extension/bundled_version"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let extension_versions = health
+        .as_ref()
+        .and_then(|v| v.pointer("/extension/connected_versions"))
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let running = health
+        .as_ref()
+        .and_then(|v| v.get("running"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let ready = health
+        .as_ref()
+        .and_then(|v| v.get("ready"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let port_conflict = configured_port == Some(PORT);
+    let port_matched =
+        configured_port.is_some() && listening_port.is_some() && configured_port == listening_port;
+    let log_path = config::daemon_log_path()?;
+
+    let mut checks = Vec::new();
+    checks.push(json!({
+        "name": "cli",
+        "ok": exe_ok,
+        "hint": if exe_ok { Value::Null } else { json!("当前 CLI 二进制不可执行或无法定位") }
+    }));
+    checks.push(json!({
+        "name": "api",
+        "ok": api_reachable,
+        "host": HOST,
+        "port": PORT,
+        "hint": if api_reachable { Value::Null } else { json!("daemon API 未监听；doctor 不会自动启动 daemon，可运行 atb restart") }
+    }));
+    checks.push(json!({
+        "name": "config",
+        "ok": config_ok,
+        "path": config_path,
+        "exists": config_exists,
+        "extension_port": configured_port,
+        "hint": config_hint
+    }));
+    checks.push(json!({
+        "name": "extension_port",
+        "ok": extension_port_ok && !port_conflict,
+        "configured_port": configured_port,
+        "listening_port": listening_port,
+        "port_matched": port_matched,
+        "hint": extension_port_hint(configured_port, listening_port, extension_port_ok, port_conflict)
+    }));
+    checks.push(json!({
+        "name": "health",
+        "ok": running,
+        "running": running,
+        "ready": ready,
+        "extension_connected": extension_connected,
+        "active_tabs": active_tabs,
+        "hint": if running { Value::Null } else { json!("daemon 未运行；运行 atb restart 或执行 tabs/open/exec/scan 自动启动") }
+    }));
+    checks.push(json!({
+        "name": "extension_connected",
+        "ok": extension_connected,
+        "configured_port": configured_port,
+        "listening_port": listening_port,
+        "connected": extension_connected,
+        "hint": if extension_connected { Value::Null } else { json!(format!("浏览器插件未连接；确认插件已启用，且插件端口为 {}", configured_port.unwrap_or(config::DEFAULT_EXTENSION_PORT))) }
+    }));
+    checks.push(json!({
+        "name": "active_tabs",
+        "ok": active_tabs > 0,
+        "active_tabs": active_tabs,
+        "hint": if active_tabs > 0 { Value::Null } else { json!("Chrome 需要至少打开一个普通 http/https/file 网页标签页") }
+    }));
+    checks.push(json!({
+        "name": "extension_fresh",
+        "ok": !extension_stale,
+        "optional": true,
+        "bundled_version": extension_bundled,
+        "connected_versions": extension_versions,
+        "hint": if extension_stale {
+            json!("浏览器里的扩展版本低于磁盘上的版本：打开 chrome://extensions 对本扩展点一次「重新加载」，否则代码改动不会生效")
+        } else {
+            Value::Null
+        }
+    }));
+    checks.push(json!({
+        "name": "file_scheme_access",
+        "ok": true,
+        "optional": true,
+        "profiles": file_scheme_profiles,
+        "hint": "文件网址访问是可选能力；关闭时不影响普通 http/https 页面控制"
+    }));
+
+    let ok = checks.iter().all(|c| {
+        c.get("optional").and_then(Value::as_bool).unwrap_or(false)
+            || c.get("ok").and_then(Value::as_bool).unwrap_or(false)
+    });
+    Ok(json!({
+        "ok": ok,
+        "checks": checks,
+        "log_path": log_path,
+        "log_exists": log_path.exists()
+    }))
+}
+
+pub(crate) fn extension_port_hint(
+    configured: Option<u16>,
+    listening: Option<u16>,
+    extension_port_ok: bool,
+    port_conflict: bool,
+) -> Value {
+    if port_conflict {
+        json!("插件端口不能和 API 端口 18767 相同；运行 atb set-extension-port <port> 修改")
+    } else if configured.is_some() && listening.is_some() && configured != listening {
+        json!("CLI 配置和 daemon 实际监听端口不一致；运行 atb restart 让配置生效")
+    } else if !extension_port_ok {
+        json!("当前插件端口未监听；daemon 未启动或 WebSocket 端口启动失败")
+    } else {
+        Value::Null
+    }
+}
+
+pub(crate) fn tcp_listening(port: u16) -> bool {
+    TcpStream::connect_timeout(
+        &format!("{HOST}:{port}").parse().expect("固定地址应可解析"),
+        Duration::from_millis(300),
+    )
+    .is_ok()
+}
+
+pub(crate) fn cmd_status(is_async: bool) -> Result<()> {
+    reject_async_if_set("status", is_async)?;
+    print_json(status_value()?);
+    Ok(())
+}
+
+pub(crate) fn cmd_doctor(args: DoctorArgs, is_async: bool) -> Result<()> {
+    reject_async_if_set("doctor", is_async)?;
+    let mut report = doctor_value()?;
+    if args.fix {
+        // --fix：在诊断结果之上，对可自动修复的问题逐条处理；
+        // 每条输出 {fix, executed, result}，executed=false 表示只给出命令/指引。
+        // 全局 --dry-run 时只列计划：不杀进程、不删 token。
+        let dry_run = DRY_RUN.load(Ordering::Relaxed);
+        report["fix_results"] = json!(run_doctor_fixes(&report, args.force, dry_run));
+        if dry_run {
+            report["dry_run"] = json!(true);
+        }
+    }
+    print_json(report);
+    Ok(())
+}
+
+/// 找出占用指定端口处于 LISTENING 状态的进程 PID。
+///
+/// Windows 用 `netstat -ano`（不引入新依赖，注意隐藏控制台窗口）；
+/// macOS/Linux 用 `lsof -t -i:TCP:<port>`。拿不到就返回空表，调用方降级为打印命令。
+fn find_port_pids(port: u16) -> Vec<u32> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let Ok(output) = Command::new("netstat")
+            .arg("-ano")
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+        else {
+            return Vec::new();
+        };
+        let text = String::from_utf8_lossy(&output.stdout);
+        // netstat 行形如：TCP  127.0.0.1:18767  0.0.0.0:0  LISTENING  12345
+        // 列：协议 / 本地地址 / 远端地址 / 状态 / PID
+        let needle = format!(":{port}");
+        let mut pids: Vec<u32> = Vec::new();
+        for line in text.lines() {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() < 5 || fields[0] != "TCP" || fields[3] != "LISTENING" {
+                continue;
+            }
+            // 只匹配本地地址列，避免远端地址碰巧带同端口号的误杀。
+            let local = fields[1].trim_end_matches(']');
+            if local.ends_with(&needle) {
+                if let Ok(pid) = fields[4].parse::<u32>() {
+                    pids.push(pid);
+                }
+            }
+        }
+        pids.sort_unstable();
+        pids.dedup();
+        pids
+    }
+    #[cfg(not(windows))]
+    {
+        let Ok(output) = Command::new("lsof")
+            .args(["-t", &format!("-i:TCP:{port}")])
+            .output()
+        else {
+            return Vec::new();
+        };
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.trim().parse::<u32>().ok())
+            .collect()
+    }
+}
+
+/// 解析扩展源目录（assets/atb_bridge）的实际路径，用于「扩展过旧」的重载指引。
+/// 与 `install-skill` 的解析口径一致：ATB_PACKAGE_DIR → exe 祖先目录 → cwd。
+fn resolve_extension_source_dir() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(package_dir) = config::env_compat("PACKAGE_DIR") {
+        candidates.push(PathBuf::from(package_dir).join("assets/atb_bridge"));
+    }
+    if let Ok(exe) = env::current_exe() {
+        for ancestor in exe.ancestors().take(6) {
+            candidates.push(ancestor.join("assets/atb_bridge"));
+        }
+    }
+    if let Ok(cwd) = env::current_dir() {
+        candidates.push(cwd.join("assets/atb_bridge"));
+    }
+    candidates
+        .into_iter()
+        .find(|dir| dir.join("manifest.json").is_file())
+}
+
+/// `doctor --fix` 的执行体：从诊断报告里挑出可自动修复的问题逐条处理。
+///
+/// 三类修复（与任务口径一致）：
+/// - 旧 daemon 占端口：先用 netstat/lsof 找 PID；带 `--force` 才真杀（并逐个核对进程
+///   身份），不带时只打印要执行的命令（杀进程影响面大，必须显式授权）；
+/// - API token 失配：**只有** `/health` 明确返回 `invalid_api_token` 时才删
+///   `~/.atb/api-token`（超时/连接失败都不算），新 daemon 启动时会刷新；
+/// - 扩展过旧：只能人工在 chrome://extensions 点「重新加载」，输出带实际路径的指引。
+///
+/// `dry_run`（全局 `--dry-run`）：只列计划，不杀进程、不删 token。
+fn run_doctor_fixes(report: &Value, force: bool, dry_run: bool) -> Vec<Value> {
+    let mut results: Vec<Value> = Vec::new();
+    // 场景一：端口在监听但 /health 拿不到（旧 daemon 占端口，或 daemon 正忙超时）。
+    // token 失配单独判定，不能从「/health 失败」推出来。
+    let alive = is_server_alive();
+    let health_reachable = alive && request("GET", "/health", None, 2.0).is_ok();
+    if alive && !health_reachable {
+        // a) 旧 daemon 占端口
+        let pids = find_port_pids(PORT);
+        if pids.is_empty() {
+            results.push(json!({
+                "fix": "stale_daemon_on_port",
+                "executed": false,
+                "result": {
+                    "port": PORT,
+                    "pids": [],
+                    "hint": "未从 netstat/lsof 解析到 PID；请手动执行 netstat -ano | findstr 18767 查看占用进程"
+                }
+            }));
+        } else {
+            let pid_list = pids
+                .iter()
+                .map(|pid| pid.to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            #[cfg(windows)]
+            let command = format!("taskkill /PID {pid_list} /F");
+            #[cfg(not(windows))]
+            let command = format!("kill -9 {pid_list}");
+            if force && !dry_run {
+                // 强杀前逐个核对进程身份：占端口的可能是用户自己的程序，
+                // 也可能是「daemon 正忙导致 /health 超时」——杀错进程的代价极高。
+                let attempts: Vec<KillOutcome> =
+                    pids.iter().map(|pid| kill_verified_pid(*pid)).collect();
+                let killed: Vec<u32> = attempts
+                    .iter()
+                    .filter(|outcome| outcome.killed)
+                    .map(|outcome| outcome.pid)
+                    .collect();
+                let skipped: Vec<Value> = attempts
+                    .iter()
+                    .filter(|outcome| !outcome.killed)
+                    .map(KillOutcome::to_json)
+                    .collect();
+                let killed_any = !killed.is_empty();
+                results.push(json!({
+                    "fix": "stale_daemon_on_port",
+                    "executed": killed_any,
+                    "result": {
+                        "port": PORT,
+                        "killed": killed,
+                        "attempts": attempts.iter().map(KillOutcome::to_json).collect::<Vec<_>>(),
+                        "skipped": skipped,
+                        "identity_checked": true,
+                        "hint": if killed_any {
+                            json!("占用端口的进程没有通过身份核对，未强杀；请人工核查占用者")
+                        } else {
+                            json!("进程已结束；执行 atb restart 拉起新 daemon，再 atb status 确认")
+                        }
+                    }
+                }));
+            } else if force && dry_run {
+                results.push(json!({
+                    "fix": "stale_daemon_on_port",
+                    "executed": false,
+                    "result": {
+                        "port": PORT,
+                        "pids": pids,
+                        "command": command,
+                        "dry_run": true,
+                        "hint": "dry-run：只列出计划；强杀前会核对进程身份（必须包含本机 atb 可执行文件或 atb daemon 命令行）"
+                    }
+                }));
+            } else {
+                results.push(json!({
+                    "fix": "stale_daemon_on_port",
+                    "executed": false,
+                    "result": {
+                        "port": PORT,
+                        "pids": pids,
+                        "command": command,
+                        "hint": "结束进程影响面大：加 --force 才会真正执行上面的命令"
+                    }
+                }));
+            }
+        }
+    }
+    // b) token 失配 → 删除 ~/.atb/api-token
+    //
+    // 只有 **结构化** 的 `invalid_api_token` 才算证据：以前只要「端口在听但
+    // /health 失败」就删 token，而超时（daemon 正忙）、连接被重置、非 JSON 响应都会
+    // 命中这条分支——删掉 token 并不会解决问题，反而让正常 daemon 在下次重启后
+    // 与其它调用方的 token 失配。
+    if daemon_token_mismatch() {
+        let token_path = config::api_token_path();
+        if dry_run {
+            results.push(json!({
+                "fix": "api_token_mismatch",
+                "executed": false,
+                "result": {
+                    "dry_run": true,
+                    "would_remove": token_path
+                        .as_ref()
+                        .ok()
+                        .map(|path| json!(path.display().to_string()))
+                        .unwrap_or(Value::Null),
+                    "hint": "dry-run：不会删除 token；去掉 --dry-run 再执行 --fix",
+                }
+            }));
+        } else {
+            let token_result = match token_path {
+                Ok(path) => {
+                    if path.exists() {
+                        match fs::remove_file(&path) {
+                            Ok(()) => json!({
+                                "removed": path,
+                                "hint": "token 文件已删除；执行 atb restart（daemon 启动时会刷新 token），再 atb status 确认"
+                            }),
+                            Err(err) => {
+                                json!({ "removed": Value::Null, "error": err.to_string(), "path": path })
+                            }
+                        }
+                    } else {
+                        json!({
+                            "removed": Value::Null,
+                            "hint": "token 文件本就不存在；残留 daemon 用的是别处配置，请核对占端口的进程"
+                        })
+                    }
+                }
+                Err(err) => json!({ "removed": Value::Null, "error": err.to_string() }),
+            };
+            results.push(json!({
+                "fix": "api_token_mismatch",
+                // removed 为非 null 才算真的执行了删除；文件不存在/读路径失败时如实报 false。
+                "executed": matches!(token_result.get("removed"), Some(v) if !v.is_null()),
+                "result": token_result,
+            }));
+        }
+    }
+    // c) 扩展过旧：人工步骤，只能给指引（带扩展源目录的实际路径）
+    let extension_stale = report
+        .get("checks")
+        .and_then(Value::as_array)
+        .and_then(|checks| {
+            checks
+                .iter()
+                .find(|check| {
+                    // 名字必须与 doctor_value 里注册的一致（`extension_fresh`）；
+                    // 旧代码查 `extension_freshness`，于是「扩展过旧」的修复永远不出现。
+                    check.get("name").and_then(Value::as_str) == Some("extension_fresh")
+                })
+                .map(|check| check.get("ok").and_then(Value::as_bool).unwrap_or(true))
+        })
+        .map(|ok| !ok)
+        .unwrap_or(false);
+    if extension_stale {
+        let source_dir = resolve_extension_source_dir();
+        // 先算出人读文本（避免 source_dir 被 format! 消耗后下面还要用）。
+        let source_dir_text = source_dir
+            .as_ref()
+            .map(|dir| dir.display().to_string())
+            .unwrap_or_else(|| "随包的 assets/atb_bridge".to_string());
+        results.push(json!({
+            "fix": "extension_outdated",
+            // Chrome 不提供「从外部触发扩展重载」的接口，这步只能人工执行。
+            "executed": false,
+            "result": {
+                "steps": [
+                    format!("用 {source_dir_text} 覆盖你加载的扩展目录"),
+                    "打开 chrome://extensions（Edge 是 edge://extensions），对本扩展点「重新加载」",
+                    "重跑 atb status 确认 extension.stale=false"
+                ],
+                "source_dir": source_dir
+                    .map(|dir| json!(dir.display().to_string()))
+                    .unwrap_or(Value::Null),
+            }
+        }));
+    }
+    // daemon 未在跑：没有可自动修复的动作，但值得明确说出来，避免 Agent 以为 --fix 漏做。
+    if !alive {
+        results.push(json!({
+            "fix": "daemon_not_running",
+            "executed": false,
+            "result": {
+                "hint": "daemon 未运行；执行 atb restart 或任意页面命令（tabs/open/exec）会自动拉起"
+            }
+        }));
+    }
+    if results.is_empty() {
+        results.push(json!({
+            "fix": "none",
+            "executed": false,
+            "result": "诊断全部通过，没有需要修复的问题"
+        }));
+    }
+    results
+}
+
+/// 能力门禁阈值（CLI 侧写死并在此注明口径，避免 Agent 逐条命令踩坑才发现）：
+/// - core（open/exec/tabs/close 等基础命令）：扩展连上即可用，无版本要求；
+/// - open_session（open 的 --session / --group-title）：扩展 2.1+（daemon /open 校验口径）；
+/// - group / window / current 选择器：扩展 3.5+（daemon 目标解析的提示口径）；
+/// - challenge（挑战页自动求解）：扩展 5.0+（server/challenge.rs 的版本门禁）。
+fn feature_min_versions() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("core", "0.0.0"),
+        ("open_session", "2.1"),
+        ("group", "3.5"),
+        ("window", "3.5"),
+        ("current", "3.5"),
+        ("challenge", "5.0"),
+    ]
+}
+
+/// 版本号比较：按 `.` 分段转数值逐段比（"2.10" > "2.1"），非数字段按 0 处理。
+/// 与 daemon `server/open.rs::version_at_least` 同一套语义。
+fn version_at_least(installed: &str, minimum: &str) -> bool {
+    let parse = |version: &str| -> Vec<u64> {
+        version
+            .split('.')
+            .map(|part| part.trim().parse::<u64>().unwrap_or(0))
+            .collect()
+    };
+    let mut installed = parse(installed);
+    let mut minimum = parse(minimum);
+    let len = installed.len().max(minimum.len());
+    installed.resize(len, 0);
+    minimum.resize(len, 0);
+    installed >= minimum
+}
+
+/// `atb capabilities`：一次探测 daemon/扩展版本与能力门禁。
+///
+/// 目的（实测反馈）：Agent 先探测再动手，而不是踩到 null/0 的响应才知道
+/// 当前扩展不支持某个选择器/能力。
+pub(crate) fn cmd_capabilities(is_async: bool) -> Result<()> {
+    reject_async_if_set("capabilities", is_async)?;
+    // daemon 不在时给明确错误：这不是「features 全 false」，是压根没得探测。
+    if !is_server_alive() {
+        return Err(usage_failure(
+            "daemon_not_running",
+            "daemon 未运行，无法探测能力",
+            "执行 atb restart 或任意页面命令（tabs/open/exec）自动拉起，再运行 atb capabilities",
+        ));
+    }
+    let health = match request("GET", "/health", None, 5.0) {
+        Ok(value) => value,
+        Err(err) => {
+            return Err(usage_failure(
+                "daemon_token_mismatch",
+                format!("18767 有进程在监听，但 /health 不可达：{err}"),
+                "通常是残留的旧 daemon：netstat -ano | findstr 18767 找 PID 后 taskkill /PID <pid> /F，或运行 atb doctor --fix",
+            ));
+        }
+    };
+    let daemon_version = health
+        .get("version")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let extension_connected = health
+        .pointer("/connection/extension_connected")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    // 扩展版本取 connected_versions 里的最大值：多浏览器并存时按最高的算，
+    // 低于阈值的实例会在具体命令上单独报错，这里回答的是「最好情况能干什么」。
+    let extension_version: Option<String> = health
+        .pointer("/extension/connected_versions")
+        .and_then(Value::as_array)
+        .map(|versions| {
+            versions
+                .iter()
+                .filter_map(Value::as_str)
+                .max_by_key(|version| {
+                    version
+                        .split('.')
+                        .map(|part| part.trim().parse::<u64>().unwrap_or(0))
+                        .collect::<Vec<_>>()
+                })
+                .map(str::to_string)
+        })
+        .unwrap_or(None);
+    let installed = extension_version.as_deref().unwrap_or("");
+    let mut features = serde_json::Map::new();
+    let mut thresholds = serde_json::Map::new();
+    for (feature, minimum) in feature_min_versions() {
+        thresholds.insert(feature.to_string(), json!(minimum));
+        // 未连接扩展时除 core 外全部 false：避免拿「未探测」冒充「支持」。
+        let ok = extension_connected && version_at_least(installed, minimum);
+        features.insert(feature.to_string(), json!(ok));
+    }
+    let compat_ok = health
+        .pointer("/compatibility/ok")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let mut value = json!({
+        "ok": extension_connected && compat_ok,
+        "extension_connected": extension_connected,
+        "extension_version": extension_version,
+        "daemon_version": daemon_version,
+        "features": features,
+        "thresholds": thresholds,
+    });
+    if !compat_ok {
+        value["hint"] =
+            json!("扩展协议版本低于 daemon 期望：按 atb status 的 next_steps 更新扩展后重新探测");
+    } else if !extension_connected {
+        value["hint"] = json!("扩展未连接：确认浏览器已打开且扩展已启用，再运行 atb capabilities");
+    }
+    print_json(value);
+    Ok(())
+}

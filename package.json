@@ -1,64 +1,63 @@
 {
-  "name": "agent-browser-cli2",
-  "version": "0.3.8",
-  "description": "Agent-oriented browser sensing and control CLI backed by a native Rust daemon.",
+  "name": "@g1728578755/atb",
+  "version": "0.7.1",
+  "description": "Agent-oriented browser CLI with multi-tab and multi-agent isolation, backed by a native Rust daemon.",
   "license": "MIT",
   "keywords": [
-    "browser-automation",
-    "chrome",
-    "cdp",
-    "chrome-extension",
-    "agent",
+    "browser",
     "cli",
+    "automation",
+    "chrome-extension",
+    "cdp",
     "rust",
-    "web-scraping"
+    "ai-agent",
+    "multi-tab"
   ],
-  "homepage": "https://github.com/1728578755/agent-browser-cli2#readme",
-  "bugs": {
-    "url": "https://github.com/1728578755/agent-browser-cli2/issues"
-  },
   "bin": {
-    "agent-browser-cli": "npm/bin/agent-browser-cli.js",
-    "agent-browser-cli2": "npm/bin/agent-browser-cli.js"
+    "atb": "npm/bin/atb.js"
   },
   "files": [
     "npm/bin",
     "npm/postinstall.js",
     "assets",
     "skills",
-    "docs",
     "README.md",
     "README_EN.md",
     "AI_INSTALL.md",
     "CHANGELOG.md",
-    "PRIVACY.md",
     "LICENSE",
+    "NOTICE",
     "SOURCES.md",
-    "NOTICE"
+    "PRIVACY.md"
   ],
   "scripts": {
-    "build": "cargo build --release",
-    "version": "node scripts/sync-optional-deps.mjs && node scripts/sync-version.mjs && git add package.json package-lock.json Cargo.toml README.md README_EN.md",
+    "build": "node scripts/check-lock.mjs && cargo build --release --locked",
+    "check:lock": "node scripts/check-lock.mjs",
+    "test": "node --test",
+    "version": "node scripts/sync-optional-deps.mjs && node scripts/sync-version.mjs && git add package.json package-lock.json Cargo.toml Cargo.lock README.md README_EN.md",
     "sync-version": "node scripts/sync-version.mjs",
     "sync:extension": "node scripts/sync-extension-assets.mjs",
     "check:extension": "node scripts/sync-extension-assets.mjs --check",
-    "bench": "node tests/concurrency_bench.mjs",
     "prepack": "node scripts/sync-optional-deps.mjs && node scripts/sync-extension-assets.mjs",
     "postinstall": "node npm/postinstall.js"
   },
   "optionalDependencies": {
-    "agent-browser-cli2-darwin-arm64": "0.3.8",
-    "agent-browser-cli2-darwin-x64": "0.3.8",
-    "agent-browser-cli2-linux-x64": "0.3.8",
-    "agent-browser-cli2-linux-arm64": "0.3.8",
-    "agent-browser-cli2-windows-x64": "0.3.8"
+    "@g1728578755/atb-darwin-arm64": "0.7.1",
+    "@g1728578755/atb-darwin-x64": "0.7.1",
+    "@g1728578755/atb-linux-x64": "0.7.1",
+    "@g1728578755/atb-linux-arm64": "0.7.1",
+    "@g1728578755/atb-win32-x64": "0.7.1"
   },
   "engines": {
     "node": ">=18"
   },
+  "homepage": "https://github.com/1728578755/atb-cli",
+  "bugs": {
+    "url": "https://github.com/1728578755/atb-cli/issues"
+  },
   "repository": {
     "type": "git",
-    "url": "https://github.com/1728578755/agent-browser-cli2"
+    "url": "git+https://github.com/1728578755/atb-cli.git"
   },
   "publishConfig": {
     "access": "public",

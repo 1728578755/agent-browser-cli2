@@ -5,7 +5,7 @@
 //   验证「页面监听器比我们更早注册」时改写是否仍然生效，以及 wait --js
 //   是否只注入一次。
 //
-// 前置：daemon 运行中，且浏览器装好 tmwd_cdp_bridge 扩展。
+// 前置：daemon 运行中，且浏览器装好 atb_bridge 扩展。
 // 运行：node tests/live_xhr_wait.mjs [--keep]
 import http from "node:http";
 import path from "node:path";
@@ -13,7 +13,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const CLI = process.env.ABC_CLI || path.join(ROOT, "target", "release", "agent-browser-cli.exe");
+const CLI = process.env.ABC_CLI || path.join(ROOT, "target", "release", "atb.exe");
 const KEEP = process.argv.includes("--keep");
 
 const PAGE = `<!doctype html><html><head><meta charset="utf-8"><title>xhr rewrite</title></head>
@@ -391,7 +391,7 @@ async function main() {
 
     console.log("18) reset 后访问器已还原");
     await run(["net", "reset", ...tab]);
-    res = await run(["exec", "return { guarded: !!(window.__abcNetState && window.__abcNetState.xhrGuarded) }", ...tab]);
+    res = await run(["exec", "const k = Object.getOwnPropertyNames(window).find(n => n.indexOf('__atb_net_') === 0); const s = k ? window[k] : window.__abcNetState; return { guarded: !!(s && s.xhrGuarded) }", ...tab]);
     assert(jsReturn(res)?.guarded === false, "reset 关掉了访问器守卫", jsReturn(res));
     res = await run(["exec", "return await window.runXhr('/api')", ...tab]);
     const afterReset = jsReturn(res);

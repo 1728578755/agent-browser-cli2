@@ -82,6 +82,13 @@ pub fn resolve_open_target(
         return resolve_path_input(input, cwd);
     }
 
+    // `C:report.html` 是 Windows 的「驱动器相对路径」，不是 scheme `c`。
+    // 旧逻辑把它交给 `explicit_scheme`，于是报 unsupported_scheme（P3）。
+    #[cfg(windows)]
+    if is_windows_drive_relative(input) {
+        return resolve_path_input(input, cwd);
+    }
+
     if let Some(scheme) = explicit_scheme(input) {
         return match scheme.as_str() {
             "http" | "https" => resolve_explicit_web(input, &scheme),
@@ -105,7 +112,106 @@ pub fn resolve_open_target(
         }
     }
 
-    resolve_implicit_web(input)
+    // 裸文件名不存在时不能静默改写成 `https://demo.html`：那条 URL 必然打不开，
+    // 用户只会在浏览器里看到一个与输入毫不相关的错误页（P3）。只有明确像域名时
+    // 才回退到 https。
+    if looks_like_web_target(input) {
+        return resolve_implicit_web(input);
+    }
+
+    Err(OpenTargetError::new(
+        "file_not_found",
+        format!("Open Target looks like a local file but does not exist: {input}"),
+        json!({
+            "open_target": input,
+            "cwd": cwd.map(|path| path.display().to_string()),
+            "did_you_mean": suggest_local_files(input, cwd),
+        }),
+    ))
+}
+
+/// Windows 驱动器相对路径（`C:report.html`）：单字母 + `:`，且后面不是 `//`、`/`、`\`。
+///
+/// 它相对的是「该驱动器的当前目录」，既不是进程 cwd，也不是 scheme。
+#[cfg(windows)]
+fn is_windows_drive_relative(input: &str) -> bool {
+    let bytes = input.as_bytes();
+    if bytes.len() < 2 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' {
+        return false;
+    }
+    !matches!(bytes.get(2), Some(b'/') | Some(b'\\'))
+}
+
+/// 常见文件扩展名：用来区分「`demo.html` 这种文件名」和「`example.com` 这种域名」。
+///
+/// 没有这张表就只能靠「有没有点号」判断，`demo.html` 会被误当成域名（P3）。
+const FILE_EXTENSIONS: &[&str] = &[
+    "html", "htm", "xhtml", "txt", "md", "markdown", "pdf", "png", "jpg", "jpeg", "gif", "webp",
+    "svg", "css", "js", "mjs", "cjs", "ts", "tsx", "jsx", "json", "jsonl", "xml", "csv", "tsv",
+    "yaml", "yml", "toml", "ini", "log", "zip", "gz", "tar", "7z", "rar", "mp3", "mp4", "webm",
+    "mov", "wav", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "exe", "msi", "dmg", "sh", "bat",
+    "ps1", "py", "rb", "go", "rs", "java", "c", "h", "cpp", "hpp",
+];
+
+/// 这个输入看起来是「网页」而不是「本地文件名」吗？
+///
+/// 判定偏保守：有显式端口、是 localhost、或点号后不是常见扩展名时才算网页。
+fn looks_like_web_target(input: &str) -> bool {
+    if explicit_port(input).is_some() {
+        return true;
+    }
+    let authority = input.split(['/', '?', '#']).next().unwrap_or(input);
+    if authority.starts_with('[') {
+        // IPv6 字面量（`[::1]` / `[::1]:8080`）。
+        return true;
+    }
+    if authority.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let mut labels = authority.rsplit('.');
+    let Some(tld) = labels.next() else {
+        return false;
+    };
+    // 没有点号 = 本地文件名（`demo`），不当作单标签主机名。
+    if labels.next().is_none() {
+        return false;
+    }
+    let tld = tld.to_ascii_lowercase();
+    tld.len() >= 2
+        && tld.chars().all(|ch| ch.is_ascii_alphabetic())
+        && !FILE_EXTENSIONS.contains(&tld.as_str())
+}
+
+/// 给 `file_not_found` 附带同目录下的相近候选，避免用户/智能体只能靠猜。
+fn suggest_local_files(input: &str, cwd: Option<&Path>) -> Vec<String> {
+    let Some(cwd) = cwd else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(cwd) else {
+        return Vec::new();
+    };
+    let (stem, extension) = match input.rsplit_once('.') {
+        Some((stem, extension)) => (
+            stem.to_ascii_lowercase(),
+            Some(extension.to_ascii_lowercase()),
+        ),
+        None => (input.to_ascii_lowercase(), None),
+    };
+    let mut candidates: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+        .filter(|name| {
+            let lower = name.to_ascii_lowercase();
+            let same_stem = !stem.is_empty() && lower.contains(&stem);
+            let same_extension = extension
+                .as_deref()
+                .is_some_and(|extension| lower.ends_with(&format!(".{extension}")));
+            same_stem || same_extension
+        })
+        .collect();
+    candidates.sort();
+    candidates.truncate(3);
+    candidates
 }
 
 fn resolve_explicit_web(
@@ -251,6 +357,24 @@ fn resolve_path_input(
     cwd: Option<&Path>,
 ) -> Result<ResolvedOpenTarget, OpenTargetError> {
     let path = expand_current_user_home(input)?;
+    #[cfg(windows)]
+    let path = if is_windows_drive_relative(input) {
+        // `C:report.html` 相对「C: 盘的当前目录」，不能按进程 cwd 拼接（会得到
+        // `cwd\C:report.html`）。`std::path::absolute` 走 GetFullPathNameW，能按
+        // Windows 自己的语义展开（P3）。
+        std::path::absolute(&path).map_err(|err| {
+            OpenTargetError::new(
+                "invalid_open_target",
+                format!(
+                    "Could not resolve drive-relative path {}: {err}",
+                    path.display()
+                ),
+                json!({ "open_target": input }),
+            )
+        })?
+    } else {
+        path
+    };
     let absolute = if path.is_absolute() {
         path
     } else {
@@ -404,10 +528,15 @@ fn foreign_path_platform(input: &str) -> Option<&'static str> {
         && bytes[0].is_ascii_alphabetic()
         && bytes[1] == b':'
         && matches!(bytes[2], b'\\' | b'/');
+    // `C:report.html`（驱动器相对路径）同样是 Windows 语法，不是 scheme `c`。
+    let drive_relative = bytes.len() >= 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && !matches!(bytes.get(2), Some(b'/') | Some(b'\\'));
     let unc = input.starts_with("\\\\");
     let relative = input.starts_with(".\\") || input.starts_with("..\\");
     let home = input.starts_with("~\\");
-    (drive || unc || relative || home).then_some("windows")
+    (drive || drive_relative || unc || relative || home).then_some("windows")
 }
 
 #[cfg(windows)]
@@ -441,11 +570,51 @@ mod tests {
     }
 
     #[test]
-    fn missing_bare_file_shape_falls_back_to_web() {
+    fn missing_bare_file_is_reported_as_file_not_found() {
+        // 旧行为是静默改写成 `https://demo.html`，浏览器里必然打不开（P3）。
         let dir = temp_dir();
-        let resolved = resolve_open_target("demo.html", Some(&dir)).unwrap();
-        assert_eq!(resolved.navigation_url, "https://demo.html");
+        fs::write(dir.join("demo-old.html"), "ok").unwrap();
+        let err = resolve_open_target("demo.html", Some(&dir)).unwrap_err();
+        assert_eq!(err.code, "file_not_found");
+        let suggestions = err
+            .details
+            .get("did_you_mean")
+            .and_then(Value::as_array)
+            .expect("did_you_mean");
+        assert!(
+            suggestions
+                .iter()
+                .any(|item| item.as_str() == Some("demo-old.html")),
+            "suggestions: {suggestions:?}"
+        );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn missing_dotted_name_that_looks_like_a_domain_still_falls_back_to_web() {
+        let dir = temp_dir();
+        assert_eq!(
+            resolve_open_target("example.com", Some(&dir))
+                .unwrap()
+                .navigation_url,
+            "https://example.com"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_drive_relative_path_is_a_path_not_a_scheme() {
+        assert!(is_windows_drive_relative("C:report.html"));
+        assert!(is_windows_drive_relative(r"C:reports\a.html"));
+        assert!(!is_windows_drive_relative("C:/report.html"));
+        assert!(!is_windows_drive_relative("c://example.com"));
+        assert!(!is_windows_drive_relative("https://example.com"));
+
+        // 关键是不能报 unsupported_scheme：它必须走本地路径分支（P3）。
+        let err = resolve_open_target("C:definitely-missing-report.html", None).unwrap_err();
+        assert_ne!(err.code, "unsupported_scheme");
+        assert_eq!(err.code, "local_resource_not_found");
     }
 
     #[test]

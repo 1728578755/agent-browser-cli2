@@ -1,10 +1,22 @@
+# 统一行尾：仓库内文本按 LF 存储、按 LF 检出。
+#
+# 为什么需要：`scripts/sync-extension-assets.mjs` / `tests/asset_parity.test.mjs`
+# 会对 assets/page_*.js 与 assets/atb_bridge/ops/page_*.js 做逐字节比对，这要求两边
+# 行尾完全一致。Windows 上 core.autocrlf=true 会让两边检出成不同行尾，导致本地通、
+# Linux CI 失败，所以这里统一要求 LF。
 * text=auto eol=lf
 
-*.png binary
+*.js text eol=lf
+*.mjs text eol=lf
+*.cjs text eol=lf
+*.json text eol=lf
+*.rs text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.toml text eol=lf
+*.lock text eol=lf
 
-# 页面脚本要与 ops/ 副本逐字节比对，两边都禁止换行转换
-assets/page_*.js -text
-assets/tmwd_cdp_bridge/ops/page_*.js -text
-
-# 依赖锁文件只用于可复现构建，不进入 review diff
-Cargo.lock -diff
+# Windows 批处理必须 CRLF（cmd.exe 对 LF 换行敏感）。文件不存在时规则也无害。
+*.bat text eol=crlf
+*.cmd text eol=crlf

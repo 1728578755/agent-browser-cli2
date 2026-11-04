@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>ATB E2E Download</title>
+</head>
+<body>
+<h1>下载页面</h1>
+<p>点击链接触发一次真实下载；配合 <code>atb download-wait</code> 验证下载状态机。</p>
+
+<p><a id="dl" href="/files/sample.txt" download="atb-e2e-sample.txt">下载 sample.txt</a></p>
+<p id="hint">若 Chrome 弹了「另存为」对话框，自动化路径下不会有人点确认，脚本会标记 skipped 而不是 failed。</p>
+</body>
+</html>

@@ -15,14 +15,127 @@
 //
 // 重要：本文件每次命令都会重新注入，因此状态必须挂在 window 上，
 // 包装函数只在首次注入时安装，避免 fetch 被套多层。
+//
+// ---- 可检测性约束（改这段前先读完）----
+//
+// 1) 状态槽位：不再用 window.__abcNetState（名字显眼，且能被
+//    Object.getOwnPropertyNames(window) 一眼认出）。改成
+//      window['__atb_net_<random>'] = state
+//    —— 不可枚举、不可写、可配置。**stealth scrub 依赖 "__atb_" 前缀**去定位
+//    这些槽位（扫 own property names 取前缀匹配项）；改前缀或换成别的位置会让
+//    scrub 漏掉残留。多次注入时先按前缀找回已有槽位，找不到才新建随机后缀，
+//    这样同一页面里所有注入共享同一份状态，不会重复包装 fetch。
+//
+//    configurable 必须是 true：reset / scrub 要能把它 delete 掉。若设成 false，
+//    这个属性会一直留在 window 上，getOwnPropertyNames 永远列得出来，删也删不掉
+//    —— 比它想藏的东西更显眼。所以这里刻意不用 configurable:false。
+//
+// 2) 包装函数：见下面的 disguise()。站点最常见的检测是
+//    fn.toString().includes('[native code]')，其次是 fn.name / fn.length。
+//
+// 3) 旧版本注入可能在页面上留了 window.__abcNetState：迁移到新槽位后 delete。
+//
+// 4) 入口定义：整个文件包在 IIFE 里，末尾用 defineProperty 把 __abcNet 挂到 window，
+//    而不是写成顶层 `function __abcNet(){}`。原因有两条，都实测过：
+//    a. 顶层函数声明在 classic script（扩展 executeScript({files}) 路径）里创建的是
+//       **non-configurable** 全局绑定 —— 这个位是 V8 内部的 DONT_DELETE，
+//       getOwnPropertyDescriptor 上看不出来（configurable 仍报 true），但
+//       `delete window.__abcNet` 恒返回 false。结果 scrub 永远清不掉这个入口。
+//       （daemon 的 eval 路径没有这个问题，但两条路径必须都给对。）
+//    b. 全局函数声明是 enumerable 的，站点一行 `Object.keys(window)` 就能列出来。
+//    defineProperty 之后它是非枚举 + 可配置：for...in / Object.keys 看不到，
+//    delete 又能成功。名字保持不变 —— daemon 的 `return __abcNet({})` 是裸标识符，
+//    靠全局对象属性照样解析得到；扩展侧是 `window[name]`，更不受影响。
+;(function () {
 function __abcNet(opts) {
   opts = opts || {};
   const action = String(opts.action || 'fetch').toLowerCase();
   const now = () => (typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now());
 
-  const state = (function () {
-    if (window.__abcNetState) return window.__abcNetState;
-    const created = {
+  // 状态槽位名 = STATE_PREFIX + randomToken()，即 `__atb_net_` + 8 位 [a-z0-9]。
+  //
+  // **这是一条跨文件契约**（读槽位的代码不在本文件里）：
+  //   * assets/page_stealth.js 的 netStateKey()：audit 判定 + scrub 删除都靠它定位；
+  //   * tests/live_xhr_wait.mjs：拿 xhrGuarded 判断访问器是否被接管。
+  // 因此改前缀、改后缀长度或字符集，必须同步改这两处的匹配规则，否则 audit 会变瞎
+  // （"页面干净"的假结论）。
+  //
+  // 读取侧必须**锚定整名**（/^__atb_net_[a-z0-9]{8}$/）而不是只比前缀：
+  // 光比前缀的话，页面自己造一个 `__atb_net_fake` 就会被当成我们的槽位 —— scrub
+  // 会删掉页面的属性、还报 'state-only'（读起来像"已还原"），既毁页面数据又误报。
+  // 只按 enumerable === false 过滤不够：页面同样可以定义不可枚举属性，
+  // 只有"名字形状 + 值结构（routes/log 数组、seq 数字、installed 布尔）"双检才稳。
+  const STATE_PREFIX = '__atb_net_';
+  const LEGACY_STATE_KEY = '__abcNetState';
+
+  let state = null;
+  let stateKey = null;
+
+  /// 8 位 [a-z0-9]。**长度和字符集是契约的一部分**（见 STATE_PREFIX 注释里的
+  /// 锚定正则），改这里就要同步改读取侧的匹配规则。
+  function randomToken() {
+    const alphabet = 'abcdefghijklmnopqrstuvwxyz0123456789';
+    const bytes = new Uint8Array(8);
+    let filled = false;
+    try {
+      if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
+        crypto.getRandomValues(bytes);
+        filled = true;
+      }
+    } catch (_) {}
+    if (!filled) {
+      for (let i = 0; i < bytes.length; i += 1) bytes[i] = Math.floor(Math.random() * 256);
+    }
+    let out = '';
+    for (let i = 0; i < bytes.length; i += 1) out += alphabet[bytes[i] % alphabet.length];
+    return out;
+  }
+
+  /// 槽位名的形状：`__atb_net_` + 8 位 [a-z0-9]（见 STATE_PREFIX 注释里的契约）。
+  const STATE_SLOT_RE = /^__atb_net_[a-z0-9]{8}$/;
+
+  /// 值结构校验：名字可以被页面撞（甚至伪造），字段结构才是我们独有的。
+  function looksLikeNetState(value) {
+    return !!value && typeof value === 'object'
+      && Array.isArray(value.routes) && Array.isArray(value.log)
+      && typeof value.seq === 'number' && typeof value.installed === 'boolean';
+  }
+
+  /// 只接受**数据属性**，一律通过描述符读取。
+  /// 页面可以把 `__atb_net_xxxxxxxx` 定义成 getter：直接 `window[name]` 会在我们的
+  /// 注入上下文里执行页面代码，等于白送它一个执行通道。访问器属性直接跳过、不触发。
+  ///
+  /// `hasOwnProperty(desc, 'value')` 判的是「描述符里有没有 value 这个槽位」，也就是
+  /// **属性的种类**；别改写成 `desc.value !== undefined`（那是判值，语义不同：数据属性
+  /// 完全可以有 undefined 值，访问器则根本没有 value 槽位），更别图省事改回
+  /// `window[name]` —— 那会把上面这条执行通道重新打开。
+  function dataSlot(name) {
+    let desc = null;
+    try { desc = Object.getOwnPropertyDescriptor(window, name); } catch (_) { return null; }
+    if (!desc) return null;
+    if (typeof desc.get === 'function' || typeof desc.set === 'function') return null;
+    if (!Object.prototype.hasOwnProperty.call(desc, 'value')) return null;
+    return desc;
+  }
+
+  /// 找已经存在的状态槽位（按名字形状扫，不靠固定名字），保证重复注入共享同一份状态。
+  /// 三个条件同时满足才认：名字形状对、不可枚举（我们的写法）、值结构像 state ——
+  /// 只比前缀会让页面自造的 `__atb_net_fake` 被当成我们的槽位，reset 时被删掉。
+  function findStateKey() {
+    let names = [];
+    try { names = Object.getOwnPropertyNames(window) || []; } catch (_) { return null; }
+    for (const name of names) {
+      if (typeof name !== 'string' || !STATE_SLOT_RE.test(name)) continue;
+      const desc = dataSlot(name);
+      if (!desc || desc.enumerable !== false) continue;
+      if (!looksLikeNetState(desc.value)) continue;
+      return name;
+    }
+    return null;
+  }
+
+  function emptyState() {
+    return {
       installed: false,
       seq: 0,
       log: [],
@@ -34,9 +147,98 @@ function __abcNet(opts) {
       xhrNative: null,
       xhrRestore: null
     };
-    window.__abcNetState = created;
-    return created;
-  })();
+  }
+
+  function loadState() {
+    const existingKey = findStateKey();
+    if (existingKey) {
+      const found = dataSlot(existingKey);
+      if (found) return { key: existingKey, state: found.value };
+    }
+
+    const created = emptyState();
+    // 旧版本（window.__abcNetState）留下的状态：接着用，然后把旧名字抹掉。
+    // 同样只认数据属性 + 结构匹配：页面随手写个 window.__abcNetState = 'x'
+    // 不该被我们当成自己的状态，更不该被 reset 删掉。
+    const legacyDesc = dataSlot(LEGACY_STATE_KEY);
+    if (legacyDesc && looksLikeNetState(legacyDesc.value)) {
+      const legacy = legacyDesc.value;
+      for (const key of Object.keys(created)) {
+        if (legacy[key] !== undefined) created[key] = legacy[key];
+      }
+      try { delete window[LEGACY_STATE_KEY]; } catch (_) {}
+    }
+
+    const key = STATE_PREFIX + randomToken();
+    try {
+      Object.defineProperty(window, key, {
+        value: created,
+        enumerable: false,
+        configurable: true,
+        writable: false
+      });
+    } catch (_) {
+      // 走到这里说明 defineProperty 在 window 上失败了（页面把名字占成了不可配置等），
+      // 退回普通赋值至少让本次注入能用；代价是这个槽位变成可枚举，下次注入认不出来
+      // （会重新建一份）。正常页面不会走到这里。
+      try { window[key] = created; } catch (_) {}
+    }
+    return { key: key, state: created };
+  }
+
+  /// 每次进入都确认 state 绑在 window 的真实槽位上：reset 会把槽位删掉，
+  /// 之后的调用（同一份注入再被调用）需要重新建一份，否则会拿旧对象继续包装。
+  function hydrate() {
+    if (state && stateKey) {
+      // 同样走描述符：页面若把槽位重定义成 getter，读值就等于执行它的代码。
+      const alive = dataSlot(stateKey);
+      if (alive && alive.value === state) return;
+    }
+    const slot = loadState();
+    state = slot.state;
+    stateKey = slot.key;
+  }
+
+  hydrate();
+
+  // ---- 包装函数伪装 ------------------------------------------------------------
+  //
+  // 站点判断「fetch 被改过」最省事的办法就是 `window.fetch.toString()`：
+  // 原生实现含 "[native code]"，我们的包装函数不含，一测就露。
+  //
+  // 这里不动 Function.prototype（改全局原型本身就是更强的痕迹，而且会拖慢
+  // 整个页面、还可能被冻结原型的站点搞崩），只在 wrapper 自身上盖一个 toString，
+  // 让 fn.toString() / String(fn) 都返回**原函数**的原生源码。同时对齐 name、
+  // length 与原型链，覆盖另外两个廉价检测点。
+  //
+  // 幂等：wrapper 由 install() 在 installed 标志下只创建一次，重复注入不会二次包装。
+  function disguise(wrapper, original) {
+    if (typeof wrapper !== 'function') return wrapper;
+    if (typeof original !== 'function') return wrapper;
+    try {
+      Object.defineProperty(wrapper, 'name', {
+        value: original.name, configurable: true
+      });
+    } catch (_) {}
+    try {
+      Object.defineProperty(wrapper, 'length', {
+        value: original.length, configurable: true
+      });
+    } catch (_) {}
+    try {
+      Object.setPrototypeOf(wrapper, Object.getPrototypeOf(original));
+    } catch (_) {}
+    try {
+      const nativeSource = Function.prototype.toString.call(original);
+      Object.defineProperty(wrapper, 'toString', {
+        value: function toString() { return nativeSource; },
+        enumerable: false,
+        configurable: true,
+        writable: true
+      });
+    } catch (_) {}
+    return wrapper;
+  }
 
   function pushLog(entry) {
     entry.id = ++state.seq;
@@ -66,17 +268,57 @@ function __abcNet(opts) {
     return out;
   }
 
+  /// 只认**自有**属性：页面污染 Object.prototype（`Object.prototype.status = 200`）
+  /// 之后，`rule.status !== undefined` 会对所有规则恒真 → isMock 恒真 → 所有命中规则的
+  /// 请求都被伪造。规则对象来自 JSON，走 hasOwnProperty 即可。
+  function own(obj, key) {
+    return !!obj && Object.prototype.hasOwnProperty.call(obj, key);
+  }
+
+  /// 相对 URL 先解析成绝对 URL 再参与匹配。
+  /// 页面写 `fetch('/api/user')` 时匹配目标只有 "/api/user"，用户按直觉配的
+  /// `match:"example.com/api"` 永远不命中，而 `net route` 自己返回 ok、日志记「未命中」
+  /// —— 静默失配，极难排查。日志里仍保留页面原本写的相对 URL。
+  function absoluteUrl(url) {
+    const raw = String(url || '');
+    try { return new URL(raw, location.href).href; } catch (_) { return raw; }
+  }
+
+  /// 规则匹配：默认按**子串**匹配；`regex:true` 才把 match 当正则。
+  ///
+  /// 以前是「子串不中就用 new RegExp(match) 再试一次」：字面量里的 `.` `?` `+`
+  /// 在正则分支意外获得通配语义（`app.js` 会命中 `appXjs`），用户无法表达
+  /// 「只按字面匹配」，而且每个请求每条规则都要重编译一次正则。
+  /// 为了不打断已经在用的正则写法，字符串里带明显正则元字符时仍走回退分支；
+  /// 想强制关掉回退可以写 `regex:false`。
+  const REGEX_LOOKING = /[\^$*+?()[\]{}|\\]/;
+  const reCache = new Map();
+
+  function regexFor(pattern) {
+    if (reCache.has(pattern)) return reCache.get(pattern);
+    let compiled = null;
+    try { compiled = new RegExp(pattern); } catch (_) { compiled = null; }
+    // 上限 64：规则本身就限 50 条，页面反复改规则时也不会无限增长。
+    if (reCache.size >= 64) reCache.clear();
+    reCache.set(pattern, compiled);
+    return compiled;
+  }
+
   function matchRule(url, method) {
     const target = String(url || '');
+    const absolute = absoluteUrl(target);
+    const targets = absolute === target ? [target] : [target, absolute];
     const verb = String(method || 'GET').toUpperCase();
     for (const rule of state.routes) {
-      if (rule.method && rule.method !== '*' && String(rule.method).toUpperCase() !== verb) continue;
-      if (!rule.match) continue;
-      let hit = false;
-      try {
-        hit = target.includes(rule.match) || new RegExp(rule.match).test(target);
-      } catch (_) {
-        hit = target.includes(rule.match);
+      if (own(rule, 'method') && rule.method && rule.method !== '*'
+          && String(rule.method).toUpperCase() !== verb) continue;
+      if (!own(rule, 'match') || !rule.match) continue;
+      const pattern = String(rule.match);
+      let hit = targets.some(candidate => candidate.indexOf(pattern) >= 0);
+      if (!hit && rule.regex !== false) {
+        const useRegex = rule.regex === true || REGEX_LOOKING.test(pattern);
+        const compiled = useRegex ? regexFor(pattern) : null;
+        if (compiled) hit = targets.some(candidate => compiled.test(candidate));
       }
       if (hit) return rule;
     }
@@ -84,7 +326,7 @@ function __abcNet(opts) {
   }
 
   function ruleBody(rule, fallback) {
-    const body = rule.body !== undefined ? rule.body : fallback;
+    const body = own(rule, 'body') ? rule.body : fallback;
     if (body === undefined || body === null) return '';
     return typeof body === 'string' ? body : JSON.stringify(body);
   }
@@ -95,7 +337,9 @@ function __abcNet(opts) {
 
   function isMock(rule) {
     if (!rule) return false;
-    return rule.abort === true || rule.status !== undefined || rule.body !== undefined;
+    return rule.abort === true
+      || (own(rule, 'status') && rule.status !== undefined)
+      || (own(rule, 'body') && rule.body !== undefined);
   }
 
   // ---- XHR 响应改写：接管访问器，而不是在事件回调里改实例 ----------------
@@ -142,28 +386,17 @@ function __abcNet(opts) {
     return map;
   }
 
-  /// 把原始响应体读成文本；读不出来返回 null（blob 等无法同步读取）。
-  function rawXhrText(xhr) {
-    const native = state.xhrNative;
-    if (!native) return null;
-    const type = xhr.responseType || '';
+  /// 伪造 readyState=4（mock / abort 都要用）。
+  ///
+  /// 只在实例上还没有 own readyState 时补一个，并留下 `__abcNetOwnReady` 标记：
+  /// 复用同一个 xhr 再发真实请求时，open() 靠这个标记**只删我们自己打的补丁**，
+  /// 不会误删页面/框架原本就在实例上设的值。
+  function fakeReadyState(xhr) {
+    if (Object.getOwnPropertyDescriptor(xhr, 'readyState')) return;
     try {
-      if (type === '' || type === 'text') return native.props.responseText.get.call(xhr);
-      if (type === 'json') {
-        const value = native.props.response.get.call(xhr);
-        return value === undefined ? null : JSON.stringify(value);
-      }
-      if (type === 'arraybuffer') {
-        const buffer = native.props.response.get.call(xhr);
-        if (!buffer || typeof TextDecoder === 'undefined') return null;
-        return new TextDecoder('utf-8').decode(new Uint8Array(buffer));
-      }
-      if (type === 'document') {
-        const doc = native.props.response.get.call(xhr);
-        return doc && doc.documentElement ? doc.documentElement.outerHTML : null;
-      }
+      Object.defineProperty(xhr, 'readyState', { value: 4, configurable: true });
+      xhr.__abcNetOwnReady = true;
     } catch (_) {}
-    return null;
   }
 
   function buildRewrite(xhr, spec, out) {
@@ -175,19 +408,26 @@ function __abcNet(opts) {
     }
     const rewrite = spec.response;
     if (!rewrite) return;
-    let text = null;
-    if (rewrite.body !== undefined) {
-      text = typeof rewrite.body === 'string' ? rewrite.body : JSON.stringify(rewrite.body);
-    } else {
-      text = rawXhrText(xhr);
+    // 只改 status/headers 时**不读 body**：旧实现无条件 rawXhrText(xhr)，
+    // 于是「只想把 404 改成 200」也要把整个响应体解码成字符串 —— arraybuffer
+    // 还要多走一趟 TextDecoder、blob 直接读不出来被误判成 body_unreadable，
+    // 整条改写作废。现在没有 body 规则就把 text 留成 null，让 responseText /
+    // response 原样透传（访问器见 rewriteValue：null 即放行原生值）。
+    if (rewrite.body === undefined) {
+      if (rewrite.status !== undefined) out.status = Number(rewrite.status);
+      if (rewrite.statusText !== undefined) out.statusText = String(rewrite.statusText);
+      // rule.headers 是「响应头」的统一入口（mock 与改写都认），
+      // response.headers 只对改写生效且优先级更高。
+      if (spec.headers || rewrite.headers) {
+        out.headers = Object.assign({}, spec.headers || {}, rewrite.headers || {});
+      }
+      return;
     }
-    if (text === null) {
-      // 原始响应体读不出来（blob / 读访问器抛错），又没给 response.body：
-      // 整条改写作废、放行原生响应，只在日志里记 response_rewrite_skipped。
-      // 绝不能拿空串顶替——访问器会把这个空值交给页面，等于吞掉真实响应。
-      out.unsupported = xhr.responseType === 'blob'
-        ? 'blob-without-body（想改原始二进制体请用 net mock --engine cdp）'
-        : 'body_unreadable';
+    const text = typeof rewrite.body === 'string' ? rewrite.body : JSON.stringify(rewrite.body);
+    if (typeof text !== 'string') {
+      // JSON.stringify 对函数 / Symbol / 循环引用返回 undefined 或抛错；不能拿
+      // 空串顶替（会吞掉真实响应），整条改写作废并记原因。
+      out.unsupported = 'body_unserializable';
       return;
     }
     out.text = text;
@@ -257,6 +497,86 @@ function __abcNet(opts) {
     return undefined;
   }
 
+  // ---- 响应体捕获与响应改写：都不能阻塞页面自己的 fetch ----------------------
+  //
+  // `clone.text()` 要等整个 body 结束。对 text/event-stream 这类**永不结束**的流，
+  // 页面自己的 fetch Promise 就永远不 resolve —— 聊天流、进度推送、视频分片全挂死
+  // 。所以：
+  //   * 捕获走旁路（不 await）：日志条目先落盘、preview 后补；
+  //   * 改写只动 status/headers 时透传 response.body 流，不缓冲；
+  //   * 命中流式/超大响应且规则没给 body 时跳过改写，并标明原因。
+  const MAX_CAPTURE_BYTES = 4 * 1024 * 1024;
+  const NULL_BODY_STATUS = new Set([101, 204, 205, 304]);
+
+  function captureSkipReason(response) {
+    let type = '';
+    let length = 0;
+    try { type = String(response.headers.get('content-type') || '').toLowerCase(); } catch (_) {}
+    try { length = Number(response.headers.get('content-length') || 0); } catch (_) {}
+    if (type.indexOf('text/event-stream') >= 0) return 'streaming_response (text/event-stream)';
+    if (length > MAX_CAPTURE_BYTES) return 'content_length ' + length + ' > ' + MAX_CAPTURE_BYTES;
+    return null;
+  }
+
+  /// 旁路读取响应体：不 await，读完把 preview 补进同一条日志。
+  function captureBody(response, entry) {
+    Promise.resolve().then(async function () {
+      try {
+        const text = await response.clone().text();
+        entry.response_preview = text.slice(0, 2000);
+        entry.response_length = text.length;
+      } catch (e) {
+        entry.body_capture_error = (e && e.message) || String(e);
+      }
+      delete entry.body_capture_pending;
+    });
+  }
+
+  /// `new Response(...)` 会丢掉 url / type / redirected（url 变空串、type 变 'default'），
+  /// 依赖这些字段的页面会误判。能补就补，补不上留给日志标 url_lost。
+  function preserveMeta(next, original) {
+    const lost = [];
+    for (const key of ['url', 'type', 'redirected']) {
+      try {
+        const value = original[key];
+        if (value === undefined) continue;
+        Object.defineProperty(next, key, { value: value, configurable: true, enumerable: false });
+      } catch (_) { lost.push(key); }
+    }
+    return lost;
+  }
+
+  /// 构造 mock 响应。以前这段在 try **之外**：规则写 `status:204`（无内容响应是很
+  /// 常见的 mock 需求）同时带 body 时 `new Response` 抛 TypeError，异常从包装器同步
+  /// 抛出 → 页面 fetch 直接 reject，且一条日志都没有，`net log` 里查不到这次请求
+  /// 。现在：无内容状态码强制 body=null，任何构造失败都记
+  /// `mock_invalid` 并放行真实请求。
+  function buildMockResponse(rule, url, method, started) {
+    const status = rule.status === undefined ? 200 : Number(rule.status);
+    const valid = Number.isInteger(status) && status >= 200 && status <= 599;
+    const body = NULL_BODY_STATUS.has(status) ? null : ruleBody(rule, '');
+    try {
+      if (!valid) throw new TypeError('invalid status: ' + String(rule.status));
+      const response = new Response(body, {
+        status: status,
+        statusText: rule.statusText || 'OK',
+        headers: ruleHeaders(rule)
+      });
+      pushLog({
+        kind: 'fetch', url, method, mocked: true, status: status,
+        ok: true, elapsed_ms: Math.round(now() - started)
+      });
+      return response;
+    } catch (e) {
+      pushLog({
+        kind: 'fetch', url, method, mocked: true, ok: false,
+        mock_invalid: (e && e.message) || String(e), status: status,
+        elapsed_ms: Math.round(now() - started)
+      });
+      return null;
+    }
+  }
+
   function guardXhr() {
     if (state.xhrGuarded) return;
     const native = captureXhrNative();
@@ -268,9 +588,16 @@ function __abcNet(opts) {
     function define(name, descriptor) {
       // 浏览器实现里拿不到原生 getter 就干脆不接管，调用方仍走原生路径。
       if (!native.props[name]) return;
+      const nativeDescriptor = native.props[name];
+      const guarded = Object.assign({}, descriptor);
+      // 接管的 getter 也是包装函数：toString 要跟原生的一致，
+      // 否则 Object.getOwnPropertyDescriptor(proto, 'responseText').get 就成了铁证。
+      if (typeof guarded.get === 'function' && nativeDescriptor.get) {
+        guarded.get = disguise(guarded.get, nativeDescriptor.get);
+      }
       try {
-        Object.defineProperty(proto, name, descriptor);
-        restore.push({ name: name, descriptor: native.props[name] });
+        Object.defineProperty(proto, name, guarded);
+        restore.push({ name: name, descriptor: nativeDescriptor });
       } catch (_) {}
     }
 
@@ -318,7 +645,7 @@ function __abcNet(opts) {
       }
     });
 
-    proto.getAllResponseHeaders = function () {
+    proto.getAllResponseHeaders = disguise(function () {
       const raw = native.allHeaders.call(this);
       const out = rewriteOf(this);
       if (!out || !out.headers) return raw;
@@ -334,9 +661,9 @@ function __abcNet(opts) {
       const keys = Object.keys(map);
       if (!keys.length) return '';
       return keys.map(function (key) { return key + ': ' + map[key]; }).join('\r\n') + '\r\n';
-    };
+    }, native.allHeaders);
 
-    proto.getResponseHeader = function (name) {
+    proto.getResponseHeader = disguise(function (name) {
       const key = String(name || '').toLowerCase();
       const out = rewriteOf(this);
       if (out && out.headers) {
@@ -346,7 +673,7 @@ function __abcNet(opts) {
         if (out.text !== null && (key === 'content-length' || key === 'content-encoding')) return null;
       }
       return native.oneHeader.call(this, name);
-    };
+    }, native.oneHeader);
 
     state.xhrRestore = restore;
     state.xhrGuarded = true;
@@ -364,7 +691,7 @@ function __abcNet(opts) {
     // XHR 的响应改写靠访问器接管，必须和 fetch 一起装上。
     guardXhr();
 
-    window.fetch = async function (input, init) {
+    const fetchWrapper = disguise(async function (input, init) {
       const url = typeof input === 'string' ? input : (input && input.url) || '';
       const method = String((init && init.method) || (input && input.method) || 'GET').toUpperCase();
       const rule = matchRule(url, method);
@@ -372,21 +699,14 @@ function __abcNet(opts) {
 
       if (rule && rule.abort) {
         pushLog({ kind: 'fetch', url, method, mocked: true, aborted: true, ok: false });
-        throw new TypeError('Failed to fetch (blocked by agent-browser-cli rule)');
+        throw new TypeError('Failed to fetch (blocked by atb rule)');
       }
 
       if (rule && isMock(rule)) {
-        const body = ruleBody(rule, '');
-        const response = new Response(body, {
-          status: rule.status || 200,
-          statusText: rule.statusText || 'OK',
-          headers: ruleHeaders(rule)
-        });
-        pushLog({
-          kind: 'fetch', url, method, mocked: true, status: rule.status || 200,
-          ok: true, elapsed_ms: Math.round(now() - started)
-        });
-        return response;
+        const mocked = buildMockResponse(rule, url, method, started);
+        // 构造失败（非法 status / 204 带 body）已记进日志，这里放行真实请求，
+        // 而不是把 TypeError 抛给页面。
+        if (mocked) return mocked;
       }
 
       // 改写请求：只在规则确实带 request* 字段时重建 init，避免影响正常调用。
@@ -417,47 +737,99 @@ function __abcNet(opts) {
           request_rewritten: rewritten || undefined
         };
         if (state.captureBodies) {
-          try {
-            const clone = response.clone();
-            const text = await clone.text();
-            entry.response_preview = text.slice(0, 2000);
-            entry.response_length = text.length;
-          } catch (_) {}
+          // 不 await：见 captureBody 的注释。流式响应直接跳过，避免挂死页面。
+          const skip = captureSkipReason(response);
+          if (skip) {
+            entry.body_capture_skipped = skip;
+          } else {
+            entry.body_capture_pending = true;
+            captureBody(response, entry);
+          }
         }
         pushLog(entry);
 
-        // 放行后改写响应：读取原响应体再构造一个新的 Response。
+        // 放行后改写响应。
         if (rule && rule.response) {
           const spec = rule.response;
-          let body = null;
-          try {
-            body = await response.clone().text();
-          } catch (_) {
-            body = null;
-          }
-          // 读不到原始响应体（body 已被消费 / 不透明响应）时，只有规则**显式**
-          // 给了 response.body 才能安全地构造新响应。否则 nextBody 会是一个空串，
-          // 页面拿到「200 + 空 body」，日志却写着改写成功——真实数据静默丢失。
-          // 宁可放行原响应，也不要造一个假响应。
-          if (body === null && spec.body === undefined) {
-            pushLog({
-              kind: 'fetch', url, method, response_modified: false,
-              response_rewrite_skipped: 'body_unreadable',
-              elapsed_ms: Math.round(now() - started)
-            });
-            return response;
-          }
-          const nextBody = spec.body !== undefined ? ruleBody({ body: spec.body }, '') : body;
+          const skip = captureSkipReason(response);
+          const status = spec.status || response.status;
+          const statusText = spec.statusText || response.statusText;
           const nextHeaders = Object.assign(
             toHeaders(response.headers),
             toHeaders(rule.headers),
             toHeaders(spec.headers)
           );
+          // 目标状态码是「无内容」时 body 必须置空：`new Response(stream, {status:204})`
+          // 会直接抛 TypeError，页面自己的 fetch 就变成 reject。
+          if (spec.body === undefined && NULL_BODY_STATUS.has(status)) {
+            const noContent = new Response(null, {
+              status: status,
+              statusText: statusText,
+              headers: nextHeaders
+            });
+            const lost = preserveMeta(noContent, response);
+            pushLog({
+              kind: 'fetch', url, method, response_modified: true, body_dropped: 'null_body_status',
+              status: noContent.status, ok: true, url_lost: lost.length ? lost : undefined
+            });
+            return noContent;
+          }
+          // 只改 status / headers：透传原始 body 流，不读、不缓冲。
+          // 流式响应也能走这条路 —— 见下面「拿不到流才退回缓冲」的分支。
+          if (spec.body === undefined && response.body) {
+            const passed = new Response(response.body, {
+              status: status,
+              statusText: statusText,
+              headers: nextHeaders
+            });
+            const lost = preserveMeta(passed, response);
+            pushLog({
+              kind: 'fetch', url, method, response_modified: true, body_stream_passthrough: true,
+              status: passed.status, ok: true, url_lost: lost.length ? lost : undefined
+            });
+            return passed;
+          }
+          // 拿不到 body 流（不透明响应 / 已被消费）且是流式或超大响应：不缓冲，
+          // 放行原响应并记下原因 —— 否则 SSE 上整段缓冲等于永不返回。
+          if (spec.body === undefined && skip) {
+            pushLog({
+              kind: 'fetch', url, method, response_modified: false,
+              response_rewrite_skipped: skip,
+              elapsed_ms: Math.round(now() - started)
+            });
+            return response;
+          }
+          let nextBody;
+          if (spec.body !== undefined) {
+            // 规则自带 body：原始响应体马上就要被丢弃，**绝不能**去读它。
+            // 以前这里无条件 `await response.clone().text()`，遇到 text/event-stream
+            // 这种永不结束的响应，页面自己的 fetch 会永久挂死。
+            // 顺手把原始流取消掉，别让连接一直占着。
+            try { if (response.body) response.body.cancel(); } catch (_) {}
+            nextBody = ruleBody({ body: spec.body }, '');
+          } else {
+            try {
+              nextBody = await response.clone().text();
+            } catch (_) {
+              nextBody = null;
+            }
+            // 读不到原始响应体（body 已被消费 / 不透明响应）且规则没显式给 body：
+            // 空串会让页面拿到「200 + 空 body」，日志却写着改写成功——真实数据静默丢失。
+            if (nextBody === null) {
+              pushLog({
+                kind: 'fetch', url, method, response_modified: false,
+                response_rewrite_skipped: 'body_unreadable',
+                elapsed_ms: Math.round(now() - started)
+              });
+              return response;
+            }
+          }
           const modified = new Response(nextBody, {
-            status: spec.status || response.status,
-            statusText: response.statusText,
+            status: status,
+            statusText: statusText,
             headers: nextHeaders
           });
+          preserveMeta(modified, response);
           pushLog({
             kind: 'fetch', url, method, response_modified: true,
             status: modified.status, ok: true
@@ -469,9 +841,10 @@ function __abcNet(opts) {
         pushLog({ kind: 'fetch', url, method, ok: false, error: e.message, elapsed_ms: Math.round(now() - started) });
         throw e;
       }
-    };
+    }, originals.fetch);
+    window.fetch = fetchWrapper;
 
-    XMLHttpRequest.prototype.open = function (method, url) {
+    XMLHttpRequest.prototype.open = disguise(function (method, url) {
       this.__abcNet = {
         method: String(method || 'GET').toUpperCase(),
         url: String(url || ''),
@@ -482,17 +855,33 @@ function __abcNet(opts) {
       // 复用同一个 xhr 时清掉上一次的改写状态，否则会拿旧响应体。
       this.__abcNetRespSpec = null;
       try { delete this.__abcNetRespBuilt; } catch (_) {}
+      // 同一个 XHR 反复 open/send 时，上一轮 send 里注册的 loadend 记账监听器
+      // 还挂在实例上 —— 每轮多一条日志、多一次 rewriteOf，长轮询页面上会线性膨胀
+      // 。这里按保存的引用精确摘掉自己注册的那一个，不用 removeAll 误伤页面。
+      if (this.__abcNetLoadend) {
+        try { this.removeEventListener('loadend', this.__abcNetLoadend); } catch (_) {}
+        this.__abcNetLoadend = null;
+      }
+      // mock / abort 会在实例上打一个 own 的 readyState=4（遮蔽原型的原生访问器）。
+      // 复用同一个 xhr 再发真实请求时必须删掉它，否则 readyState 永远读作 4，
+      // onreadystatechange / progress 全被遮蔽，等效挂死该请求。
+      // 只删**我们自己打的**那个（靠 __abcNetOwnReady 标记）：页面/测试桩如果本来
+      // 就有 own 的 readyState，不该被我们顺手删掉。
+      if (this.__abcNetOwnReady) {
+        try { delete this.readyState; } catch (_) {}
+        try { delete this.__abcNetOwnReady; } catch (_) {}
+      }
       return originals.xhrOpen.apply(this, arguments);
-    };
+    }, originals.xhrOpen);
 
-    XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
+    XMLHttpRequest.prototype.setRequestHeader = disguise(function (name, value) {
       if (!this.__abcNet) return originals.xhrSetHeader.apply(this, arguments);
       // 非 OPENED 状态保持原生行为（抛 InvalidStateError）。
       if (this.readyState !== 1) return originals.xhrSetHeader.apply(this, arguments);
       this.__abcNet.headerPairs.push([String(name), String(value)]);
-    };
+    }, originals.xhrSetHeader);
 
-    XMLHttpRequest.prototype.send = function (body) {
+    XMLHttpRequest.prototype.send = disguise(function (body) {
       const meta = this.__abcNet || { method: 'GET', url: '', headers: {} };
       meta.started = now();
       if (typeof body === 'string') meta.request_preview = body.slice(0, 1000);
@@ -502,7 +891,20 @@ function __abcNet(opts) {
       if (rule && rule.abort) {
         setTimeout(function () {
           try {
-            xhr.dispatchEvent(new Event('error'));
+            // 真实网络错误时浏览器会：readyState → 4、status → 0，并派发
+            // **ProgressEvent**（不是裸 Event）。以前只 dispatch 一个普通 error，
+            // readyState 停在 1，于是任何「在 onerror 里读 readyState/status」的库
+            // 与重试逻辑都会行为错乱。
+            fakeReadyState(xhr);
+            xhr.__abcNetRespSpec = {
+              mock: { text: '', status: 0, statusText: '', headers: null },
+              response: null
+            };
+            if (typeof ProgressEvent === 'function') {
+              xhr.dispatchEvent(new ProgressEvent('error'));
+            } else {
+              xhr.dispatchEvent(new Event('error'));
+            }
             xhr.dispatchEvent(new Event('loadend'));
           } catch (_) {}
         }, 0);
@@ -511,32 +913,35 @@ function __abcNet(opts) {
       }
 
       if (rule && isMock(rule)) {
-        const text = ruleBody(rule, '');
+        const status = rule.status === undefined ? 200 : Number(rule.status);
+        // 204/304 不能带 body；这里只是伪造文本，统一置空以免页面解析出脏数据。
+        const text = NULL_BODY_STATUS.has(status) ? '' : ruleBody(rule, '');
         // 只伪造 readyState，其余字段交给访问器守卫统一返回，
         // 这样 status / responseText / getResponseHeader 在任何时刻读都一致。
         xhr.__abcNetRespSpec = {
           mock: {
             text: text,
-            status: rule.status === undefined ? 200 : rule.status,
+            status: status,
             statusText: rule.statusText || 'OK',
             headers: ruleHeaders(rule)
           },
           response: null
         };
         setTimeout(function () {
-          try {
-            if (!Object.getOwnPropertyDescriptor(xhr, 'readyState')) {
-              Object.defineProperty(xhr, 'readyState', { value: 4, configurable: true });
-            }
-            if (typeof xhr.onreadystatechange === 'function') xhr.onreadystatechange();
-            xhr.dispatchEvent(new Event('readystatechange'));
-            xhr.dispatchEvent(new Event('load'));
-            xhr.dispatchEvent(new Event('loadend'));
-          } catch (_) {}
+          // 事件只派发一次：旧实现先手动 `xhr.onreadystatechange` 再
+          // `dispatchEvent(new Event('readystatechange'))`，凡是 onreadystatechange
+          // 与 addEventListener('readystatechange') 都注册的页面会收到两次回调
+          // （fetch 封装 / 重试队列里会重复解析、重复 push）。dispatchEvent 本身
+          // 就会同步调用 onreadystatechange 属性上的处理器，手动调用是多余的。
+          // 每一段各自兜住异常：onreadystatechange 里抛错不能把 load/loadend 吞掉。
+          try { fakeReadyState(xhr); } catch (_) {}
+          try { xhr.dispatchEvent(new Event('readystatechange')); } catch (_) {}
+          try { xhr.dispatchEvent(new Event('load')); } catch (_) {}
+          try { xhr.dispatchEvent(new Event('loadend')); } catch (_) {}
         }, 0);
         pushLog({
           kind: 'xhr', url: meta.url, method: meta.method, mocked: true,
-          status: rule.status === undefined ? 200 : rule.status, ok: true
+          status: status, ok: true
         });
         return;
       }
@@ -577,7 +982,8 @@ function __abcNet(opts) {
         };
       }
 
-      xhr.addEventListener('loadend', function () {
+      // 记账监听器要留引用：open 复用同一个 XHR 时要精确摘掉。
+      const onLoadend = function () {
         const computed = rule && rule.response ? rewriteOf(xhr) : null;
         const entry = {
           kind: 'xhr', url: meta.url, method: meta.method,
@@ -588,13 +994,20 @@ function __abcNet(opts) {
         };
         entry.ok = entry.status >= 200 && entry.status < 400;
         if (computed) {
-          entry.response_modified = computed.text !== null && !computed.unsupported;
+          // status / statusText / headers 被改也算「改写生效」，不能只看 text：
+          // 只改状态码的规则以前会记成 response_modified:false，日志与页面实际看到的不符。
+          entry.response_modified = !computed.unsupported && (
+            computed.text !== null || computed.status !== null ||
+            computed.statusText !== null || computed.headers !== null
+          );
           if (computed.unsupported) entry.response_rewrite_skipped = computed.unsupported;
         }
         pushLog(entry);
-      });
+      };
+      xhr.__abcNetLoadend = onLoadend;
+      xhr.addEventListener('loadend', onLoadend);
       return originals.xhrSend.call(this, nextBody);
-    };
+    }, originals.xhrSend);
 
     state.installed = true;
     return originals;
@@ -605,14 +1018,51 @@ function __abcNet(opts) {
     if (responseType === 'base64') {
       const buffer = await response.arrayBuffer();
       const bytes = new Uint8Array(buffer);
+      // E1-10：base64 相对原始字节的膨胀比是 4/3，要拿到 maxChars 个字符
+      // 只需要读约 0.75 * maxChars 字节；先截断再编码，避免把整页 base64 塞进内存。
+      const maxBytes = Math.max(1, Math.ceil(maxChars * 0.75));
+      const limit = Math.min(bytes.length, maxBytes);
+      // 分块 String.fromCharCode.apply：逐字节 `binary +=` 在大页面上是 O(n²) 字符串
+      // 拼接，会卡死页面（E1-10）。0x8000 一块也远低于各引擎的 apply 参数上限。
+      const CHUNK = 0x8000;
       let binary = '';
-      const limit = Math.min(bytes.length, maxChars);
-      for (let i = 0; i < limit; i += 1) binary += String.fromCharCode(bytes[i]);
+      for (let i = 0; i < limit; i += CHUNK) {
+        binary += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + CHUNK, limit)));
+      }
       return {
         body: btoa(binary),
         encoding: 'base64',
         truncated: bytes.length > limit,
         total_bytes: bytes.length,
+        content_type: contentType
+      };
+    }
+    // 文本分支：直接用 reader 流式读，累计到 maxChars 就 cancel，避免先
+    // `response.text()` 全量缓冲再 slice（E1-10）。没有 getReader 的老实现 /
+    // 测试桩（mock Response）退回原来的 text() 路径。
+    if (response.body && typeof response.body.getReader === 'function'
+        && typeof TextDecoder !== 'undefined') {
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder('utf-8');
+      let text = '';
+      let truncated = false;
+      try {
+        for (;;) {
+          const step = await reader.read();
+          if (step.done) break;
+          text += decoder.decode(step.value, { stream: true });
+          if (text.length >= maxChars) { truncated = true; break; }
+        }
+        if (!truncated) text += decoder.decode();
+      } finally {
+        if (truncated) { try { await reader.cancel(); } catch (_) {} }
+      }
+      return {
+        body: truncated ? text.slice(0, maxChars) : text,
+        encoding: 'text',
+        truncated,
+        // 提前 cancel 后拿不到真实总长：显式给 null，别把「已读长度」冒充总数。
+        total_chars: truncated ? null : text.length,
         content_type: contentType
       };
     }
@@ -647,9 +1097,19 @@ function __abcNet(opts) {
       }
     }
     const started = now();
+    // 用 hook **之前**的原始 fetch：`net fetch` 是诊断手段，用来验证「mock 是否生效」。
+    // 走被包装过的全局 fetch 会命中自己写的规则 → 拿到伪造响应还当是服务器返回，
+    // 而且每次诊断自己都进一条 log，形成自证循环。
+    const upstream = state.installed && state.originals
+      && typeof state.originals.fetch === 'function'
+      ? state.originals.fetch
+      : fetch;
+    const bypassedHooks = upstream !== fetch;
     let response;
     try {
-      response = await fetch(url, init);
+      // 不绑 this：原生 fetch 不依赖调用方，绑到 window 反而会在某些 vm/测试桩里
+      // 让 shim 的 this 变成空对象（mock 扩展自检就踩过）。
+      response = await upstream(url, init);
     } catch (e) {
       return {
         ok: false,
@@ -668,7 +1128,11 @@ function __abcNet(opts) {
       try { json = JSON.parse(payload.body); } catch (_) {}
     }
     return {
-      ok: response.ok,
+      // `ok` 表示「这次 fetch 动作执行成功」，不是 HTTP 状态：以前直接取
+      // `response.ok`，于是 404 会被 daemon 判成 "page script failed"，调用方
+      // 拿不到状态码、body 和 headers。HTTP 成败放在 http_ok 里。
+      ok: true,
+      http_ok: response.ok,
       url: response.url || url,
       method,
       status: response.status,
@@ -680,6 +1144,7 @@ function __abcNet(opts) {
       total_chars: payload.total_chars,
       total_bytes: payload.total_bytes,
       json,
+      bypassed_hooks: bypassedHooks || undefined,
       elapsed_ms: Math.round(now() - started)
     };
   }
@@ -687,11 +1152,29 @@ function __abcNet(opts) {
   if (action === 'fetch') return doFetch();
 
   if (action === 'hook' || action === 'install') {
-    state.captureBodies = opts.captureBodies === true;
-    if (opts.maxLog > 0) state.maxLog = Math.floor(opts.maxLog);
+    // 只有显式给出才覆盖。旧实现无条件 `= opts.captureBodies === true`，
+    // 于是第二次 `net hook --persist`（只想刷新 matches）会把已持久化的
+    // captureBodies 静默压回 false，用户看到的是「body 抓不到了」却找不到原因。
+    // daemon 侧已改成「None 不下发」，页面侧必须同样把「未传」当成「保持现状」。
+    if (opts.captureBodies !== undefined) {
+      state.captureBodies = opts.captureBodies === true;
+    }
+    // E1-11：maxLog 之前没有上限，`--max-log 100000000` 会把整个进程的内存吃光。
+    // 下限 10 保证还能看到最近的几条；上限 20000 条足够诊断，再大就该用 match 过滤。
+    if (opts.maxLog > 0) {
+      state.maxLog = Math.min(20000, Math.max(10, Math.floor(opts.maxLog)));
+      // 收紧上限时立刻裁剪：否则要等下一条日志进来才生效，刚 `--max-log 10`
+      // 就 `net log` 仍会看到旧的几千条。
+      if (state.log.length > state.maxLog) state.log.splice(0, state.log.length - state.maxLog);
+    }
     // 持久注入重放时会带上已有规则，避免刷新后规则丢失。
+    // 超过 50 条的部分会被截断，这里必须把条数回传给调用方：
+    // 以前静默 slice(0,50)，第 51 条刷新后就消失且毫无提示。
+    let routesDropped = 0;
     if (Array.isArray(opts.routes)) {
-      state.routes = opts.routes.filter((rule) => rule && typeof rule === 'object').slice(0, 50);
+      const accepted = opts.routes.filter((rule) => rule && typeof rule === 'object');
+      routesDropped = Math.max(0, accepted.length - 50);
+      state.routes = accepted.slice(0, 50);
     }
     install();
     return {
@@ -704,6 +1187,7 @@ function __abcNet(opts) {
       // 刷新后原样下发会被上面的 Array.isArray(opts.routes) 跳过，规则就静默丢了。
       routes: state.routes.length,
       count: state.routes.length,
+      routes_dropped: routesDropped || undefined,
       routes_list: state.routes
     };
   }
@@ -731,14 +1215,23 @@ function __abcNet(opts) {
     if (!rule.match && opts.url) rule.match = String(opts.url);
     if (!rule.match) return { ok: false, error: 'net route: 需要 match / url' };
     if (rule.method) rule.method = String(rule.method).toUpperCase();
-    state.routes = state.routes.filter(function (item) {
-      return item.match !== rule.match
-        || String(item.method || '*') !== String(rule.method || '*');
+    // 同 (match, method) 的规则**原位替换**，不能「先删再 push 到队尾」：
+    // matchRule 按数组顺序取第一个命中，队尾意味着它从「具体规则在前」变成
+    // 「排在更宽规则之后」—— 更新一条规则会静默改变生效顺序。
+    const existing = state.routes.findIndex(function (item) {
+      return own(item, 'match') && item.match === rule.match
+        && String(item.method || '*') === String(rule.method || '*');
     });
-    state.routes.push(rule);
+    let replaced = false;
+    if (existing >= 0) {
+      state.routes[existing] = rule;
+      replaced = true;
+    } else {
+      state.routes.push(rule);
+    }
     if (!state.installed) install();
     return {
-      ok: true, action: 'route', routes: state.routes.length,
+      ok: true, action: 'route', routes: state.routes.length, replaced: replaced,
       rule: rule, all: state.routes
     };
   }
@@ -782,8 +1275,39 @@ function __abcNet(opts) {
     state.log = [];
     state.installed = false;
     state.originals = null;
-    return { ok: true, action: 'reset', cleared_log: cleared };
+    // 状态槽位本身也是痕迹：不可枚举，但仍能被 getOwnPropertyNames 列出来，
+    // 所以 reset 要连它一起删掉（configurable:true 就是为了这一步）。
+    // 旧版本留下的 window.__abcNetState 也一并清掉。
+    try { delete window[stateKey]; } catch (_) {}
+    try { delete window[LEGACY_STATE_KEY]; } catch (_) {}
+    // 槽位删掉了，但闭包里的 state 对象先留着：reset 之后可能还有在飞的请求
+    // 会回调到 pushLog，直接置 null 会让页面里的请求抛 TypeError。
+    // stateKey 置 null 后，下一次进入 __abcNet 由 hydrate() 重建槽位。
+    stateKey = null;
+    return { ok: true, action: 'reset', cleared_log: cleared, cleared: true };
   }
 
   return { ok: false, error: 'net: 未知 action ' + action };
 }
+
+// 实现标记：MAIN world 里页面可以抢先把 window.__abcNet 定义成
+// 自己的函数，扩展侧的「已加载就跳过注入」探测就会通过 → 执行页面控制的实现。
+// 扩展现在每次都注入本文件，并校验这个不可枚举标记，抢不到就明确报错。
+// 不可枚举：不在 Object.keys(window) / for...in 里多留一条痕迹。
+try { Object.defineProperty(__abcNet, '__abcOwn', { value: true }); } catch (_) {}
+
+// 入口挂载（见文件头第 4 条）：可配置 —— scrub 的 delete 才能真的成功；
+// 不可枚举 —— 不出现在 Object.keys(window) / for...in 里。
+try {
+  Object.defineProperty(window, '__abcNet', {
+    value: __abcNet,
+    writable: true,
+    enumerable: false,
+    configurable: true
+  });
+} catch (_) {
+  // 页面上已有旧版本留下的不可配置绑定：属性描述改不动，但值是 writable 的，
+  // 赋值能把实现换成本版本（仍然是不可删，这一点只能等页面重载）。
+  try { window.__abcNet = __abcNet; } catch (_) {}
+}
+})();

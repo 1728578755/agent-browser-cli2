@@ -24,29 +24,28 @@ jobs:
           - name: darwin-arm64
             os: macos-14
             target: aarch64-apple-darwin
-            binary: agent-browser-cli
+            binary: atb
           - name: darwin-x64
             os: macos-15-intel
             target: x86_64-apple-darwin
-            binary: agent-browser-cli
+            binary: atb
           - name: linux-x64
             os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            binary: agent-browser-cli
+            binary: atb
           - name: linux-arm64
             os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
-            binary: agent-browser-cli
-          - name: windows-x64
+            binary: atb
+          - name: win32-x64
             os: windows-2022
             target: x86_64-pc-windows-msvc
-            binary: agent-browser-cli.exe
+            binary: atb.exe
           # win32-arm64（aarch64-pc-windows-msvc）故意不在这里：没有真实 ARM runner 持续验证的
           # 构建矩阵，不如不承诺——发布一个从未构建过的包会让用户装成功、运行时才炸。
-          # 该平台的用户走 npm/bin 里给出的"cargo build --release + AGENT_BROWSER_CLI_BIN"路径。
+          # 该平台的用户走 npm/bin 里给出的"cargo build --release + ATB_BIN"路径。
           # 若将来要补：这里加 aarch64-pc-windows-msvc、package.json 加 optionalDependencies、
-          # npm/bin 的 platformPackageName 加分支、scripts/sync-optional-deps.mjs 的 packages
-          # 数组加一项、mirror-sync 的 packages 数组加一项，五处必须一起改。
+          # npm/bin 的 platformPackageName 加分支、mirror-sync 的 packages 数组加一项，四处必须一起改。
 
     steps:
       - name: Checkout
@@ -70,6 +69,14 @@ jobs:
       - name: Build binary
         run: cargo build --release --target ${{ matrix.target }}
 
+      - name: Stage release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/bin-artifact
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" \
+             "dist/bin-artifact/${{ matrix.target }}-${{ matrix.binary }}"
+
       - name: Stage platform package
         run: node scripts/package-platform.mjs ${{ matrix.name }} target/${{ matrix.target }}/release/${{ matrix.binary }}
 
@@ -80,11 +87,13 @@ jobs:
           mkdir -p dist/npm
           npm pack "npm/platform/${{ matrix.name }}" --pack-destination dist/npm
 
+      # 没有配置 NPM_TOKEN 时跳过 npm 发布，但二进制与 Release 产物照常生成：
+      # 发布凭据缺失不应该连带阻断 GitHub Release。
       - name: Publish platform package
+        if: ${{ secrets.NPM_TOKEN != '' }}
         shell: bash
         working-directory: npm/platform/${{ matrix.name }}
         env:
-          # 首次发布必须用 token；包存在后可切换到 npm trusted publishing（OIDC）
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
@@ -107,8 +116,10 @@ jobs:
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         with:
-          name: agent-browser-cli-${{ matrix.name }}
-          path: target/${{ matrix.target }}/release/${{ matrix.binary }}
+          name: atb-${{ matrix.name }}
+          # 每个平台都把二进制重命名成 <target>-atb[.exe] 再上传：四个 artifact 内部同名
+          # `atb` 在 merge-multiple 后会互相覆盖，Release 里只剩两份文件，用户装到错的架构。
+          path: dist/bin-artifact/${{ matrix.target }}-${{ matrix.binary }}
 
       - name: Upload npm package artifact
         uses: actions/upload-artifact@v4
@@ -136,6 +147,7 @@ jobs:
         run: npm install -g npm@11.5.1
 
       - name: Publish main package
+        if: ${{ secrets.NPM_TOKEN != '' }}
         shell: bash
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -170,29 +182,9 @@ jobs:
         if: ${{ !contains(github.ref_name, '-extension') }}
         uses: actions/download-artifact@v4
         with:
-          pattern: agent-browser-cli-*
+          pattern: atb-*
           path: dist/bin
-
-      - name: Normalize binary names
-        if: ${{ !contains(github.ref_name, '-extension') }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p dist/release
-          # 每个 artifact 目录里都是同名 agent-browser-cli(.exe)，直接合并会互相覆盖。
-          # 这里按 artifact 名（即平台名）重命名，Release 才能区分架构。
-          for dir in dist/bin/agent-browser-cli-*; do
-            [ -d "$dir" ] || continue
-            name="$(basename "$dir")"
-            for file in "$dir"/*; do
-              base="$(basename "$file")"
-              case "$base" in
-                *.exe) cp "$file" "dist/release/${name}.exe" ;;
-                *) cp "$file" "dist/release/${name}" ;;
-              esac
-            done
-          done
-          ls -l dist/release
+          merge-multiple: true
 
       - name: Download npm package artifacts
         if: ${{ !contains(github.ref_name, '-extension') }}
@@ -209,7 +201,7 @@ jobs:
           mkdir -p dist
           rm -f dist/chrome-extensions.zip
           # 压缩包根目录直接放扩展文件，拖入浏览器扩展页即可安装。
-          (cd assets/tmwd_cdp_bridge && zip -r ../../dist/chrome-extensions.zip .)
+          (cd assets/atb_bridge && zip -r ../../dist/chrome-extensions.zip .)
 
       - name: Create release
         shell: bash
@@ -218,8 +210,8 @@ jobs:
         run: |
           set -euo pipefail
           release_assets=()
-          if [ -d dist/release ]; then
-            while IFS= read -r file; do release_assets+=("${file}"); done < <(find dist/release -type f | sort)
+          if [ -d dist/bin ]; then
+            while IFS= read -r file; do release_assets+=("${file}"); done < <(find dist/bin -type f | sort)
           fi
           if [ -d dist/npm ]; then
             while IFS= read -r file; do release_assets+=("${file}"); done < <(find dist/npm -type f -name '*.tgz' | sort)
@@ -284,7 +276,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # 淘宝镜像按包独立抓取上游，历史上出现过单个平台子包漏抓。
+          # 淘宝镜像按包独立抓取上游，历史上出现过单个平台子包漏抓（win32-x64@0.3.7）。
           # 主包 optionalDependencies 强制要求同一版本，子包缺失时 npm 会静默跳过该依赖，
           # 于是 Windows 用户安装"成功"、运行时才报 native binary not found。
           # 这里发布后对主包和 5 个平台子包逐个触发回源同步。
@@ -295,7 +287,7 @@ jobs:
             "${base}-darwin-x64"
             "${base}-linux-x64"
             "${base}-linux-arm64"
-            "${base}-windows-x64"
+            "${base}-win32-x64"
           )
           for pkg in "${packages[@]}"; do
             encoded="${pkg//\//%2F}"
@@ -329,7 +321,7 @@ jobs:
             "${base}-darwin-x64"
             "${base}-linux-x64"
             "${base}-linux-arm64"
-            "${base}-windows-x64"
+            "${base}-win32-x64"
           )
           summary='/tmp/mirror-sync.md'
           printf '| 包 | 结果 |\n|---|---|\n' > "${summary}"

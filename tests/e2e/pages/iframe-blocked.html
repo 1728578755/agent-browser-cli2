@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>ATB E2E Iframe Blocked</title>
+</head>
+<body>
+<h1>受限页面（iframe 内嵌其他扩展）</h1>
+<p>
+  本页把一个 <code>chrome-extension://&lt;32 位 id&gt;/…</code> 的 iframe 嵌进普通页面。
+  Chrome 不允许普通页面脚本（以及其它扩展）访问这个子框架，调试器 attach 也会报
+  “Cannot access a chrome-extension:// URL of different extension”，
+  用来复现 <code>page_protected</code> / 受限页面回退路径。
+</p>
+
+<!-- 32 位 a-p 的假扩展 ID：不会真的加载出内容，只要求 Chrome 拒绝跨扩展访问。 -->
+<iframe id="ext-frame"
+        src="chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/iframe/index.html"
+        width="320" height="120" title="fake extension frame"></iframe>
+
+<p id="note">页面自身仍然可读：这段文字必须能被 read / snapshot 拿到。</p>
+</body>
+</html>

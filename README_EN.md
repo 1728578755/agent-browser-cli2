@@ -1,423 +1,391 @@
 <div align="center">
 
-# agent-browser-cli2
+# atb
 
-A browser perception and control CLI for agents, turning a real Chrome session into reusable tab scanning, page JavaScript, Cookie, CDP, and screenshot capabilities.
+A browser CLI for agents: a Rust daemon plus a Chrome MV3 extension bridge that drives the user's logged-in Chrome / Edge.
 
-The repository and npm package are named `agent-browser-cli2`; the CLI command, binary, and Skill name remain `agent-browser-cli`, with an `agent-browser-cli2` alias installed as well.
-
-Browser perception · Page control · Chrome session reuse · CDP · Conditional wait · Agent Skill integration
+Tab scanning · Page reading · JS execution · Click and fill · Screenshots / PDF · Cookies · Network capture · CDP · Multi-agent isolation
 
 <p>
-  <a href="https://github.com/1728578755/agent-browser-cli2"><img src="https://img.shields.io/badge/CLI-agentbrowsercli2-2ea44f" alt="CLI agentbrowsercli2"></a>
-  <a href="https://github.com/1728578755/agent-browser-cli2/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-green" alt="License MIT"></a>
-  <a href="https://github.com/1728578755/agent-browser-cli2"><img src="https://img.shields.io/badge/sys-win%2Fmac%2Flinux-0078D6?labelColor=0078D6&color=C0C0C0" alt="sys win/mac/linux"></a>
-  <a href="https://github.com/1728578755/agent-browser-cli2/releases"><img src="https://img.shields.io/badge/release-v0.3.8-orange" alt="release v0.3.8"></a>
-  <a href="https://github.com/1728578755/agent-browser-cli2/pulls"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen" alt="PRs welcome"></a>
+  <a href="https://github.com/1728578755/atb-cli"><img src="https://img.shields.io/badge/CLI-atb-2ea44f" alt="CLI atb"></a>
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-green" alt="License MIT"></a>
+  <a href="https://github.com/1728578755/atb-cli"><img src="https://img.shields.io/badge/sys-win%2Fmac%2Flinux-0078D6?labelColor=0078D6&color=C0C0C0" alt="sys win/mac/linux"></a>
+  <a href="https://github.com/1728578755/atb-cli/releases"><img src="https://img.shields.io/badge/release-v0.7.1-orange" alt="release v0.7.1"></a>
+  <a href="https://github.com/1728578755/atb-cli/pulls"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen" alt="PRs welcome"></a>
 </p>
 
-[AI One-Line Install](#ai-one-line-install) · [Manual Installation](#manual-installation) · [Chrome Extension](#chrome-extension) · [Update](#update) · [Changelog](CHANGELOG.md) · [Uninstall](#uninstall) · [Friendly Links](#friendly-links)
+[Quick start](#quick-start) · [Install](#install) · [Capability map](#capability-map) · [Versions](#versions-and-compatibility) · [Security](#security-and-privacy) · [Docs](#documentation-map)
 
 [中文](README.md) | English
 
 </div>
 
-`agent-browser-cli` is a browser perception and control tool for agents. It connects to the user's real Chrome browser through a Chrome extension, preserving login state and cookies while providing tab scanning, page JavaScript execution, cookie reading, CDP control, screenshots, file uploads, dropdown clicks, and related capabilities.
+## What it is
 
-This project is not Selenium or Playwright. It is better suited for helping agents read pages accurately and perform actions inside an existing browser session.
+`atb` lets an agent use the browser you already have open: a long-running Rust daemon connects to the running Chrome / Edge through a Chrome extension, and each CLI call is a short-lived process that sends one command to the daemon.
 
-## Project Info
+Login state, cookies, installed extensions, and the current window stay as they are, because it is your window. One command can target several tabs at once; results come back in input order as JSON, and exit codes separate "the command is wrong" from "retry later", so scripts never parse error text.
 
-- Current version: `0.3.8`
-- Supported platforms: macOS (arm64 / x64), Linux (x64 / arm64), Windows (x64, including WSL)
-- No prebuilt package: Windows ARM64 (`win32-arm64`) requires `cargo build --release` and `AGENT_BROWSER_CLI_BIN` pointing at the produced binary
-- Browser: Chrome; Edge also works with its own extension install
-- Linux prerequisite: the local Chrome / Chromium build must support loading extensions
-- WSL prerequisite: use `WSL 2.0.0+`, and preferably enable `networkingMode=mirrored` on Windows `11 22H2+` so WSL can reach the host Chrome bridge service on `localhost`
+The daemon stays resident; it exits after 300 idle seconds by default, but never while an extension is still connected, so consecutive operations do not handshake again for every command.
 
-## Acknowledgements
+**What it is not**: not Selenium / Playwright (it never launches a throwaway automation profile and does not own the browser by default; only an explicit `atb launch --restart` restarts it); not a cloud browser (traffic between the CLI, daemon and extension stays on `127.0.0.1`; the pages you drive still talk to their own sites); not a stealth browser (it only reduces this tool's own traces and does not patch fingerprints).
 
-This project continues from the 0.3.7 codebase of [sleepinginsummer/agent-browser-cli](https://github.com/sleepinginsummer/agent-browser-cli), which in turn derives from the Web toolchain in [GenericAgent](https://github.com/lsdefine/GenericAgent), including ideas and implementation around `TMWebDriver`, `simphtml`, and the `tmwd_cdp_bridge` extension.
-
-This project is an **unofficial derivative work** and is not affiliated with or endorsed by either upstream project. Thanks to both projects for the browser bridge, page simplification, CDP control, and practical SOPs; changes on top of 0.3.7 are listed under v0.3.8 in [CHANGELOG.md](./CHANGELOG.md).
-
-See [SOURCES.md](./SOURCES.md) for the full derivation chain, secondary-development scope, specification references, and dependency licenses. The upstream MIT copyright notices and license text are reproduced in [NOTICE](./NOTICE).
-
-## AI One-Line Install
-
-```text
-Please read https://github.com/1728578755/agent-browser-cli2/blob/main/AI_INSTALL.md, follow the instructions to install the CLI, load the Chrome extension, and add `skills/agent-browser-cli/SKILL.md`.
-```
-
-## Improvements over GenericAgent (0.3.7 baseline)
-
-The items below are changes in the 0.3.7 baseline relative to GenericAgent; this repository's changes on top of 0.3.7 are listed in CHANGELOG.
-
-- Extracted browser control capability from GenericAgent and exposed it as a CLI for Codex, Claude Code, and OpenCode. The GenericAgent browser extension can be reused and does not need to be reinstalled.
-- Avoids reinitializing the browser connection for every command.
-- Adds a startup lock to avoid repeated low-level port binding when multiple CLI commands start concurrently.
-- Adds the skill `skills/agent-browser-cli/SKILL.md` for AI usage reference.
-- Includes several optimizations to reduce command execution time.
-- Optimizes the CDP debugger attach/detach flow to reduce page flicker and stale attach state after abnormal exits.
-- Rust implementation for the CLI side.
-
-## What It Can Do
-
-1. Automated testing
-   It can reuse a real browser environment for page-flow validation, form submission, button clicks, navigation checks, and login-state page testing.
-2. Frontend page debugging
-   It can read the DOM, execute JS, inspect page state, and capture screenshots to help locate frontend interaction, rendering, and data issues, including backend API integration problems.
-3. Page style debugging
-   It can execute JS on real pages to modify DOM / CSS and temporarily validate styles, layout, and interaction effects. It is more of a debugging assistant than a complete design tool.
-4. Web data extraction
-   It can read page content, tables, lists, cookies, and API-related state, making it suitable for extracting data from pages that require login state.
-5. Browser operation scripting
-   It can chain operations such as opening pages, switching tabs, executing JS, taking screenshots, and uploading files into scripts for repetitive web tasks.
-6. Agent-assisted web admin operation
-   It is suitable for letting AI Agents operate existing web tools such as admin consoles, configuration pages, low-code platforms, and form systems.
-7. Page structure analysis
-   It can simplify HTML and identify main content areas and list structures, helping Agents understand complex pages faster.
-8. Security research and reverse-engineering assistance
-   It can observe page behavior in a real browser session, execute debugging scripts, and read frontend state to assist analysis of frontend logic and API calls.
-
-## Its Capabilities
-
-1. Scan current Chrome tabs and get page titles, URLs, and tab IDs.
-2. Switch to a specified tab and reuse existing pages and login state.
-3. Open new tabs and directly visit target URLs.
-4. Execute JavaScript in pages and read DOM, forms, state, and page data.
-5. Read cookies from the current page for login-state related tasks.
-6. Call Chrome CDP capabilities for lower-level page control.
-7. Capture page screenshots for visual inspection and page confirmation.
-8. Upload local files to web file picker inputs.
-9. Operate common page elements such as dropdowns, buttons, and forms.
-10. Background execution: `open --background` creates a tab without stealing focus; long-running work can be submitted with `--async` and collected through the `job` commands so it never blocks the caller.
-
-## Background and Async
-
-`open` is foreground by default (it switches to the new tab). With `--background` the tab is created without switching or stealing focus, and it still becomes the default target for subsequent commands.
+## Quick start
 
 ```bash
-agent-browser-cli open https://example.com              # foreground
-agent-browser-cli open https://example.com --background # background
-agent-browser-cli exec 'return location.href'            # acts on the new tab directly
-agent-browser-cli --async scan --text-only              # submit to the queue, get a job_id back
-agent-browser-cli job wait <jobId> --timeout 300        # collect the result when you need it
-agent-browser-cli run steps.json                        # run several steps in one process
+# 1. Install the CLI — Node >= 18
+npm i -g @g1728578755/atb
+
+# 2. Load the extension: chrome://extensions → Developer mode → Load unpacked
+#    pick the directory where chrome-extensions.zip was extracted (manifest.json sits directly inside);
+#    the repo and npm package also ship the same directory as assets/atb_bridge
+
+# 3. Open a page: a target command starts the daemon automatically
+atb open https://example.com
+
+# 4. Confirm the extension bridge
+atb tabs --ids
+
+# 5. Read the current page, or run JS in it
+atb read --tab current --max-chars 4000
+atb exec 'return document.title'
+
+# For a full health check (status does not start the daemon; run the commands above first)
+atb status
 ```
 
-For details and limitations, see [docs/ASYNC_BACKGROUND.md](./docs/ASYNC_BACKGROUND.md); for what is implemented, what comes next, and the boundary/perf data, see [docs/FEATURE_STATUS.md](./docs/FEATURE_STATUS.md).
+No browser restart is needed after loading the extension. When a command returns `ok:false`, read `error_code` and `hint` (some timeout cases only carry `error` / `reason`); `atb schema --json` gives an agent the arguments of top-level commands.
 
-When the extension changes, reload the unpacked directory once in `chrome://extensions`. After that (since 2.3) the extension watches the content hash of `background.js` and reloads itself while idle, so you do not have to click reload repeatedly. If you are unsure whether the browser is running the current extension, run `agent-browser-cli status`: `extension.stale: true` or a `warning` means it has not been reloaded yet.
+## How it differs from Selenium / Playwright
 
-## Layout
+| Dimension | atb | Selenium / Playwright |
+| --- | --- | --- |
+| Session source | Reuses the user's logged-in Chrome / Edge | Starts a fresh profile with no login state |
+| Concurrency | One command over many tabs | You write the concurrency and pooling yourself |
+| Output | Compact JSON plus structured error_code / exit codes | Native objects and exceptions |
+| Detection surface | Read / exec / wait do not attach; snapshot, plain-CSS click/fill, screenshots and PDF try to attach, with automatic fallback when refused (see below) | Automation markers and a debugger by default |
+| Best fit | An agent driving the user's own browser | End-to-end suites built from scratch |
 
-```text
-.
-├── Cargo.toml                    # Rust project config
-├── src/                          # Rust CLI / daemon / bridge
-├── assets/tmwd_cdp_bridge/       # Chrome MV3 extension
-├── assets/page_*.js              # Master copies of the page scripts
-├── assets/simphtml_opt.js        # Page simplification script
-├── scripts/                      # Build/sync helpers (sync-extension-assets.mjs, ...)
-├── npm/                          # npm launcher scripts
-├── skills/agent-browser-cli/     # Agent Skill
-├── tests/                        # Node-side tests, mock extension, manual acceptance scripts
-├── docs/                         # Behaviour notes and capability status
-└── .github/workflows/            # CI and release pipelines
-```
+It does not replace a test framework: for isolated environments and hundreds of parallel cases, Playwright is the better tool.
 
-`assets/page_*.js` is copied byte-for-byte into `assets/tmwd_cdp_bridge/ops/` by `npm run sync:extension`: the first copy is bundled into the daemon for the eval path, the second is injected by the extension on strict-CSP pages. **Edit only the `assets/` copy**, then run the sync script. `npm run check:extension` compares without writing (CI runs it as a consistency guard) and `prepack` syncs automatically.
+## Capability map
 
-## Manual Installation
+| Domain | Representative command | What it does |
+| --- | --- | --- |
+| Page reading | `atb read` | Main content, links, hidden nodes, iframes, truncated by a character budget |
+| Page actions | `atb snapshot` | Emits `@e1` handles used by click, fill, select, upload and scroll |
+| Scripts and batches | `atb exec` / `atb scrape` | Run JS, multi-step scripts, cross-tab scraping, async jobs |
+| Network and debugging | `atb net` / `atb console` / `atb downloads` | Capture requests, mock responses, console, download watching |
+| Challenges and traces | `atb challenge` / `atb stealth` | Challenge detection and active solving; trace audit and scrubbing |
+| Multi-browser and ops | `atb browsers` / `atb doctor` / `atb logs` | Multi-browser / Profile selection, diagnostics, logs |
+
+## Install
 
 ### npm
 
 ```bash
-npm install -g agent-browser-cli2
-agent-browser-cli tabs
+npm i -g @g1728578755/atb
+atb status
 ```
 
-> The primary command remains `agent-browser-cli` for compatibility with existing scripts and the Skill; an `agent-browser-cli2` alias is installed as well. The source-built binary is also named `agent-browser-cli`.
+Prebuilt binaries come from `optionalDependencies` per platform, so no Rust toolchain is required. The npm package exposes a single command name, `atb`. If the version is not on the registry yet, use the Release artifacts or build from source below.
 
-### Build From Source
+### Build from source
 
 ```bash
 cargo build --release
-./target/release/agent-browser-cli tabs
+./target/release/atb status
 ```
 
+Point `ATB_BIN` at the built binary to avoid mixing it with a global install.
 
-## Chrome Extension
+### Load the extension
 
-1. Recommended: download `chrome-extensions.zip` from the [latest Release](https://github.com/1728578755/agent-browser-cli2/releases/latest), extract it, open `chrome://extensions` in Chrome, enable `Developer mode`, click `Load unpacked`, and select the extracted `tmwd_cdp_bridge` directory.
+1. Download `chrome-extensions.zip` from the [latest Release](https://github.com/1728578755/atb-cli/releases/latest) and extract it into a fixed directory (the zip root is the extension itself, with `manifest.json` directly inside), or use `assets/atb_bridge` from the repo.
+2. Open `chrome://extensions` (Edge: `edge://extensions`), enable developer mode, click "Load unpacked", and select the directory that directly contains `manifest.json`.
+3. Keep at least one normal web page tab open — not only `about:blank` or `chrome://` pages.
+4. **This release requires extension 5.2.9.** After you replace the extension directory the daemon asks the extension to reload on the next handshake; if the daemon is not running, click "Reload" on the extension page yourself — copying files without reloading keeps the old code running in pages.
 
-2. When building from local source, you can also load this extension directory directly:
-
-```text
-assets/tmwd_cdp_bridge
-```
-
-3. Chrome needs at least one normal web page tab open. Do not leave it only on `about:blank` or `chrome://` pages.
-4. After the extension is connected, a Chrome extension tip badge appears on the right side of the page. The badge position is draggable and expands on hover. It auto-hides after 10 seconds without commands, and you can also click `Hide for this session` to hide it manually. Manual hiding lasts for the current service connection cycle and resets after the service disconnects after about 300 seconds and reconnects.
-5. By default the daemon only checks that the WebSocket handshake comes from *some* Chrome extension, i.e. "install the extension and it works". To harden it, use `agent-browser-cli trust-extension <extensionId>` to allow-list extension IDs and/or `--token <value>` to require a handshake token; when both are set, both must match. `--clear` returns to compatibility mode. See [SKILL.md](./skills/agent-browser-cli/SKILL.md#加固-websocket-身份可选).
-
-### Custom Chrome Extension WebSocket Port
-
-- `18765`: default extension WebSocket port, used by the Chrome extension. It can be changed with `agent-browser-cli set-extension-port <port>`.
-- `18767`: CLI HTTP API port, used by the CLI to reuse the session. It cannot be used as the extension port.
-
-Change the extension port from CLI:
+### Verify
 
 ```bash
-agent-browser-cli set-extension-port 18766
+atb tabs --ids           # run this first: starts the daemon and proves the bridge works
+atb status               # then check health; running status first reports daemon_not_running
+atb doctor               # use it when nothing connects: ports, token, daemon state
 ```
 
-This command writes the config file. If the daemon is running, it restarts the daemon so the new port takes effect immediately.
+### Platform matrix
 
-You can also edit the config file manually. The config file is `~/.agent-browser-cli/config.json`. It is created automatically when missing:
+| Platform | Prebuilt | Notes |
+| --- | --- | --- |
+| macOS arm64 / x64 | Yes | — |
+| Linux glibc x64 / arm64 | Yes | The local Chrome / Chromium must allow loading extensions; WSL 2 also uses this package |
+| Windows x64 | Yes | Native Windows; do not use the win32 package inside WSL |
+| Windows ARM64 | No | `cargo build --release`, then point `ATB_BIN` at the binary |
+| Alpine / musl | No | Same as above, build it yourself |
 
-```json
-{
-  "extension_port": 18765
-}
-```
+WSL needs `WSL 2.0.0+`; on Windows 11 22H2+ set `networkingMode=mirrored` in `.wslconfig` so WSL can reach the bridge service on the host `localhost`.
 
-Manual edit example:
+## Core concepts
 
-```json
-{
-  "extension_port": 18766
-}
-```
+### Daemon
 
-After manually editing the config file, run `agent-browser-cli restart` so the daemon listens on the new port.
+When the `atb` binary finds no daemon it starts a resident process that listens on `127.0.0.1:18767` and serves the HTTP API; later commands reuse that session. It exits after 300 idle seconds only when no extension is connected; while an extension stays connected it keeps running, with a 60-second reconnect grace after a disconnect. `ATB_IDLE_TTL` changes the idle value. Logs go to `~/.atb/logs/daemon.log`.
 
-The Chrome extension popup can also update the extension port and reconnect immediately. The popup port must match the CLI `extension_port` config.
+### Extension bridge
 
-### Profile Label
+The extension opens a WebSocket to `127.0.0.1:18765`, using `extension_port` from `~/.atb/config.json`. The daemon sends commands, the extension runs them in the tab and returns JSON. Reloading the extension or restarting the browser invalidates every tab id under that browser and yields `session_gone`: `open` again, or run `tabs` for a fresh list.
 
-When multiple Chrome Profiles or browser instances are connected, `profile_id` and `browser_id` are long. You can set a short label for each Chrome Profile and then use `--profile <label>`.
+### Agent identity
+
+Resolution order: `--agent` → `ATB_AGENT` → terminal session id (`WT_SESSION` / `TMUX_PANE` / `VSCODE_IPC_HOOK_CLI`, …) → `default`. `open` only moves the caller's own default target and `cleanup` only closes tabs this agent opened, so several agents can share one daemon without fighting over a page.
+
+### Target selection
+
+`--tab` accepts a single id, `111,222`, `all`, `@1` / `@1-5`, `url:<substring>`, `title:<substring>`, `group:<title>`, `window:<id>`, and `current`. Multi-target runs execute concurrently, return in input order, and one failure does not affect the others; when writing files `--out` must contain `{tab}` or `{index}` or preflight rejects the command.
+
+### Protocols
+
+Three versions must line up: the CLI ↔ daemon API protocol (currently **5**), the extension message protocol (currently **4**), and the extension file version (currently **5.2.9**). The `compatibility` field of `atb status` reports expected and actual values, with `fixes[]` when they disagree.
+
+## Common workflows
+
+### Read a page
 
 ```bash
-agent-browser-cli lookup tab <tabId>
-agent-browser-cli lookup browser <browser_id>
-agent-browser-cli profile-label set work --profile <profile_id>
-agent-browser-cli tabs --profile work
+atb tabs --ids
+atb read --tab <tabId> --max-chars 8000
+atb read --include-hidden          # include display:none content
+atb scan --fast                    # compact text only, fast on large pages
 ```
 
-You can also set Profile Label from the extension popup in the corresponding Chrome Profile. The label is only an alias; internal routing still uses `browser_id:profile_id:tab_id`. If a label matches multiple profiles in the current daemon, the CLI reports ambiguity. Prefer setting labels via CLI because it checks uniqueness across currently connected profiles; the popup is a local convenience entry and cannot guarantee cross-profile uniqueness. `tabtree` truncates URLs and omits `session_key` by default to save tokens; pass `--full` for the complete fields.
-
-### Dialog Suppression
-
-The extension no longer rewrites page `alert` / `confirm` / `prompt` globally. Native dialogs are suppressed only while a CLI page script command is running, then restored after the command finishes, so long-lived pages keep their original global functions.
-
-## Quick Check
+### Fill a form and submit
 
 ```bash
-agent-browser-cli tabs
-agent-browser-cli open https://www.baidu.com
+atb snapshot --limit 200           # produces @e1 / @e2 handles
+atb fill @e2 'Jane Doe' --dry-run  # validate arguments and target first
+atb fill @e2 'Jane Doe'
+atb click @e1
+atb wait --selector '.result' --timeout 10
 ```
 
-On success `tabs` returns (while `open` returns `opened_tab_id` / `opened_session_key` / `ready`):
+`snapshot` by default, and `click` / `fill` with plain CSS selectors, attach the debugger; `snapshot --js` plus `@e` handles use the in-page path and avoid the debug banner.
 
-```json
-{
-  "ok": true,
-  "result": {
-    "status": "success",
-    "metadata": {
-      "tabs_count": 1
-    }
-  }
-}
-```
-
-## Common Commands
-
-The README only keeps the quick entry point. For the full command list and browser operation SOP, see [skills/agent-browser-cli/SKILL.md](./skills/agent-browser-cli/SKILL.md).
+### Batch scraping
 
 ```bash
-agent-browser-cli tabs
-agent-browser-cli scan
-agent-browser-cli exec 'document.title'
-agent-browser-cli snapshot
-agent-browser-cli click @e1
-agent-browser-cli fill @e2 'text'
-agent-browser-cli send-keys Enter --target @e2
-agent-browser-cli mouse-click @e1
-agent-browser-cli screenshot --full-page
-agent-browser-cli save-pdf
-agent-browser-cli network start
-agent-browser-cli network list
-agent-browser-cli console start
-agent-browser-cli console list
-agent-browser-cli cookies
-agent-browser-cli upload 'input[type=file]' ./a.pdf
-agent-browser-cli run steps.json
-agent-browser-cli batch steps.json --concurrency 8   # concurrent batch (across tabs)
-agent-browser-cli read --max-chars 8000 --links      # structured page read
-agent-browser-cli find 'a[href]' --limit 20           # find elements
-agent-browser-cli find --text '登录'                   # find by visible text
-agent-browser-cli hover '#menu'
-agent-browser-cli select '#city' --value sh
-agent-browser-cli check 'input[name=agree]'
-agent-browser-cli scroll --to bottom
-agent-browser-cli wait --selector '.result' --timeout 10
-agent-browser-cli back
-agent-browser-cli reload
-agent-browser-cli frames                              # list iframes
-agent-browser-cli exec --frame <frameId> '...'        # execute inside an iframe
-agent-browser-cli inject 'window.__x = 1'             # one-shot injection
-agent-browser-cli inject --persist hook --match '*://*.example.com/*' '...'
-agent-browser-cli inject --list
-agent-browser-cli inject --remove hook
-
-# Reading: hidden content / large pages / iframes
-agent-browser-cli read --include-hidden                  # include display:none content
-agent-browser-cli read --max-nodes 20000 --budget-ms 800 # rate-limit huge pages
-agent-browser-cli scan --fast                            # compact text only, still fast on 100k-node pages
-agent-browser-cli read --frame <frameId>                 # read content inside an iframe
-
-# Page network: send requests / record / mock
-agent-browser-cli net fetch https://api.example.com/me -H 'Accept: application/json'
-agent-browser-cli net hook --capture-bodies
-agent-browser-cli net hook --persist                      # survives reloads
-agent-browser-cli net mock /api/user --request-header 'x-token: t' --response-status 201
-agent-browser-cli net log --limit 20
-agent-browser-cli net mock /api/user --status 200 --body '{"id":1,"name":"mock"}'
-agent-browser-cli net routes
-agent-browser-cli net unroute /api/user                      # remove page rules
-agent-browser-cli net unroute /api/user --engine cdp          # remove CDP rules
-agent-browser-cli net reset
-
-# CAPTCHA / CF challenge: detect, wait, hand over (no automated bypass)
-agent-browser-cli challenge status
-agent-browser-cli challenge solve                             # waits up to 120s by default
-agent-browser-cli challenge wait                              # waits up to 30s by default
-agent-browser-cli challenge focus
-
-# Download watching
-agent-browser-cli downloads --limit 10
-agent-browser-cli download https://example.com/report.pdf --filename report.pdf
-agent-browser-cli download-wait --id 7 --timeout 120
-
-# Multi-browser orchestration (one extension install per Chrome / Edge)
-agent-browser-cli browsers
-agent-browser-cli broadcast exec --script 'return location.href'
-agent-browser-cli broadcast read --args '{"max_chars":2000}' --browser chrome --browser edge
-agent-browser-cli open https://a.com https://b.com https://c.com --background  # open several tabs concurrently
-agent-browser-cli tabs --full
-agent-browser-cli open https://example.com --window --focus
-agent-browser-cli open https://example.com --group-title demo
-agent-browser-cli close --tab <tabId>
-agent-browser-cli --async exec 'return document.title'
-agent-browser-cli job list
-agent-browser-cli job wait <jobId>
-agent-browser-cli tabtree
-agent-browser-cli tabtree --full
-agent-browser-cli tabtree --profile <profile_label>
-agent-browser-cli tabtree --tab <tabId>
-agent-browser-cli lookup tab <tabId>
-agent-browser-cli lookup browser <browser_id>
-agent-browser-cli profile-label set work --profile <profile_id>
-agent-browser-cli profile-label clear --profile <profile_id>
-agent-browser-cli status
-agent-browser-cli doctor
-agent-browser-cli logs --tail 100
-agent-browser-cli install-skill --dry-run
-
-# Optional WebSocket identity hardening (off by default)
-agent-browser-cli trust-extension <extensionId>   # only allowed extension IDs may connect
-agent-browser-cli trust-extension --token <value> # the handshake must carry ?token=<value>
-agent-browser-cli trust-extension --list
+atb scrape --urls urls.txt --out out.jsonl
+atb scrape --urls urls.txt --js-file grab.js --out out.jsonl --batch 6 --concurrency 6 --retry 2
 ```
 
-> **This hardening is one-way — do not treat it as a security boundary.** `trust-extension` controls *who may connect to the daemon*; the reverse direction is not checked — **the extension never verifies that the daemon it talks to is genuine**.
->
-> The daemon exits after 5 idle minutes, freeing port 18765. During that window any local process can bind the port; the extension will reconnect on its own schedule and still execute whatever commands that process sends (including reading cookies for any site and calling arbitrary CDP methods). In other words: **a token protects your daemon from other extensions, not your extension from other processes.**
->
-> Practical impact: this amplifies local privilege escalation / lateral movement, and requires an attacker who can already execute code on the machine. Run sensitive work while you are present, and `agent-browser-cli stop` when you are done to shorten the window.
+`--urls` takes a file (one per line) or a comma-separated list; the default script collects `{title, url, text}`. Everything is orchestrated CLI-side on top of the daemon's open / exec / close.
 
-## Exit Codes
-
-When a command returns `ok:false`, the exit code is non-zero, so scripts and agents can rely on `$?` / `&&` instead of parsing JSON.
-
-```text
-0    success
-1    business failure (ok:false); includes challenge wait/solve timeouts and page script errors under exec --monitor
-3    wait timeout: job wait timed out, download-wait timed out
-130  cancelled: job wait observed a cancelled job
-```
-
-`status` follows `healthy` — a stopped daemon, a port mismatch, a disconnected extension, or no usable page all produce `ok:false` plus a non-zero exit code. Set `AGENT_BROWSER_CLI_EXIT0` (any value, including `0`) to restore the old always-zero behaviour; do not set it unless something depends on it.
-
-The daemon exits after 5 idle minutes by default; override this with `AGENT_BROWSER_CLI_IDLE_TTL` (seconds). A shorter window reduces the chance of another local process grabbing the port.
-
-## Update
-
-For the full version history, see [CHANGELOG.md](./CHANGELOG.md).
-
-AI one-line update:
-
-```text
-Please read https://github.com/1728578755/agent-browser-cli2/blob/main/AI_INSTALL.md, follow the instructions to update the CLI, download the extension zip again to the user-specified location, ask the user to manually load the Chrome extension, and update the related SKILL.md.
-```
-
-If the Chrome extension has updates, download the zip again, overwrite the existing files, and reload the `Agent Browser CLI Bridge` extension in `chrome://extensions`.
-
-### Upgrading from an earlier version
-
-- **`change.top_change` is gone**: `--monitor` now returns `change = {changed, added, removed, attributes, text, samples}` only. Switch to `changed` / `samples`; failed observation adds `monitor.reason` (`navigated` / `superseded` / `unsupported`).
-- **`status` changed its exit code**: `ok` follows `healthy`, so an unhealthy daemon no longer exits 0. Scripts that gate on `status && ...` should either read `summary` or set `AGENT_BROWSER_CLI_EXIT0=1` temporarily.
-- **Failures no longer pretend to succeed**: page script errors under `exec --monitor`, `job wait` on `failed` / `cancelled`, `download-wait` timeouts, and `challenge wait/solve` timeouts all return non-zero.
-- **`trust-extension` is optional**: leaving it unconfigured keeps the "install and go" behaviour. Configure it when several extensions or several people share one machine. Note it only constrains *who may connect to the daemon*, not *who the extension connects to* — see the hardening note above.
-- **Keep the extension assets in sync**: `assets/page_*.js` and `assets/tmwd_cdp_bridge/ops/` are two copies of the same scripts; when building from source run `npm run sync:extension` first, otherwise strict-CSP pages keep running the old code.
-
-## Uninstall
-
-Stop the long-lived service first:
+### Multiple tabs
 
 ```bash
-agent-browser-cli stop
+atb open https://a.com https://b.com --background
+atb read --tab all --max-chars 2000
+atb exec --tab @1-3 'return location.href'
+atb screenshot --tab all --out 'shots/{index}-{tab}.png'
 ```
 
-Then clean up as needed:
+#### When the page blocks debugger injection (automatic fallback)
+
+Chrome refuses `chrome.debugger.attach` on pages that embed an iframe from another extension
+(common with assistant/translator extensions). These commands now degrade instead of failing:
+
+| Command | Fallback channel | Marker in the response |
+| --- | --- | --- |
+| `screenshot` | visible area via `chrome.tabs.captureVisibleTab` (no debugger) | `via:"captureVisibleTab"` |
+| `screenshot --full-page` | scroll slice by slice, stitch with OffscreenCanvas | `via:"captureFullPageStitched"`, `stitched:true`, `slices`, `truncated` |
+| `save-pdf` | stitched long image wrapped into a single-page PDF (text not selectable) | `via:"stitched-image-pdf"`, `text_selectable:false` |
+| `mouse-click` | synthetic mouse events dispatched in the page | `synthetic:true`, `trusted:false` |
+
+`--max-height` caps the stitched image height (device pixels, default 20000); overflow is truncated
+and reported as `truncated:true`. Inherent limits of stitching: `position:fixed/sticky` elements repeat
+on every slice, and the PDF is image-only. Disable the offending extension temporarily if you need
+trusted input events or a searchable PDF.
+
+### Multiple agents
 
 ```bash
-npm uninstall -g agent-browser-cli2
-rm -rf ~/.agent-browser-cli
-rm -rf ~/.agents/skills/agent-browser-cli
+atb --agent reviewer open https://a.com
+ATB_AGENT=reviewer atb read
+atb cleanup --dry-run      # preview what would be closed
+atb cleanup                # close only tabs this agent opened
 ```
 
-`~/.agent-browser-cli/` holds `config.json`, `api-token`, `ws-trust.json`, `net-hooks.json`, `daemon.lock`, and logs — that is the local token and network-rule state. Check that nothing in there needs to be kept before deleting it.
+### Challenge pages
 
-Finally, remove the `Agent Browser CLI Bridge` extension from Chrome's extension management page, or remove the loaded `assets/tmwd_cdp_bridge` extension configuration.
+```bash
+atb open https://example.com                 # --challenge auto by default: solve actively, then wait
+atb challenge status                         # challenge state, widget position, solve verdict
+atb challenge solve --timeout 120            # run the active solver again manually
+atb challenge widget                         # solver failed: get widget coordinates
+atb challenge click --at 320,410             # the agent clicks it itself, no human needed
+atb challenge focus                          # only for image/SMS checks that need a human
+```
 
-## Privacy and Data
+`open` and `challenge solve` do not just wait: they locate the widget, click it with trusted mouse events that include a movement path, then wait for the token or navigation. If the solver fails, the agent can fall back to `widget` + `click --at`; `challenge wait` is the passive path and `focus` is the last resort for a human. Passing is not guaranteed, and this does not bypass access control. Details in [docs/ANTI_DETECTION_AND_CHALLENGE.md](./docs/ANTI_DETECTION_AND_CHALLENGE.md).
 
-Everything runs on your machine: the CLI and the daemon talk over `127.0.0.1`, and the extension only connects to a local port. Page content, cookies, and screenshots are never uploaded.
+## Command reference
 
-The data boundaries worth knowing:
+```bash
+# Reading
+atb tabs --ids                            # compact list for target picking
+atb read --max-chars 8000 --links
+atb snapshot --limit 200                  # element handles @e1 / @e2
+atb find --text 'Sign in' --limit 5
 
-- **Cookies and page content**: commands such as `cookies`, `read`, and `exec` return their results to the caller, which usually means the agent's conversation context, and may then be sent to the corresponding model provider. Judge for yourself on sensitive sites.
-- **Network interception**: `net hook --capture-bodies` records request/response bodies and `net mock` rewrites responses; everything stays local and `net reset` clears it.
-- **Local files**: config, tokens, persisted network rules, and logs live in `~/.agent-browser-cli/`; logs may contain URLs and error messages.
-- **Extension permissions**: see [PRIVACY.md](./PRIVACY.md) for the purpose of permissions such as `cookies`, `debugger`, and `downloads`.
+# Actions
+atb open https://example.com --background
+atb click @e1
+atb fill @e2 'text'
+atb select '#city' --value sh
+atb upload 'input[type=file]' ./a.pdf
+atb wait --selector '.result' --timeout 10
+atb close --tab <tabId>
 
-## Responsible Use
+# Scripts and batches
+atb exec 'return document.title'
+atb run steps.json                        # many steps in one process
+atb batch steps.json --concurrency 8
+atb scrape --urls urls.txt --out out.jsonl
+atb --async scan --text-only              # returns a job_id immediately
+atb job wait <jobId> --timeout 300
 
-This tool is meant for automated testing, frontend debugging, data collection, and security research within authorized scope. Users must comply with the target site's terms of service, its robots policy, and applicable local law, and must not use it for unauthorized access, bypassing access controls, or infringing on other people's data. The project ships no automated CAPTCHA bypass: the `challenge` commands only detect, wait, and hand over to a human.
+# Network and debugging
+atb net fetch https://api.example.com/me
+atb net hook --capture-bodies
+atb net mock /api/user --status 200 --body '{"id":1}'
+atb console start
+atb downloads --limit 10
+
+# Challenges and traces
+atb challenge status
+atb stealth audit
+atb stealth scrub
+
+# Operations
+atb status
+atb doctor --fix
+atb capabilities
+atb schema --json                         # argument schema for top-level commands (use --help for subcommands)
+atb logs --tail 100
+```
+
+`atb schema --json` is authoritative for parameters; the domain tables live in [skills/atb/references/commands.md](./skills/atb/references/commands.md).
+
+### Exit codes
+
+| Code | Meaning | What to do |
+| --- | --- | --- |
+| `0` | Success | — |
+| `1` | Execution failed | Read `error_code`; retry after `retry_after_ms` when retryable |
+| `2` | Command is wrong | Fix selector / JS / arguments / target; do not retry |
+| `3` | `job wait` / `download-wait` timed out | Raise `--timeout`, or query again later; a plain `wait` timeout is `1` |
+| `4` | Outcome unknown | The action may have run; resend with the same `--idempotency-key` |
+| `130` | Job cancelled | `job wait` observed `cancelled` |
+
+## Versions and compatibility
+
+| Item | Value |
+| --- | --- |
+| CLI / daemon | `0.7.1` |
+| CLI ↔ daemon API protocol | `5` |
+| Extension message protocol | `4` |
+| Extension file version | `5.2.9` |
+| Minimum Chrome | `120` |
+
+- Current version: `0.7.1`
+- Companion extension: `5.2.9` (display name `ATB`)
+
+```bash
+atb status
+# compatibility: { ok, cli_protocol, daemon_protocol,
+#                  extension_protocol_expected, extension_protocol_connected, fixes[] }
+```
+
+| Symptom | What to do |
+| --- | --- |
+| `compatibility.ok:false` with different protocol numbers | `atb restart`; if it persists, end the process holding `18767` |
+| `error_code:"extension_outdated"` | Replace the extension directory with `assets/atb_bridge`, then click "Reload" on the extension page |
+| `upgrade_recommended:true` in `status` | Core commands still work; update the extension following `next_steps` |
+| `stealth` returns `extension_ok:false` | Extension older than 5.0.0, or files replaced without a reload; follow `fixes`, then re-check |
+
+Upgrade note: a new CLI refuses to talk to an old daemon on a protocol mismatch and prints the fix steps. The config directory stays `~/.atb` on purpose — moving it would split old and new daemons across separate ports.
+
+## Operations
+
+```bash
+atb status                       # ok follows healthy; non-zero exit when unhealthy
+atb doctor                       # diagnose ports, token, daemon version
+atb doctor --fix                 # auto-repair; --force is required to kill processes
+atb logs --tail 100
+atb restart                      # restart the daemon after protocol or config changes
+atb stop                         # stop the daemon; frees 18765, and the extension keeps reconnecting
+atb set-extension-port 18766     # change the extension port, writes config.json and restarts
+atb install-skill --dry-run      # preview where the skill will land
+atb install-skill                # real dir ~/.agents/skills/atb; symlinks into the five agent dirs
+```
+
+`18767` is the CLI HTTP API port: fixed, not configurable, and never usable as the extension port. `ATB_EXIT0=1` restores the old always-zero `status` exit code — set it only if a script depends on that.
+
+Upgrading the CLI: `npm i -g @g1728578755/atb@latest`, then update the extension files as described in "Load the extension". Full history in [CHANGELOG.md](./CHANGELOG.md); an AI-driven upgrade flow in [AI_INSTALL.md](./AI_INSTALL.md).
+
+## Security and privacy
+
+- Traffic between the CLI, daemon and extension stays on `127.0.0.1`; no telemetry, no remote code, no ad SDK. The pages you drive still talk to their own sites.
+- `trust-extension` is one-way: it constrains who may connect to the daemon, but the extension never verifies that the daemon it talks to is genuine.
+- The daemon exits after 300 idle seconds only when no extension is connected; `atb stop` alone frees 18765 while the extension keeps reconnecting, so disable the extension or close the browser to truly close the window.
+- The extension declares `<all_urls>`, `cookies`, `debugger`, `scripting`, `management`, `contentSettings` and similar permissions; page data is read only when you or the CLI issue a command; `management` is used for the extension's own reload and to name the extension that blocks the debugger (`blockingExtensions`).
+- `challenge` interacts with the page's verification widget (click and wait) but does not guarantee passage; image reading and SMS/email checks still need a human.
+
+Report vulnerabilities per [SECURITY.md](./SECURITY.md); the local data inventory and deletion steps are in [PRIVACY.md](./PRIVACY.md). Both documents promise only what the code can guarantee and mark everything else as a boundary.
+
+## Platforms and limits
+
+Supported: macOS arm64 / x64, Linux glibc x64 / arm64, Windows x64, WSL 2 (use the Linux package), Chrome and Edge 120 or newer.
+
+What it explicitly cannot do:
+
+- No prebuilt packages for Windows ARM64 (`win32-arm64`) or Alpine / musl — build from source.
+- The debug banner is Chrome's own UI and cannot be removed at runtime; the only switch is a launch flag, and applying it requires restarting the browser via `atb launch --restart`.
+- Firefox / Safari are not supported; it needs a Chromium-based browser plus the extension.
+- No fingerprint spoofing: UA, canvas, WebGL and hardware values stay as the browser reports them; `stealth` only removes what this tool wrote into the page.
+- No bypassing CAPTCHAs or access control; JS challenges and clickable Turnstile widgets can be handled automatically, while image selection and SMS checks still need a human.
+- When the extension bridge is down, no tab can be driven. That is by design, not a defect.
+
+## Documentation map
+
+| Reader | Document | Contents |
+| --- | --- | --- |
+| Letting an AI install it | [AI_INSTALL.md](./AI_INSTALL.md) | Copyable prompt, step-by-step flow, failure branches, uninstall |
+| Writing an agent | [skills/atb/SKILL.md](./skills/atb/SKILL.md) | Standard loop, command selection by intent, failure handling |
+| Looking up flags | [commands.md](./skills/atb/references/commands.md) | Per-domain command and parameter tables |
+| Wanting recipes | [recipes.md](./skills/atb/references/recipes.md) | Copy-paste scenarios |
+| Debugging a failure | [troubleshooting.md](./skills/atb/references/troubleshooting.md) | Symptom → diagnosis → fix |
+| Going deeper | [docs/BEST_PRACTICES.md](./docs/BEST_PRACTICES.md) | Selectors, waiting, token budgets |
+| Long-running work | [docs/ASYNC_BACKGROUND.md](./docs/ASYNC_BACKGROUND.md) | Async jobs, background tabs, limits |
+| Detection and challenges | [docs/ANTI_DETECTION_AND_CHALLENGE.md](./docs/ANTI_DETECTION_AND_CHALLENGE.md) | Trace audit, scrubbing, challenge handling |
+| Edge load failures | [docs/EDGE_TROUBLESHOOTING.md](./docs/EDGE_TROUBLESHOOTING.md) | Extension load errors, one by one |
+| Feature status | [docs/FEATURE_STATUS.md](./docs/FEATURE_STATUS.md) | Shipped / next / performance and boundaries |
+| Release history | [CHANGELOG.md](./CHANGELOG.md) | Change summaries since 0.4.0 |
+| Historical record | [docs/CHANGELOG_ARCHIVE.md](./docs/CHANGELOG_ARCHIVE.md) | 0.3.7 and earlier, plus pre-refactor detail |
+| Contributing | [CONTRIBUTING.md](./CONTRIBUTING.md) | Layers, test matrix, contracts you cannot break |
+| Community norms | [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md) | Expected behaviour, reporting channel |
+| Security / privacy / sources | [SECURITY.md](./SECURITY.md) · [PRIVACY.md](./PRIVACY.md) · [SOURCES.md](./SOURCES.md) | Threat model, local data, upstream and dependencies |
 
 ## Contributing
 
-Issues and PRs are welcome. Read [CONTRIBUTING.md](./CONTRIBUTING.md) before submitting; report security problems privately as described in [SECURITY.md](./SECURITY.md) rather than posting exploitable details in public.
+Read [CONTRIBUTING.md](./CONTRIBUTING.md) before changing code: exit codes, `error_code` values, JSON fields and both protocols are external contracts. Before submitting, run `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `node --test tests/*.test.mjs`.
 
-## Friendly Links
+Documentation changes ship in the same PR; the Chinese and English READMEs must stay in sync, and version strings are written by `npm run sync-version`.
 
-- [LINUX DO - A New Ideal Community](https://linux.do/)
-- [GenericAgent - a self-evolving agent in roughly 3K lines](https://github.com/lsdefine/GenericAgent/tree/main)
+## Acknowledgements
+
+The browser control capability was extracted and adapted from the Web toolchain in [GenericAgent](https://github.com/lsdefine/GenericAgent), including `TMWebDriver`, `simphtml`, and the `atb_bridge` extension. Upstream sources and dependency licences are listed in [SOURCES.md](./SOURCES.md).
 
 ## License
 
-MIT License. See [LICENSE](./LICENSE).
+MIT License, Copyright (c) 2026 1728578755. Upstream attribution is in [NOTICE](./NOTICE).

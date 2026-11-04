@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Deep DOM fixture</title>
+</head>
+<body>
+  <!-- 600 层嵌套：页面侧 cloneNode 递归如果没深度上限，会抛
+       RangeError: Maximum call stack size exceeded，scan 直接失败。 -->
+  <div id="root"></div>
+  <script>
+    let node = document.getElementById('root');
+    for (let i = 0; i < 600; i += 1) {
+      const div = document.createElement('div');
+      div.setAttribute('data-depth', String(i));
+      if (i === 599) div.textContent = 'DEEP-LEAF-TEXT';
+      node.appendChild(div);
+      node = div;
+    }
+  </script>
+</body>
+</html>

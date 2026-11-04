@@ -1,6 +1,6 @@
 // 资源一致性守卫。
 //
-// assets/page_*.js 是「源文件」，assets/tmwd_cdp_bridge/ops/page_*.js 是扩展里
+// assets/page_*.js 是「源文件」，assets/atb_bridge/ops/page_*.js 是扩展里
 // 真正被 scripting.executeScript 注入的那一份。两份靠复制同步，历史上就出现过
 // 只改一边、线上跑的是旧逻辑的问题（TOKEN_SELECTORS 被删掉就是这么漏出去的）。
 // 这里做逐字节比对，并给出差异偏移，方便定位。
@@ -11,9 +11,9 @@ import { fileURLToPath } from 'node:url';
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, '..');
 const ASSETS = join(ROOT, 'assets');
-const OPS = join(ASSETS, 'tmwd_cdp_bridge', 'ops');
+const OPS = join(ASSETS, 'atb_bridge', 'ops');
 
-const PAGES = ['action', 'challenge', 'find', 'net', 'read', 'snapshot', 'wait'];
+const PAGES = ['action', 'challenge', 'find', 'net', 'read', 'snapshot', 'stealth', 'wait'];
 
 const results = [];
 function check(name, ok, detail) {
@@ -57,7 +57,7 @@ for (const page of PAGES) {
     continue;
   }
   if (!existsSync(copyPath)) {
-    check(label, false, `缺少副本 assets/tmwd_cdp_bridge/ops/page_${page}.js`);
+    check(label, false, `缺少副本 assets/atb_bridge/ops/page_${page}.js`);
     continue;
   }
 
@@ -100,6 +100,57 @@ if (!existsSync(challengePath)) {
       /TOKEN_SELECTORS/.test(readFileSync(opsChallenge, 'utf8')),
     );
   }
+}
+
+// 扩展版本漂移守卫：manifest.json 是唯一真相源。
+//
+// v6 P3 的实锤：manifest 早已是 5.2.1，README 三处仍写「扩展 5.0.0」，用户按文档
+// 判断「我装的是不是新的」会得到错误结论。这里直接拿 manifest 的版本去比对文案。
+const manifest = JSON.parse(readFileSync(join(ASSETS, 'atb_bridge', 'manifest.json'), 'utf8'));
+const extVersion = manifest.version;
+const readmeZh = readFileSync(join(ROOT, 'README.md'), 'utf8');
+const readmeEn = readFileSync(join(ROOT, 'README_EN.md'), 'utf8');
+// SKILL.md 会被 `install-skill` 装进 ~/.agents/skills，是 Agent 判断「扩展要不要重载」
+// 的依据；它曾经停在 5.0.0（实际 5.2.2），于是 Agent 会把新扩展当超前版本反复要求重载。
+const skillMd = readFileSync(join(ROOT, 'skills', 'atb', 'SKILL.md'), 'utf8');
+const featureStatus = readFileSync(join(ROOT, 'docs', 'FEATURE_STATUS.md'), 'utf8');
+const versionChecks = [
+  ['README 配套扩展版本', readmeZh.includes(`配套扩展：\`${extVersion}\``)],
+  ['README 扩展文件版本', readmeZh.includes(`扩展文件版本（当前 **${extVersion}**）`)],
+  ['README 本版本需要扩展版本', readmeZh.includes(`本版本需要扩展 ${extVersion}`)],
+  ['README_EN companion extension', readmeEn.includes(`Companion extension: \`${extVersion}\``)],
+  ['README_EN extension file version', readmeEn.includes(`extension file version (currently **${extVersion}**)`)],
+  ['README_EN release requires extension', readmeEn.includes(`requires extension ${extVersion}`)],
+  ['SKILL.md 扩展文件版本', skillMd.includes(`扩展文件版本（当前 **${extVersion}**）`)],
+  ['FEATURE_STATUS 扩展版本', featureStatus.includes(`扩展 ${extVersion} ATB`)],
+];
+for (const [label, ok] of versionChecks) {
+  check(`${label} = manifest ${extVersion}`, ok, `README 与 manifest.json（${extVersion}）不一致`);
+}
+
+// 更强的守卫：**当前文档**里出现的任何 `5.2.x` 都必须等于 manifest 版本。
+// 只查固定句式会漏掉「安装文档里 7 处 5.2.5」这种整篇漂移（v11 实测踩到）。
+// 历史快照（CODE_REVIEW_* / WORKLOG_* / REMEDIATION_* / CHANGELOG_ARCHIVE）不在此列。
+const CURRENT_DOCS = [
+  'README.md',
+  'README_EN.md',
+  'AI_INSTALL.md',
+  'docs/FEATURE_STATUS.md',
+  'docs/BEST_PRACTICES.md',
+  'skills/atb/SKILL.md',
+  'skills/atb/references/commands.md',
+  'skills/atb/references/recipes.md',
+  'skills/atb/references/troubleshooting.md',
+];
+for (const rel of CURRENT_DOCS) {
+  const text = readFileSync(join(ROOT, ...rel.split('/')), 'utf8');
+  const versions = [...text.matchAll(/5\.2\.\d+/g)].map((match) => match[0]);
+  const stale = [...new Set(versions)].filter((version) => version !== extVersion);
+  check(
+    `${rel} 不含过期的 5.2.x`,
+    stale.length === 0,
+    `出现了 ${stale.join(', ')}（manifest 是 ${extVersion}）——升级扩展后同步这些文档`,
+  );
 }
 
 const failed = results.filter((item) => !item.ok);

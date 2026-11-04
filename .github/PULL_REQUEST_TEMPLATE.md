@@ -1,27 +1,27 @@
-# 变更说明
+## Summary
 
-<!-- 一句话说明这个 PR 解决什么问题；关联的 issue 请用 Fixes #123 语法 -->
+<!-- What changes, and why. Link the issue if one exists. -->
 
-## 改动内容
+## Scope
 
-- 
+- [ ] Rust daemon / CLI (`src/`)
+- [ ] Chrome extension (`assets/`)
+- [ ] npm packaging (`npm/`, `scripts/`)
+- [ ] Documentation
+- [ ] CI / release
 
-## 验证方式
+## Testing
 
-<!-- 贴关键命令与结果；涉及行为变更时说明覆盖了哪些场景 -->
+<!-- Commands you ran. Do not paste secrets or private page content. -->
 
-```bash
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets --all-features
-node tests/*.test.mjs
-npm run check:extension
+```shell
+atb --version
 ```
 
-## 检查清单
+## Checklist
 
-- [ ] 改的是 `assets/page_*.js`，不是 `assets/tmwd_cdp_bridge/ops/`（`ops/` 是自动副本，禁止手改）
-- [ ] 跑过 `npm run check:extension`，资源一致性通过
-- [ ] 已在 `CHANGELOG.md` 的 `[Unreleased]` 下补充用户可见变更
-- [ ] `README.md` 与 `README_EN.md` 已同步（涉及命令、参数、输出结构时）
-- [ ] 没有夹带无关重构；行为变更已说明兼容性影响
+- [ ] I ran `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-targets --all-features`.
+- [ ] I ran `node --test tests/*.test.mjs` or explained why it does not apply.
+- [ ] New user-facing commands and flags are documented.
+- [ ] I did not commit generated files under `npm/platform/`, `dist/`, or `target/`.
+- [ ] I kept `atb` as the command name in examples.

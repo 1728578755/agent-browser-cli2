@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Ad overlay fixture</title>
+  <style>
+    body { font-family: sans-serif; margin: 0; }
+    main { width: 100%; min-height: 100vh; padding: 24px; box-sizing: border-box; background: #fff; }
+    p { line-height: 1.6; }
+    .ad { position: fixed; left: 16px; bottom: 16px; width: 320px; height: 140px;
+          background: #ffe9a8; border: 1px solid #d6b656; z-index: 99999; }
+  </style>
+</head>
+<body>
+  <!-- 固定定位的图片广告：无文案、无链接、无按钮 —— 典型的 banner 浮层。
+       scan 的 R:floatingAd 链路必须能把它整个删掉，否则每次 scan 都白算一遍
+       还把广告带进正文。 -->
+  <main>
+    <h1>Quarterly report</h1>
+    <p>Revenue grew by 12 percent in the third quarter, driven by enterprise renewals and a
+       stronger self-serve funnel. Gross margin held at 78 percent.</p>
+    <p>Operating expenses rose 6 percent as we invested in support capacity and platform
+       reliability. Headcount ended the quarter at 240.</p>
+    <p>Outlook: we expect fourth-quarter revenue between 48 and 52 million, with continued
+       expansion in the mid-market segment.</p>
+  </main>
+  <div class="ad" data-ad-slot="banner-336x140">
+    <img alt="" width="320" height="140"
+         src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='320' height='140'%3E%3Crect width='320' height='140' fill='%23ffe9a8'/%3E%3C/svg%3E">
+  </div>
+</body>
+</html>

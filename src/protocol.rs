@@ -1,12 +1,26 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot};
+
+/// daemon ↔ CLI 的 API 协议版本。
+///
+/// 只在「请求/响应语义有不兼容变化」时 +1。CLI 连上 daemon 后先比对两边版本，
+/// 不一致就明确告诉用户该重启 daemon 还是该升级 CLI，而不是让命令以奇怪的方式失败。
+pub const PROTOCOL_VERSION: u32 = 5;
+
+/// 扩展协议版本：扩展与 daemon 之间的 WebSocket 消息契约。
+///
+/// 与 `PROTOCOL_VERSION` 分开：CLI 升级不影响扩展，扩展升级也不强制重启 daemon。
+pub const EXTENSION_PROTOCOL_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TabInfo {
     pub id: String,
+    /// Chrome 窗口 id：同一个 Profile 可以开多个窗口，按窗口批量操作时用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_id: Option<i64>,
     #[serde(default)]
     pub tab_id: String,
     #[serde(default)]
@@ -15,6 +29,10 @@ pub struct TabInfo {
     pub profile_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_label: Option<String>,
+    /// 可读的浏览器标识：「Edge · Windows · 工作机」。多浏览器/多 profile 同时连着时
+    /// 用来看懂「这条标签属于哪个浏览器」；旧扩展不上报时为空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_label: Option<String>,
     #[serde(default)]
     pub session_key: String,
     #[serde(default)]
@@ -23,6 +41,12 @@ pub struct TabInfo {
     pub title: String,
     #[serde(rename = "type", default = "default_tab_type")]
     pub tab_type: String,
+    /// Chrome 标签组标题（扩展未上报时为 None）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_title: Option<String>,
+    /// 浏览器当前激活的标签页。
+    #[serde(default)]
+    pub active: bool,
     #[serde(default)]
     pub connected_at: Option<f64>,
 }
@@ -39,10 +63,19 @@ pub struct Session {
     pub profile_id: String,
     pub profile_label: Option<String>,
     pub extension_version: Option<String>,
+    /// 扩展上报的消息协议版本；旧扩展不报，视为 0（未知/过旧）。
+    pub extension_protocol: u32,
     pub file_scheme_access: Option<bool>,
     pub info: TabInfo,
     pub sender: mpsc::UnboundedSender<String>,
     pub disconnected_at: Option<Instant>,
+    /// 最近一次注册这条会话的 WebSocket 连接 id（连接代际）。
+    ///
+    /// `session_key` 是确定性拼接（browser/profile/tab），扩展重载后新连接会
+    /// **拿到同一个 key**。断开清理若只看 key 就会把新连接刚注册的会话标成断开再删掉，
+    /// 于是「刚重连就报没有可用标签页」。记下登记者的连接 id 之后，旧连接收尾时
+    /// 先比对 `conn_id`，不等就整条跳过（连 `forget_session` 都不做）。
+    pub conn_id: u64,
 }
 
 impl Session {
@@ -146,8 +179,67 @@ pub struct DriverState {
     pub default_session_key: Option<String>,
     pub latest_session_key: Option<String>,
     pub preferred_default_session_key: Option<String>,
+    /// `preferred_default_session_key` 的登记时刻（unix 秒，A2）。
+    ///
+    /// 与 key **同生共死**：设置走 [`DriverState::set_preferred_default_session`]、
+    /// 清理走 [`DriverState::clear_preferred_default_session`]，任何一处漏写都会让
+    /// 这份记忆变成永不过期的脏数据（默认目标再也建立不起来）。
+    pub preferred_default_session_at: Option<f64>,
     /// 每个 browser:profile 的 net 配置（含页面规则与网络层规则），跨标签共享。
     pub net_hooks: HashMap<String, Value>,
+}
+
+/// 「待生效默认目标」的记忆有效时长（秒）。
+///
+/// 6 小时：够覆盖浏览器重启、隔夜再打开这种正常节奏；又不至于让一个「标签早就没了」
+/// 的记忆永久卡住默认目标的自动建立（`should_set_default_session` 见到 preferred
+/// 就不再改选）。
+pub const PREFERRED_DEFAULT_TTL: f64 = 6.0 * 3600.0;
+
+impl DriverState {
+    /// 当前仍然有效的「待生效默认目标」。
+    ///
+    /// 过期的记忆在这里**只当作不存在**，不清理字段（`&self` 清不了）：清理由
+    /// [`Self::expire_preferred_default_session`] 在快照入口做一次。
+    pub fn preferred_default_session(&self) -> Option<&str> {
+        let key = self.preferred_default_session_key.as_deref()?;
+        match self.preferred_default_session_at {
+            // 没有时间戳：兼容直接写字段的旧值/测试。生产路径上每个写点都会写时间戳。
+            None => Some(key),
+            Some(at) => (now_unix_secs() - at < PREFERRED_DEFAULT_TTL).then_some(key),
+        }
+    }
+
+    /// 记忆**已经过期**就清掉，返回是否真的清理了。
+    pub fn expire_preferred_default_session(&mut self) -> bool {
+        if self.preferred_default_session_key.is_none() {
+            return false;
+        }
+        if self.preferred_default_session().is_some() {
+            return false;
+        }
+        self.clear_preferred_default_session();
+        true
+    }
+
+    /// 记下「待生效默认目标」，同时刷新时间戳（两者必须一起写）。
+    pub fn set_preferred_default_session(&mut self, session_key: String) {
+        self.preferred_default_session_key = Some(session_key);
+        self.preferred_default_session_at = Some(now_unix_secs());
+    }
+
+    /// 清掉记忆：key 与时间戳一起清，避免残留时间戳污染下一次设置。
+    pub fn clear_preferred_default_session(&mut self) {
+        self.preferred_default_session_key = None;
+        self.preferred_default_session_at = None;
+    }
+}
+
+fn now_unix_secs() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs_f64())
+        .unwrap_or_default()
 }
 
 /// 在途执行登记表：从 DriverState 拆出来单独一把锁。
@@ -208,20 +300,35 @@ pub enum WsIncoming {
     ExtReady {
         #[serde(default = "default_browser_id")]
         browser_id: String,
+        /// 可读的浏览器标识（品牌 + 系统 + 自定义名），多浏览器并行时用来区分谁是谁。
+        #[serde(default)]
+        browser_label: Option<String>,
         #[serde(default = "default_profile_id")]
         profile_id: String,
         #[serde(default)]
         profile_label: Option<String>,
         #[serde(default)]
         extension_version: Option<String>,
+        /// 扩展协议版本；旧扩展不报 → 0，按「过旧」处理。
+        #[serde(default)]
+        protocol: u32,
         #[serde(default)]
         file_scheme_access: Option<bool>,
+        /// 扩展自检发现的问题（`queryTabs` / `tabGroups` / `restartSeq` 之类异常）。
+        ///
+        /// 扩展在 `connectWS` 的 finally 块里会发这个数组，但 daemon 侧长期没有建模，
+        /// serde 直接丢弃 —— 用户看不到「为什么这次上报的 tabs 是空的」。
+        #[serde(default)]
+        warnings: Vec<Value>,
+        #[serde(default, deserialize_with = "deserialize_ext_tabs")]
         tabs: Vec<ExtTab>,
     },
     #[serde(rename = "tabs_update")]
     TabsUpdate {
         #[serde(default = "default_browser_id")]
         browser_id: String,
+        #[serde(default)]
+        browser_label: Option<String>,
         #[serde(default = "default_profile_id")]
         profile_id: String,
         #[serde(default)]
@@ -229,7 +336,12 @@ pub enum WsIncoming {
         #[serde(default)]
         extension_version: Option<String>,
         #[serde(default)]
+        protocol: u32,
+        #[serde(default)]
         file_scheme_access: Option<bool>,
+        #[serde(default)]
+        warnings: Vec<Value>,
+        #[serde(default, deserialize_with = "deserialize_ext_tabs")]
         tabs: Vec<ExtTab>,
     },
     #[serde(rename = "ack")]
@@ -252,13 +364,65 @@ pub enum WsIncoming {
     Other,
 }
 
-#[derive(Debug, Deserialize)]
+/// 扩展上报的一个标签页。
+///
+/// 反序列化规则见下方手写的 `Deserialize`：`id` 必须是字符串或整数。
+#[derive(Debug)]
 pub struct ExtTab {
     pub id: Value,
-    #[serde(default)]
+    pub window_id: Option<i64>,
     pub url: String,
-    #[serde(default)]
     pub title: String,
+    /// 扩展上报的 Chrome 标签组标题（3.5+ 才有；旧扩展为 None）。
+    pub group_title: Option<String>,
+    /// 是否是浏览器窗口里当前激活（可见）的标签页。
+    pub active: bool,
+}
+
+/// 手写 `Deserialize`：`id` 不是字符串 / 整数时**拒绝这一条**。
+///
+/// 派生实现会把任意 JSON 收进 `Value`，于是对象/数组类型的 id 会被
+/// `Value::to_string()` 变成 `{"a":1}` 这种伪 id，混进会话表后按 id 查找永远对不上
+/// （R1-11）。调用方（`Vec<ExtTab>` 的逐条 `from_value`）会把 Err 当成「丢掉这条」。
+impl<'de> Deserialize<'de> for ExtTab {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawTab {
+            id: Value,
+            #[serde(default, alias = "windowId")]
+            window_id: Option<i64>,
+            #[serde(default)]
+            url: String,
+            #[serde(default)]
+            title: String,
+            #[serde(default)]
+            group_title: Option<String>,
+            #[serde(default)]
+            active: bool,
+        }
+
+        let raw = RawTab::deserialize(deserializer)?;
+        let id_ok = matches!(&raw.id, Value::String(_))
+            || raw.id.as_i64().is_some()
+            || raw.id.as_u64().is_some();
+        if !id_ok {
+            return Err(<D::Error as serde::de::Error>::custom(format!(
+                "invalid tab id: {}",
+                raw.id
+            )));
+        }
+        Ok(ExtTab {
+            id: raw.id,
+            window_id: raw.window_id,
+            url: raw.url,
+            title: raw.title,
+            group_title: raw.group_title,
+            active: raw.active,
+        })
+    }
 }
 
 impl ExtTab {
@@ -270,18 +434,29 @@ impl ExtTab {
     ) -> TabInfo {
         let tab_id = match self.id {
             Value::String(s) => s,
-            other => other.to_string(),
+            Value::Number(number) => number.to_string(),
+            // `ExtTab` 的 Deserialize 只放行字符串 / 整数 id，走到这里是 bug。
+            // 不再用 `other.to_string()` 造伪 id：宁可给空串，也不让
+            // `{"a":1}` / `true` 之类变成会话 key 的一部分（R1-11）。
+            other => {
+                debug_assert!(false, "invalid tab id survived deserialization: {other}");
+                String::new()
+            }
         };
         let session_key = make_session_key(browser_id, profile_id, &tab_id);
         TabInfo {
             id: tab_id.clone(),
+            window_id: self.window_id,
             tab_id,
             browser_id: browser_id.to_string(),
             profile_id: profile_id.to_string(),
             profile_label,
+            browser_label: None,
             session_key,
             url: self.url,
             title: self.title,
+            group_title: self.group_title,
+            active: self.active,
             tab_type: "ext_ws".to_string(),
             connected_at: None,
         }
@@ -292,10 +467,84 @@ pub fn make_session_key(browser_id: &str, profile_id: &str, tab_id: &str) -> Str
     format!("{browser_id}:{profile_id}:{tab_id}")
 }
 
+/// `tabs` 字段的反序列化：逐个校验，`id` 类型不合法的标签**直接丢弃**。
+///
+/// 放在反序列化阶段而不是调用点，是因为 `tabs` 由扩展推送（不可信输入），而丢弃
+/// 必须在「进会话表之前」发生；这样即使调用方忘了过滤，也不会出现伪 id（R1-11）。
+fn deserialize_ext_tabs<'de, D>(deserializer: D) -> Result<Vec<ExtTab>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Vec::<Value>::deserialize(deserializer)?;
+    Ok(raw
+        .into_iter()
+        // 逐条 `from_value`：某一条 id 非法（或字段类型不对）只丢这一条，不炸整批。
+        .filter_map(|value| serde_json::from_value::<ExtTab>(value).ok())
+        .collect())
+}
+
 fn default_browser_id() -> String {
     "browser-default".to_string()
 }
 
 fn default_profile_id() -> String {
     "profile-default".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn invalid_tab_ids_are_dropped_at_deserialization() {
+        let message: WsIncoming = serde_json::from_value(json!({
+            "type": "ext_ready",
+            "tabs": [
+                { "id": "abc", "url": "https://a", "title": "A" },
+                { "id": 42, "url": "https://b", "title": "B" },
+                { "id": { "nested": 1 }, "url": "https://c" },
+                { "id": null, "url": "https://d" },
+                { "id": [1, 2], "url": "https://e" },
+                { "id": true, "url": "https://f" }
+            ]
+        }))
+        .expect("ext_ready");
+
+        let WsIncoming::ExtReady { tabs, .. } = message else {
+            panic!("expected ext_ready");
+        };
+        // 只有字符串和整数 id 的标签留下，其余直接丢弃（R1-11）。
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs[0].id, json!("abc"));
+        assert_eq!(tabs[1].id, json!(42));
+    }
+
+    #[test]
+    fn numeric_tab_id_becomes_decimal_string() {
+        let tab: ExtTab = serde_json::from_value(json!({
+            "id": 7, "url": "u", "title": "t"
+        }))
+        .expect("tab");
+        let info = tab.into_tab_info("b", "p", None);
+        assert_eq!(info.tab_id, "7");
+        assert_eq!(info.id, "7");
+        assert_eq!(info.session_key, "b:p:7");
+    }
+
+    #[test]
+    fn tabs_update_also_filters_invalid_ids() {
+        let message: WsIncoming = serde_json::from_value(json!({
+            "type": "tabs_update",
+            "tabs": [
+                { "id": "keep" },
+                { "id": { "x": 1 } }
+            ]
+        }))
+        .expect("tabs_update");
+        let WsIncoming::TabsUpdate { tabs, .. } = message else {
+            panic!("expected tabs_update");
+        };
+        assert_eq!(tabs.len(), 1);
+    }
 }

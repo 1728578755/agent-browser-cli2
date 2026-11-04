@@ -1,0 +1,7 @@
+atb e2e sample file
+-------------------
+这份文件只用于 download.html 的 <a download> 场景：
+点击链接触发一次真实下载，再让 `atb download-wait` 断言 state=complete。
+
+0123456789
+abcdefghij

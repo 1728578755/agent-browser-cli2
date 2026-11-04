@@ -15,10 +15,10 @@ import { fileURLToPath } from "node:url";
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.join(here, "..");
 const candidates = [
-  path.join(root, "target", "release", "agent-browser-cli.exe"),
-  path.join(root, "target", "release", "agent-browser-cli"),
-  path.join(root, "target", "debug", "agent-browser-cli.exe"),
-  path.join(root, "target", "debug", "agent-browser-cli"),
+  path.join(root, "target", "release", "atb.exe"),
+  path.join(root, "target", "release", "atb"),
+  path.join(root, "target", "debug", "atb.exe"),
+  path.join(root, "target", "debug", "atb"),
 ];
 const bin = candidates.find((p) => fs.existsSync(p));
 if (!bin) {

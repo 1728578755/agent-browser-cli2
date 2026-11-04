@@ -1,7 +1,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 
-const bin = path.resolve(__dirname, "bin", "agent-browser-cli.js");
+const bin = path.resolve(__dirname, "bin", "atb.js");
 try {
   fs.chmodSync(bin, 0o755);
 } catch (_) {

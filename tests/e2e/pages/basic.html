@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>ATB E2E Basic</title>
+</head>
+<body>
+<h1 id="heading">ATB E2E Basic</h1>
+<p id="intro">受控页面：标题 / 输入框 / 按钮 / 链接。按钮点击把计数写进 <code>#count</code>。</p>
+
+<label for="name">名字</label>
+<input id="name" name="name" type="text" placeholder="your name">
+
+<button id="btn" type="button">点击 +1</button>
+<p>点击次数：<span id="count">0</span></p>
+
+<p><a id="link" href="/basic.html?from=link">带 query 的自链接</a></p>
+
+<script>
+  // 计数刻意做成同步写入：#count 在 click 事件返回时就已经是 1，
+  // e2e 里可以用一条 exec 立刻读到结果，不需要额外等待。
+  const countEl = document.getElementById('count');
+  document.getElementById('btn').addEventListener('click', function () {
+    const next = Number(countEl.textContent || '0') + 1;
+    countEl.textContent = String(next);
+  });
+</script>
+</body>
+</html>

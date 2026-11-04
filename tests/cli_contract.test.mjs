@@ -8,12 +8,32 @@
 // 这里不做网络测试（起 daemon 会污染当前环境、且 src 正在并行改动），改为对
 // src/cli.rs 做源码级不变式断言：只校验「契约形状」，不校验行号，所以重构一般
 // 不会误红。
-import { readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const CLI_RS = join(HERE, '..', 'src', 'cli.rs');
+const SRC_DIR = join(HERE, '..', 'src');
+const CLI_RS = join(SRC_DIR, 'cli.rs');
+
+/// 读取源码树：模块化后 `src/cli.rs` 变成 `src/cli/*.rs`。
+/// 单文件布局用单文件；目录布局按文件名排序后拼接（函数不会被拆到两个文件，
+/// 所以 fnBody / enclosingFn 这类按花括号切分的工具仍然成立）。
+function readSourceTree(singleFile, dir) {
+  if (existsSync(singleFile)) return readFileSync(singleFile, 'utf8');
+  if (!existsSync(dir)) throw new Error(`找不到源码：${singleFile} 或 ${dir}`);
+  const files = [];
+  const walk = (current) => {
+    for (const entry of readdirSync(current, { withFileTypes: true })) {
+      const full = join(current, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.name.endsWith('.rs')) files.push(full);
+    }
+  };
+  walk(dir);
+  files.sort();
+  return files.map((file) => readFileSync(file, 'utf8')).join('\n\n');
+}
 
 const results = [];
 function check(name, ok, detail) {
@@ -21,7 +41,8 @@ function check(name, ok, detail) {
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${ok || !detail ? '' : '\n        → ' + detail}`);
 }
 
-const source = readFileSync(CLI_RS, 'utf8');
+const source = readSourceTree(CLI_RS, join(SRC_DIR, 'cli'));
+const mainSource = readFileSync(join(SRC_DIR, 'main.rs'), 'utf8');
 
 // ---- 源码切分工具 -------------------------------------------------------
 
@@ -163,7 +184,21 @@ if (downloadWaitBody) {
 // ---- 5. 只允许在 run()/main 里真正退出进程 ----------------------------
 
 const exitCalls = [...source.matchAll(/std::process::exit\s*\(/g)].map((m) => m.index);
-check('源码中有且仅有一处 std::process::exit 调用', exitCalls.length <= 1, `发现 ${exitCalls.length} 处`);
+// 旧断言写的是 `<= 1`，用例名却说「有且仅有一处」——一处都没有时也能 PASS，
+// 整个守卫等于空转（v6 P3）。现在拆成两条：
+//   1. 至多一处；2. 一处都没有时，main 必须用 ExitCode 当唯一出口。
+// 入口改成 `fn main() -> ExitCode` 后允许 0 处，但不能再出现「退出码散落在
+// 各命令实现里」的回退，所以 0 处必须能证明出口收敛在 main。
+check('std::process::exit 调用不超过一处', exitCalls.length <= 1, `发现 ${exitCalls.length} 处`);
+if (exitCalls.length === 0) {
+  const entryReturnsExitCode = /fn\s+main\s*\(\s*\)\s*->\s*ExitCode/.test(mainSource);
+  const entryDelegatesToCli = /cli::run\s*\(\s*\)/.test(mainSource);
+  check(
+    '无 process::exit 时，退出码收敛到 main 的 ExitCode 出口',
+    entryReturnsExitCode && entryDelegatesToCli,
+    'main.rs 既没有 `fn main() -> ExitCode`，也没有委托 cli::run()',
+  );
+}
 for (const at of exitCalls) {
   const owner = enclosingFn(source, at);
   check(
@@ -175,13 +210,24 @@ for (const at of exitCalls) {
 
 // ---- 6. EXIT0 兼容开关必须保留 ---------------------------------------
 
+// 命令改名为 atb 后，开关改成 config::env_compat("EXIT0")：先读 ATB_EXIT0，
+// 再回退旧名 AGENT_BROWSER_CLI_EXIT0。这里同时校验「调用点」与「旧名回退」，
+// 否则改名会把已经写进用户脚本的兼容开关静默废掉（会复发）。
+const CONFIG_RS = join(HERE, '..', 'src', 'config.rs');
+const configSource = readFileSync(CONFIG_RS, 'utf8');
 check(
-  '保留 AGENT_BROWSER_CLI_EXIT0 兼容开关',
-  /env::var_os\("AGENT_BROWSER_CLI_EXIT0"\)/.test(source),
+  '保留 EXIT0 兼容开关（调用点）',
+  /env_compat\("EXIT0"\)/.test(source),
+);
+check(
+  '兼容开关仍然认旧变量名 AGENT_BROWSER_CLI_',
+  /AGENT_BROWSER_CLI_\{suffix\}/.test(configSource),
 );
 check(
   '兼容开关生效时才吞掉非零退出码',
-  /code\s*!=\s*0\s*&&\s*env::var_os\("AGENT_BROWSER_CLI_EXIT0"\)\.is_none\(\)/.test(source),
+  /code\s*!=\s*0\s*&&\s*exit0_compat\s*\(\s*\)/.test(source) &&
+    /matches!\(\s*value\.to_string_lossy\(\)\.trim\(\),\s*"1"\s*\|\s*"true"\s*\)/.test(source),
+  'EXIT0 必须只在 code != 0 且值为 1/true 时返回 0',
 );
 
 // ---- 7. 退出码常量互不冲突 -------------------------------------------
