@@ -17,6 +17,8 @@ jobs:
     needs: version-check
     runs-on: ${{ matrix.os }}
     environment: npm
+    env:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
     strategy:
       fail-fast: false
       matrix:
@@ -90,7 +92,7 @@ jobs:
       # 没有配置 NPM_TOKEN 时跳过 npm 发布，但二进制与 Release 产物照常生成：
       # 发布凭据缺失不应该连带阻断 GitHub Release。
       - name: Publish platform package
-        if: ${{ secrets.NPM_TOKEN != '' }}
+        if: ${{ env.NPM_TOKEN != '' }}
         shell: bash
         working-directory: npm/platform/${{ matrix.name }}
         env:
@@ -133,6 +135,8 @@ jobs:
     runs-on: ubuntu-latest
     environment: npm
     needs: publish-binaries
+    env:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -147,7 +151,7 @@ jobs:
         run: npm install -g npm@11.5.1
 
       - name: Publish main package
-        if: ${{ secrets.NPM_TOKEN != '' }}
+        if: ${{ env.NPM_TOKEN != '' }}
         shell: bash
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
