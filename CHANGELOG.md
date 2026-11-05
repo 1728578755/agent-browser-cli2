@@ -8,16 +8,35 @@
 
 | 版本线 | 当前 | 真相源 |
 | --- | --- | --- |
-| CLI / daemon | `0.7.2` | `package.json` / `Cargo.toml` |
+| CLI / daemon | `0.7.3` | `package.json` / `Cargo.toml` |
 | CLI ↔ daemon API 协议 | `5` | `atb status` |
 | Chrome 扩展 | `5.3.0` | `assets/atb_bridge/manifest.json` |
 | 扩展 ↔ daemon 消息协议 | `4` | `atb status` |
 
 0.3.7 及更早版本、以及重构前的逐条修复记录，见 [docs/CHANGELOG_ARCHIVE.md](docs/CHANGELOG_ARCHIVE.md)。
 
+## [0.7.3] - 2026-11-05
+
+0.7.2 的补丁版本。命令与参数集合不变，CLI 仍为 `0.7.3`，扩展仍为 `5.3.0`
+（CLI ↔ daemon 协议 `5`、扩展消息协议 `4`）。只修复 0.7.2 发布后回归测试暴露的
+三处问题，已在 0.7.2 上安装的用户可以原地升级。
+
+### Fixed
+
+- **`file:` 相对写法在 Linux 上错误码不一致**：`file:demo.html` 在 Windows 报
+  `invalid_file_url`，在 Linux 因为 URL 解析器先把它规范化成绝对路径，变成
+  `local_resource_not_found`。现在在解析前按原始输入判断，两端统一为
+  `invalid_file_url`，并保留 `file:/abs/path` 与 `file:C:/dir/a.html` 的合法写法。
+- **挑战等待循环末尾的空派发**：剩余预算不足 50ms 时仍会向页面派发一片 wait，
+  派发守卫直接返回「预算在派发前已用尽」，把上一片的有效载荷覆盖成一条无信息的
+  错误。现在余量不足一次往返时直接收尾，最后一轮的 `challenge` 字段保留真实结论。
+- **CI 的 `npm ci --dry-run` 必然失败**：dry-run 会执行 `postinstall`，而
+  postinstall 的职责是确认原生二进制存在；源码检出时平台子包尚未发布，
+  于是每次 CI 都在这一步假红。该步骤已移除，lock 一致性由 `check-lock` 覆盖。
+
 ## [0.7.2] - 2026-11-04
 
-截至 2026-11-04，CLI 仍为 `0.7.2`；扩展同步升到 `5.3.0`（消息协议仍为 `4`）。本节汇总 0.7.1 之后已合并的 CLI/daemon 改动与 5.3.0 扩展改动；向后兼容，不删除、不改名已有字段。
+截至 2026-11-04，CLI 为 `0.7.2`；扩展同步升到 `5.3.0`（消息协议仍为 `4`）。本节汇总 0.7.1 之后已合并的 CLI/daemon 改动与 5.3.0 扩展改动；向后兼容，不删除、不改名已有字段。
 
 ### Added
 
@@ -272,7 +291,7 @@
 
 0.3.x 的最后一个版本。该版本及更早的逐条记录见 [docs/CHANGELOG_ARCHIVE.md](docs/CHANGELOG_ARCHIVE.md)。
 
-[Unreleased]: https://github.com/1728578755/atb-cli/compare/v0.7.2...HEAD
+[Unreleased]: https://github.com/1728578755/atb-cli/compare/v0.7.3...HEAD
 [0.7.2]: https://github.com/1728578755/atb-cli/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/1728578755/atb-cli/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/1728578755/atb-cli/compare/v0.6.0...v0.7.0

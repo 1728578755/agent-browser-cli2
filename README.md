@@ -10,7 +10,7 @@
   <a href="https://github.com/1728578755/atb-cli"><img src="https://img.shields.io/badge/CLI-atb-2ea44f" alt="CLI atb"></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-green" alt="License MIT"></a>
   <a href="https://github.com/1728578755/atb-cli"><img src="https://img.shields.io/badge/sys-win%2Fmac%2Flinux-0078D6?labelColor=0078D6&color=C0C0C0" alt="sys win/mac/linux"></a>
-  <a href="https://github.com/1728578755/atb-cli/releases"><img src="https://img.shields.io/badge/release-v0.7.2-orange" alt="release v0.7.2"></a>
+  <a href="https://github.com/1728578755/atb-cli/releases"><img src="https://img.shields.io/badge/release-v0.7.3-orange" alt="release v0.7.3"></a>
   <a href="https://github.com/1728578755/atb-cli/pulls"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen" alt="PRs welcome"></a>
 </p>
 
@@ -305,13 +305,13 @@ atb logs --tail 100
 
 | 项 | 值 |
 | --- | --- |
-| CLI / daemon | `0.7.2` |
+| CLI / daemon | `0.7.3` |
 | CLI ↔ daemon API 协议 | `5` |
 | 扩展消息协议 | `4` |
 | 扩展文件版本 | `5.3.0` |
 | 最低 Chrome | `120` |
 
-- 当前版本：`0.7.2`
+- 当前版本：`0.7.3`
 - 配套扩展：`5.3.0`（显示名 `ATB`）
 
 ```bash

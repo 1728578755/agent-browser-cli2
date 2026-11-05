@@ -1,6 +1,6 @@
 # 能力现状：已实现 / 下一步 / 边界
 
-更新时间：2026-11-04（扩展 5.3.0 ATB，CLI 0.7.2，CLI↔daemon 协议 5，扩展协议 4）
+更新时间：2026-11-04（扩展 5.3.0 ATB，CLI 0.7.3，CLI↔daemon 协议 5，扩展协议 4）
 
 顶层命令 **55 个**（`atb --help`，不含 `help`；另有 `net` / `job` / `challenge` / `stealth` / `network` / `console` / `lookup` / `profile-label` / `trust-extension` 等子命令）。主命令名为 `atb`。
 
@@ -19,7 +19,7 @@
 | 诊断自动修复 | `atb doctor --fix [--force]` | 旧 daemon 占端口（netstat/lsof 找 PID；`--force` 才 taskkill，否则只打印命令）、API token 失配（删 `~/.atb/api-token`）、扩展过旧（打印带实际路径的重载指引）；每条输出 `{fix, executed, result}` |
 | 批量抓取 | `atb scrape` | `--urls` 文件/逗号列表（去重）→ 分批后台开页（`--batch`，默认 4）→ 并发执行 JS（`--concurrency`，默认 4）→ 结果写 `--out`（JSONL：`{url, tab_id, ok, data, error, elapsed_ms, attempts, outcome_unknown}`）→ 批完关页 → 失败退避重试（3s/5s/7s，`--retry` 默认 3 轮）→ 摘要；默认每个 URL 只写一条最终记录（诊断「第几次才成功」用 `--record-attempts` 逐次写）；`outcome_unknown` 的 URL 不重试、最终退出码 4；`--batch/--concurrency` 超出 1..=32 退出 2；`--js-file` 缺省取 `{title,url,text(前9000字)}`；全部 CLI 侧编排，复用 open/exec/close，不改 daemon |
 
-### 当前能力（CLI 0.7.2 / 扩展 5.3.0）
+### 当前能力（CLI 0.7.3 / 扩展 5.3.0）
 
 | 能力 | 命令/字段 | 说明 |
 |---|---|---|

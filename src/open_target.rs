@@ -314,7 +314,41 @@ fn host_defaults_to_http(host: Host<&str>) -> bool {
     }
 }
 
+/// `file:` 后面是否是一段绝对路径（而不是 `file:demo.html` 这种相对写法）。
+///
+/// 必须在 `Url::parse` **之前**判断：URL 解析器会把 `file:demo.html` 规范化成
+/// `file:///demo.html`（POSIX）或带 host 的形式（Windows），等到解析后再看
+/// `path()` 已经看不出「用户写的是相对路径」。旧实现只在 Unix 上补了这条判断，
+/// 于是同一个输入在 Linux 报 `invalid_file_url`、在 Windows 走成文件不存在，
+/// 两端错误码不一致。
+fn file_url_is_absolute(input: &str) -> bool {
+    let rest = input
+        .get("file:".len()..)
+        .unwrap_or_default()
+        .trim_start_matches([' ', '\t']);
+    if rest.starts_with('/') || rest.starts_with('\\') {
+        return true;
+    }
+    // Windows 盘符绝对路径：`file:C:/dir/a.html` / `file:C://dir//a.html`。
+    let bytes = rest.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\')
+}
+
 fn resolve_file_url(input: &str) -> Result<ResolvedOpenTarget, OpenTargetError> {
+    if !input
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("file:"))
+        || !file_url_is_absolute(input)
+    {
+        return Err(OpenTargetError::new(
+            "invalid_file_url",
+            "Relative file URLs are not supported; pass a relative filesystem path instead",
+            json!({ "open_target": input }),
+        ));
+    }
     // 先解析再判绝对性：`file:/path` 在浏览器里等价于
     // `file:///path`，旧实现只认 `file://` 前缀，把绝对路径误报成「Relative file URLs」。
     let mut parsed = Url::parse(input).map_err(|err| {
@@ -329,16 +363,6 @@ fn resolve_file_url(input: &str) -> Result<ResolvedOpenTarget, OpenTargetError> 
             "invalid_file_url",
             format!("Not a file URL: {}", parsed.scheme()),
             json!({ "open_target": input, "scheme": parsed.scheme() }),
-        ));
-    }
-    // Unix 上 file URL 的 path 必须以 `/` 开头；`file:demo.html` 这类交给
-    // `to_file_path()` 会得到相对路径，统一在这里给出与旧行为一致的错误。
-    #[cfg(not(windows))]
-    if parsed.host_str().unwrap_or_default().is_empty() && !parsed.path().starts_with('/') {
-        return Err(OpenTargetError::new(
-            "invalid_file_url",
-            "Relative file URLs are not supported; pass a relative filesystem path instead",
-            json!({ "open_target": input }),
         ));
     }
     if !parsed.username().is_empty() || parsed.password().is_some() || parsed.port().is_some() {

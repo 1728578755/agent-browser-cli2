@@ -10,7 +10,7 @@ Tab scanning · Page reading · JS execution · Click and fill · Screenshots / 
   <a href="https://github.com/1728578755/atb-cli"><img src="https://img.shields.io/badge/CLI-atb-2ea44f" alt="CLI atb"></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-green" alt="License MIT"></a>
   <a href="https://github.com/1728578755/atb-cli"><img src="https://img.shields.io/badge/sys-win%2Fmac%2Flinux-0078D6?labelColor=0078D6&color=C0C0C0" alt="sys win/mac/linux"></a>
-  <a href="https://github.com/1728578755/atb-cli/releases"><img src="https://img.shields.io/badge/release-v0.7.2-orange" alt="release v0.7.2"></a>
+  <a href="https://github.com/1728578755/atb-cli/releases"><img src="https://img.shields.io/badge/release-v0.7.3-orange" alt="release v0.7.3"></a>
   <a href="https://github.com/1728578755/atb-cli/pulls"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen" alt="PRs welcome"></a>
 </p>
 
@@ -306,13 +306,13 @@ atb logs --tail 100
 
 | Item | Value |
 | --- | --- |
-| CLI / daemon | `0.7.2` |
+| CLI / daemon | `0.7.3` |
 | CLI ↔ daemon API protocol | `5` |
 | Extension message protocol | `4` |
 | Extension file version | `5.3.0` |
 | Minimum Chrome | `120` |
 
-- Current version: `0.7.2`
+- Current version: `0.7.3`
 - Companion extension: `5.3.0` (display name `ATB`)
 
 ```bash

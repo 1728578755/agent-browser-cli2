@@ -2,14 +2,14 @@
 
 适用对象：希望由编码 Agent 在本机完成 atb 安装、扩展加载、skill 安装与验证的用户。
 
-当前文档对应 CLI `0.7.2`、扩展文件版本 `5.3.0`、CLI ↔ daemon 协议 `5`。版本号以 `package.json` 与 `assets/atb_bridge/manifest.json` 为准；CLI 与扩展独立发版，不要假设两者同号。用 `@latest` 安装时如果装到更新的版本，以 `atb --version` 与 `atb status` 的输出为准。
+当前文档对应 CLI `0.7.3`、扩展文件版本 `5.3.0`、CLI ↔ daemon 协议 `5`。版本号以 `package.json` 与 `assets/atb_bridge/manifest.json` 为准；CLI 与扩展独立发版，不要假设两者同号。用 `@latest` 安装时如果装到更新的版本，以 `atb --version` 与 `atb status` 的输出为准。
 
 ## 复制给 AI 的一段话
 
 ```text
 请在这台机器上安装或升级 atb（仓库 https://github.com/1728578755/atb-cli，npm 包 @g1728578755/atb）。
 
-目标：安装最新版 atb（本文写作时为 CLI 0.7.2、扩展 5.3.0），最低 Chrome/Edge 120，Node >= 18。若实际版本更新，以命令输出为准。
+目标：安装最新版 atb（本文写作时为 CLI 0.7.3、扩展 5.3.0），最低 Chrome/Edge 120，Node >= 18。若实际版本更新，以命令输出为准。
 
 执行要求：
 1. 先做前置检查并告诉我结果：操作系统与 CPU 架构、node -v、npm -v、Chrome/Edge 版本、PATH 上是否已有 atb 及其版本、~/.atb 是否已存在。
@@ -44,7 +44,7 @@ npm install -g @g1728578755/atb@latest
 atb --version
 ```
 
-`atb --version` 应输出 `atb 0.7.2`（或你实际安装的更新版本）。npm 安装会按平台拉取可选依赖子包；平台清单：
+`atb --version` 应输出 `atb 0.7.3`（或你实际安装的更新版本）。npm 安装会按平台拉取可选依赖子包；平台清单：
 
 | 平台 | 预编译 | 说明 |
 | --- | --- | --- |
@@ -191,7 +191,7 @@ atb install-skill
 不经过 AI 的最短路径：
 
 1. 安装 Node 18+ 和 Chrome 120+。
-2. 执行 `npm install -g @g1728578755/atb@latest`，确认 `atb --version` 为 `0.7.2` 或更新版本。
+2. 执行 `npm install -g @g1728578755/atb@latest`，确认 `atb --version` 为 `0.7.3` 或更新版本。
 3. 到 https://github.com/1728578755/atb-cli/releases/latest 下载 `chrome-extensions.zip`，解压到固定目录。
 4. 打开 `chrome://extensions`，开开发者模式，加载解压后的目录（该目录直接含 `manifest.json`），再打开任意一个网页。
 5. 执行 `atb install-skill --dry-run` 确认计划后执行 `atb install-skill`，最后用 `atb tabs`、`atb status`、`atb doctor` 验证（先 `tabs` 拉起 daemon）。
@@ -201,7 +201,7 @@ atb install-skill
 ## 安装清单
 
 - [ ] Node `>=18`、Chrome / Edge `>=120`
-- [ ] `atb --version` 输出 `0.7.2` 或更新版本
+- [ ] `atb --version` 输出 `0.7.3` 或更新版本
 - [ ] `chrome-extensions.zip` 已解压，解压目录下的 `manifest.json` 版本为 `5.3.0`，且与 `background.js` 同层
 - [ ] 扩展已加载，卡片版本与磁盘一致
 - [ ] 至少一个 http/https 页面处于打开状态
