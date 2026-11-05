@@ -3,11 +3,11 @@ use super::*;
 /// 当前标签所属站点的 content-script 匹配模式：`*://host/*`。
 ///
 /// 只在没有显式 `--match` 时用来收窄持久化注入，避免 `net hook --persist`
-/// 把脚本注册到所有网站。
+/// 把脚本注册到所有网站。第二个返回值是「端口未能保留」的告警。
 pub(crate) async fn current_site_match_pattern(
     state: &AppState,
     session_key: &str,
-) -> Option<String> {
+) -> Option<(String, Option<String>)> {
     let driver = state.driver.read().await;
     let url = driver
         .sessions
@@ -15,12 +15,12 @@ pub(crate) async fn current_site_match_pattern(
         .map(|session| session.info.url.clone())
         .unwrap_or_default();
     drop(driver);
-    site_match_pattern(&url)
+    site_match_pattern_with_warning(&url)
 }
 
 /// 从 URL 提取 content-script match pattern；非 http(s) 页面返回 `None`。
 ///
-/// 以前手写切分有两个 bug：`https://example.com?q=1` 会把 query 当成 host，
+/// 以前手写切分有两个 bug（B-10）：`https://example.com?q=1` 会把 query 当成 host，
 /// 生成非法 pattern；`host.starts_with("chrom")` 又会误杀 `chromium.org`。
 /// 现在交给 `url` crate 解析，过滤条件改为按 scheme 判断。
 pub(crate) fn site_match_pattern(raw_url: &str) -> Option<String> {
@@ -40,6 +40,25 @@ pub(crate) fn site_match_pattern(raw_url: &str) -> Option<String> {
         format!("[{host}]")
     };
     Some(format!("*://{host}/*"))
+}
+
+/// 同 [`site_match_pattern`]，额外返回「端口未能保留」的告警。
+///
+/// Chrome 的 match pattern 语法里 host 段不接受 `host:port`（注册时会整条被拒），
+/// 所以端口只能丢弃；丢弃之后 `net hook --persist` 会把同一 host 的**其它端口**
+/// 也一并注入。这条语义无法在 pattern 里表达，只能如实告警，让需要隔离的调用方
+/// 改用 `--match` 显式指定。
+pub(crate) fn site_match_pattern_with_warning(raw_url: &str) -> Option<(String, Option<String>)> {
+    let parsed = url::Url::parse(raw_url).ok()?;
+    let pattern = site_match_pattern(raw_url)?;
+    let warning = parsed.port().map(|port| {
+        format!(
+            "当前页面端口是 {port}，但 Chrome 的 match pattern 不支持端口，持久注入只能按 `{pattern}` 注册；\
+             该 pattern 会同时覆盖同一 host 的其它端口。需要按端口隔离时请用 --match 显式指定，\
+             或改用 `net route --engine cdp`（按 URL 正则拦截，可带端口）"
+        )
+    });
+    Some((pattern, warning))
 }
 
 /// net 配置的键：同一 profile 下的所有标签共用一套规则。
@@ -66,11 +85,11 @@ pub(crate) fn net_config_default() -> Value {
 
 /// 把某个 profile 的 net 配置写入内存并落盘。
 ///
-/// **前提**：调用方已持有 `state.net_persist_lock`（读-改-写串行化）。
+/// **前提**：调用方已持有 `state.net_persist_lock`（的读-改-写串行化）。
 /// 这里不再自己拿锁：`net_value` 在整个「读 → 下发 → 写」期间持锁，若这里再锁一次
 /// 就是自死锁。落盘只带当前 profile 的条目，其余 profile 由后台线程从磁盘读回后合并：
 /// 旧实现克隆**所有** profile（mock body 可达 2MB）再同步写盘，全部发生在
-/// async worker 上，配置一多就会卡住整个 runtime。
+/// async worker 上，配置一多就会卡住整个 runtime（B-13）。
 pub(crate) async fn store_net_config_locked(state: &AppState, profile_key: &str, config: &Value) {
     {
         let mut driver = state.driver.write().await;

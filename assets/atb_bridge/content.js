@@ -6,7 +6,85 @@ if (window.__agentBrowserCliCleanup) window.__agentBrowserCliCleanup();
 // 旧版本在这里装过一个追 TID 元素的 MutationObserver（每个 DOM 变更都跑），
 // 现在这套通道已经废弃，这里保留一次清理调用，把旧注入留下的 observer 停掉。
 if (window.__agentBrowserCliObserverCleanup) window.__agentBrowserCliObserverCleanup();
-document.querySelectorAll('#atb-ind,#atb-style').forEach(e => e.remove());
+
+/**
+ * 清理旧版本残留的角标节点。
+ *
+ * 只在 **top frame** 执行：manifest 里本脚本是 all_frames:true，
+ * 旧实现无条件在每个 iframe 里跑 querySelectorAll('#atb-ind,#atb-style') 并 remove ——
+ * 一是白付一次全文档查询（每个子框架一次），二是如果站点自己在 iframe 里用了
+ * 同名 id（模板/第三方组件），会被我们删掉，属于越界改页面 DOM。
+ * 角标本身只挂在 top frame（见下面 createBadge 的 window.self!==window.top 判断），
+ * 子框架没有任何需要清理的东西。
+ */
+if (window.self === window.top) {
+  try {
+    document.querySelectorAll('#atb-ind,#atb-style').forEach(e => e.remove());
+  } catch (_) {}
+}
+
+/**
+ * 补做 persist_boot.js 没送达的持久注入。
+ *
+ * document_start 阶段 SW 常常还在启动（或刚被回收），persist-apply 消息会失败；
+ * persist_boot 已本地重试 2 次，仍失败时把「URL → 条目名」写进
+ * storage.local.persistBootPending。本脚本（document_idle）在这里按当前 URL 补发一次：
+ *   * 条目名 → 从 persistInjections 取回代码（不在 pending 里存第二份代码）；
+ *   * 成功（ok 且 applied 全部 ok）才删标记；
+ *   * 超过 PERSIST_PENDING_TTL_MS 的标记一律清掉，避免长期堆积。
+ * 每个 frame 只关心自己的 URL：persist_boot 注册时是 allFrames:false，只有 top frame
+ * 会写这个标记，因此补发也只在 top frame 执行（否则每个 iframe 都要打一次 storage）。
+ */
+const PERSIST_PENDING_TTL_MS = 10 * 60 * 1000;
+
+async function flushPersistPending() {
+  try {
+    const session = globalThis.chrome;
+    if (!session?.storage?.local || !session?.runtime?.sendMessage) return;
+    const store = await session.storage.local.get({ persistBootPending: {}, persistInjections: {} });
+    const all = store.persistBootPending && typeof store.persistBootPending === 'object'
+      ? store.persistBootPending
+      : null;
+    if (!all) return;
+    const url = location.href;
+    const now = Date.now();
+    let dirty = false;
+    for (const key of Object.keys(all)) {
+      const item = all[key];
+      if (!item || typeof item !== 'object' || !(now - Number(item.at || 0) <= PERSIST_PENDING_TTL_MS)) {
+        delete all[key];
+        dirty = true;
+      }
+    }
+    const pending = all[url];
+    const table = store.persistInjections && typeof store.persistInjections === 'object'
+      ? store.persistInjections
+      : {};
+    const entries = pending && Array.isArray(pending.names)
+      ? pending.names
+        .map((name) => (table[name] && table[name].code
+          ? { name, code: table[name].code, world: table[name].world || 'MAIN' }
+          : null))
+        .filter(Boolean)
+      : [];
+    if (!entries.length) {
+      if (dirty) await session.storage.local.set({ persistBootPending: all });
+      return;
+    }
+    const resp = await session.runtime.sendMessage({ type: 'persist-apply', entries });
+    const applied = Array.isArray(resp?.applied) ? resp.applied : [];
+    const failed = applied.filter((one) => one && one.ok !== true);
+    if (resp?.ok === true && !failed.length) {
+      delete all[url];
+      dirty = true;
+    }
+    if (dirty) await session.storage.local.set({ persistBootPending: all });
+  } catch (_) {
+    // 补发失败不能影响页面本身；标记留着，下次导航继续尝试（TTL 到期自动清）。
+  }
+}
+
+if (window.self === window.top) flushPersistPending();
 
 /**
  * Render a right-side floating badge that reflects the real bridge connection status.
@@ -22,15 +100,19 @@ document.querySelectorAll('#atb-ind,#atb-style').forEach(e => e.remove());
 
   // 宿主 id 用中性名字：旧 id 本身就是现成的自动化指纹，不再复用。
   const HOST_ID='atb-status-host';
-  // 角标状态刷新策略（E1-15：注释按实现写，不再宣称「纯事件驱动」）。
+  // 角标状态刷新策略（注释按实现写，不再宣称「纯事件驱动」）。
   //
   // 早期版本每个 top frame 每 5s 无条件发一条 runtime 消息，等于把 MV3 的 Service Worker
   // 钉在常驻状态（30s 无活动才允许回收），多标签用户既费电也让 SW 生命周期失去意义。
-  // 现在的行为：
-  //   1) 页面隐藏时完全不轮询（visibilitychange 直接把定时器停掉）；
-  //   2) 「页面可见 / 窗口获得焦点 / bfcache 恢复」这几个事件上各探一次；
-  //   3) 角标**正在显示**期间保留一个 30s 的低频轮询，角标一隐藏立刻停掉；
-  //   4) 点关闭按钮后立刻停轮询，不等下一个 tick。
+  //
+  // 现在的行为（修订）：
+  //   1) 轮询与**渲染**解耦：只要角标实例还在且没被用户手动关闭，就保留一个 30s 的
+  //      低频状态刷新；是否真的显示由「最近 10s 内有没有命令」决定；
+  //   2) 旧实现用「当前是否可见」控制是否轮询 —— 角标因 10s 无命令而隐藏后轮询就停了，
+  //      下一次命令若没触发 visibility/focus（后台标签页、脚本直接下发），就再也没人
+  //      把它点亮，只能等用户切标签页（自恢复死锁）；
+  //   3) 「页面可见 / 窗口获得焦点 / bfcache 恢复」各立即探一次；
+  //   4) 点关闭按钮后立刻停轮询（用户明确不想看），断开重连时重置 dismissed。
   //
   // 3) 为什么不能省：连接状态只有 background 侧知道，而 chrome.runtime.sendMessage 是
   // 「请求-响应」通道；目前唯一的反向通道是 popup 广播的 badgeConfig（只带配置、不带状态）。
@@ -96,7 +178,9 @@ document.querySelectorAll('#atb-ind,#atb-style').forEach(e => e.remove());
     let lastTop = Math.round(window.innerHeight * 0.4);
     d.style.top = lastTop + 'px';
     /**
-     * Show the badge only when the bridge is really connected.
+     * 只更新状态与**渲染**，不碰定时器。
+     * 显示条件：已连接 + 用户没手动关闭 + 最近 10s 内有命令。
+     * 隐藏不等于「不轮询」—— 轮询由 ensurePolling 独立维持。
      */
     function setBadgeState(connected, detail, lastCommandAt) {
       // 手动关闭只在当前连接周期生效；断开后下次重新连接会再次显示。
@@ -109,6 +193,8 @@ document.querySelectorAll('#atb-ind,#atb-style').forEach(e => e.remove());
       label.textContent = 'agent_browser_cli: 已连接';
       d.dataset.connected = connected ? '1' : '0';
       d.dataset.detail = detail || '';
+      // 被手动关闭后不再重开轮询（setInterval 在 close 事件里已停掉）。
+      if (!dismissed) ensurePolling();
     }
     function setExpanded(expanded) {
       d.dataset.expanded = expanded ? '1' : '0';
@@ -127,8 +213,8 @@ document.querySelectorAll('#atb-ind,#atb-style').forEach(e => e.remove());
       } catch (e) {
         setBadgeState(false, (e && e.message) || '', 0);
       }
-      // 状态更新后同步定时器：角标一隐藏就停掉，避免页面可见时空转轮询。
-      syncPolling();
+      // 注意：这里**不再**根据可见性启停轮询（见 ensurePolling 的注释）。
+      ensurePolling();
     }
     d.addEventListener('mouseenter', () => {
       if (collapseTimer) clearTimeout(collapseTimer);
@@ -172,29 +258,31 @@ document.querySelectorAll('#atb-ind,#atb-style').forEach(e => e.remove());
     };
     window.addEventListener('resize', onResize);
     (document.body||document.documentElement).appendChild(host);
-    setBadgeState(false, '');
     let refreshTimer = null;
-    function badgeVisible() {
-      return d.style.display !== 'none' && !document.hidden;
-    }
     function stopPolling() {
       if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; }
     }
-    function syncPolling() {
-      if (badgeVisible()) {
-        if (!refreshTimer) refreshTimer = setInterval(refreshBadgeState, BADGE_POLL_MS);
-      } else {
-        stopPolling();
-      }
+    /**
+     * 轮询与显示解耦：只要角标实例还在、且没被用户手动关闭，就一直保留
+     * 30s 的低频状态刷新；**是否渲染**由 setBadgeState 里的 activeRecently 决定。
+     * 旧实现按「当前是否可见」启停轮询：角标因 10s 无命令而隐藏后轮询就停了，
+     * 下一次命令若没有触发 visibility/focus（后台标签页 / 脚本直接下发的命令），
+     * 就再也没人把它点亮 —— 只能等用户切标签页，属于自恢复死锁。
+     */
+    function ensurePolling() {
+      if (refreshTimer || dismissed) return;
+      refreshTimer = setInterval(refreshBadgeState, BADGE_POLL_MS);
     }
     async function probeAndSync() {
-      if (document.hidden) { stopPolling(); return; }
       await refreshBadgeState();
     }
     function onVisibilityChange() {
-      if (document.hidden) { stopPolling(); return; }
+      // 页面回到可见时立即刷新一次：后台期间的命令此刻才看得到。
+      // 隐藏时不做事（轮询本身继续跑，浏览器会把 30s 定时器节流到分钟级）。
+      if (document.hidden) return;
       probeAndSync();
     }
+    setBadgeState(false, '');
     document.addEventListener('visibilitychange', onVisibilityChange);
     window.addEventListener('focus', probeAndSync);
     window.addEventListener('pageshow', probeAndSync);

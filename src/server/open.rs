@@ -15,6 +15,11 @@ pub(crate) struct OpenRequestExt {
     /// 打开前先 ping 一次扩展，唤醒 service worker。
     #[serde(default)]
     pub(crate) warm: bool,
+    /// `--wait-for` 的等待预算（秒）。CLI 已按它扩了 HTTP 预算，
+    /// 服务端必须用**同一个**字段，否则「服务端还在等、CLI 先断开」的旧问题依旧。
+    /// 缺省时回落到 `readiness_timeout`（旧口径）。
+    #[serde(default)]
+    pub(crate) wait_for_timeout: Option<f64>,
 }
 
 pub(crate) async fn open_tab(
@@ -23,6 +28,9 @@ pub(crate) async fn open_tab(
 ) -> Json<Value> {
     touch(&state).await;
     let wait_for = req.wait_for.clone();
+    // 等待预算在 CLI 已算进 HTTP 超时，这里必须读同一个字段；
+    // 没有该字段（旧 CLI）时回落到 `readiness_timeout`。
+    let wait_for_timeout = req.wait_for_timeout;
     if req.warm {
         warm_up_extension(&state).await;
     }
@@ -30,7 +38,7 @@ pub(crate) async fn open_tab(
     let extra_targets = req.targets.clone();
     let started = Instant::now();
     if extra_targets.len() > 1 {
-        let mut value = open_many(&state, req, wait_for).await;
+        let mut value = open_many(&state, req, wait_for, wait_for_timeout).await;
         // 统一返回：多 URL 的旧字段（tabs/count/failed/elapsed_ms）原样保留，
         // 额外补一份顶层 targets（url/tab_id/ok/error/ready/elapsed_ms）。
         // 旧脚本继续读 tabs 不受影响；新调用方单/多 URL 只认 targets 一套解析。
@@ -48,7 +56,7 @@ pub(crate) async fn open_tab(
                         "ok": entry.get("ok").cloned().unwrap_or(Value::Null),
                         "error": entry.get("error").cloned().unwrap_or(Value::Null),
                         "ready": entry.get("ready").cloned().unwrap_or(Value::Null),
-                        // S1-04：两条路径的 targets 形状保持一致（单 URL 那条也带这两个字段）。
+                        // 两条路径的 targets 形状保持一致（单 URL 那条也带这两个字段）。
                         "refresh_error": entry.get("refresh_error").cloned().unwrap_or(Value::Null),
                         "refresh_error_code": entry
                             .get("refresh_error_code")
@@ -67,7 +75,7 @@ pub(crate) async fn open_tab(
         single.target = Some(target.clone());
         single.url = Some(target);
     }
-    let result = open_single(&state, single, true, wait_for.as_deref()).await;
+    let result = open_single(&state, single, true, wait_for.as_deref(), wait_for_timeout).await;
     // 统一返回：单 URL 旧形状 {"ok":true,"result":{...}} 的所有字段不动，
     // 顶层补 count=1 与 targets=[...]。以前单/多 URL 是两套 JSON 形状，调用方
     // 必须先数 targets 长度再选解析器；现在两边的 targets 字段结构一致。
@@ -85,7 +93,7 @@ pub(crate) async fn open_tab(
             .or_else(|| result.get("error").cloned())
             .unwrap_or(Value::Null),
         "ready": entry.get("ready").cloned().unwrap_or(json!(false)),
-        // S1-04：标签已开但会话没注册上时，`open_single` 会把刷新失败原因写进 result，
+        // 标签已开但会话没注册上时，`open_single` 会把刷新失败原因写进 result，
         // 这里透传到统一的 targets 形状（多 URL 走 open_many 的条目，两条路径字段一致）。
         "refresh_error": entry.get("refresh_error").cloned().unwrap_or(Value::Null),
         "refresh_error_code": entry
@@ -126,7 +134,7 @@ async fn warm_up_extension(state: &AppState) {
 /// 否则下一条命令找不到新标签；批量打开时交给 `open_many` 收尾统一拉一次，
 /// 否则 N 个并发打开会各自排队刷新，把并发收益吃掉。
 ///
-/// `wait_for`：`--wait-for` 条件（dom-quiet / selector: / text:；
+/// `wait_for`： `--wait-for` 条件（dom-quiet / selector: / text:；
 /// `networkidle` 作为 dom-quiet 的兼容别名）。
 /// 打开并注册会话成功后继续等条件满足；条件未满足时该目标 ok:false，
 /// error_code 取真实病因（wait_for_timeout / invalid_wait_for / extension_unavailable），
@@ -136,6 +144,27 @@ pub(crate) async fn open_single(
     req: OpenRequest,
     refresh_ready: bool,
     wait_for: Option<&str>,
+    wait_for_timeout: Option<f64>,
+) -> Value {
+    // 清理失效默认是「为了让本次 open 能选中执行者会话」的前置动作，属于
+    // 有副作用的状态改写。旧实现清理后所有 early-return（目标解析失败 / 就绪超时 /
+    // 扩展报错）都不回滚，用户只是想让 open 失败一次，默认目标却被永久清掉了。
+    // 现在把原值快照下来，只有 open 真正成功才保留清理结果。
+    let forgotten = forget_stale_agent_default(state, &current_agent()).await;
+    let value = open_single_inner(state, req, refresh_ready, wait_for, wait_for_timeout).await;
+    let succeeded = value.get("ok").and_then(Value::as_bool).unwrap_or(false);
+    if !succeeded {
+        restore_agent_default(state, forgotten).await;
+    }
+    value
+}
+
+async fn open_single_inner(
+    state: &AppState,
+    req: OpenRequest,
+    refresh_ready: bool,
+    wait_for: Option<&str>,
+    wait_for_timeout: Option<f64>,
 ) -> Value {
     // 先把挑战参数取出来：后面的 `req.group_title.or(req.session)` 会部分移动 req。
     let challenge_mode = req
@@ -149,12 +178,12 @@ pub(crate) async fn open_single(
     let open_active = req.active;
     // 默认标签被关掉后 `open` 仍必须可用：先清掉本调用方已失效的默认目标，
     // 否则 select_tab 会按 报 target_lost（e2e 的 cleanup → open 序列会卡住）。
-    forget_stale_agent_default(state, &current_agent()).await;
+    // 清理的快照/回滚由外层 `open_single` 负责。
     let target = match resolve_request_target(req.target.as_deref(), req.url.as_deref()) {
         Ok(target) => target,
         Err(err) => return open_target_error_json(err),
     };
-    let resolved = match resolve_open_target(target, req.cwd.as_deref()) {
+    let resolved = match resolve_open_target_compat(target, req.cwd.as_deref()) {
         Ok(resolved) => resolved,
         Err(err) => return open_target_error_json(err),
     };
@@ -331,7 +360,7 @@ pub(crate) async fn open_single(
     }
     if !ready && refresh_ready {
         if let Some(key) = expected_session_key.as_deref() {
-            // S1-04：刷新失败以前被 `let _ =` 整段吞掉，`ready:false` 没有任何原因可查
+            // 刷新失败以前被 `let _ =` 整段吞掉，`ready:false` 没有任何原因可查
             // （调用方只能看到「标签打开了但不可操作」，分不清扩展断连还是刷新超时）。
             // 这里保留最后一次失败文本，三次都失败后挂到该 target 上；`ok` 语义不变。
             let mut last_refresh_error: Option<String> = None;
@@ -397,6 +426,9 @@ pub(crate) async fn open_single(
     }
     if let Some(object) = result.as_object_mut() {
         object.insert("ready".to_string(), json!(ready));
+        // 回显当前隔离档位。`legacy` 下具名 agent 仍会回退到全局默认，
+        // 调用方只有看到这个字段才知道「没有自己默认目标时可能落到别人的标签」。
+        object.insert("isolation".to_string(), json!(session_isolation_label()));
     }
     // 落在挑战页上时默认等站点自己放行；正常页面靠标题判别直接跳过，不付额外往返。
     if challenge_mode != "off" && ready {
@@ -423,14 +455,17 @@ pub(crate) async fn open_single(
     // 跳转到真实页面，先等挑战再等条件才符合「打开后内容可用」的直觉。
     // 不带 --wait-for 时这段完全不执行，输出与旧版逐字节一致。
     let mut wait_outcome: Option<Value> = None;
+    let wait_budget = effective_wait_for_timeout(wait_for, wait_for_timeout, req.readiness_timeout);
     if let Some(cond) = wait_for {
         wait_outcome = Some(match expected_session_key.as_deref() {
-            Some(key) if ready => run_wait_for(state, key, cond, req.readiness_timeout).await,
+            Some(key) if ready => run_wait_for(state, key, cond, wait_budget).await,
             _ => json!({
                 "condition": cond,
                 "matched": false,
                 "error_code": "wait_for_timeout",
                 "error": "标签页未能就绪，等待条件未执行（open 本身已失败或超时）",
+                "timeout_sec": wait_budget,
+                "waited_ms": 0,
             }),
         });
         let matched = wait_outcome
@@ -472,6 +507,27 @@ pub(crate) async fn open_single(
             .unwrap_or(Value::Null);
     }
     response
+}
+
+/// `--wait-for` 的实际等待预算（秒）。
+///
+/// 优先用 CLI 下发的 `wait_for_timeout`——CLI 已经按同一个值扩了 HTTP 超时，
+/// 服务端若仍用旧口径（`readiness_timeout`），就会出现「服务端还在等、CLI 先断开」。
+/// 夹到 `[0.5, settings::wait_max_total_sec()]`；没有该字段（旧 CLI / 直接打 API）
+/// 时回落到 `readiness_timeout`，行为与修复前一致。非有限值视为未提供。
+fn effective_wait_for_timeout(
+    wait_for: Option<&str>,
+    wait_for_timeout: Option<f64>,
+    readiness_timeout: f64,
+) -> f64 {
+    if wait_for.is_none() {
+        // 没有 --wait-for 时这个预算不会被消费，保持原值，避免影响其它分支。
+        return readiness_timeout;
+    }
+    match wait_for_timeout.filter(|value| value.is_finite()) {
+        Some(value) => value.clamp(0.5, crate::settings::wait_max_total_sec()),
+        None => readiness_timeout,
+    }
 }
 
 /// --wait-for 条件的 JS 字符串字面量转义：选择器/文本是调用方给的任意字符串，
@@ -548,7 +604,7 @@ async fn run_wait_for(state: &AppState, session_key: &str, cond: &str, timeout: 
         },
     };
     let elapsed_ms = started.elapsed().as_millis() as u64;
-    match outcome {
+    let mut value = match outcome {
         WaitOutcome::Matched => json!({
             "condition": cond,
             "matched": true,
@@ -582,7 +638,14 @@ async fn run_wait_for(state: &AppState, session_key: &str, cond: &str, timeout: 
             "wait_for_error": message.clone(),
             "elapsed_ms": elapsed_ms,
         }),
+    };
+    if let Some(object) = value.as_object_mut() {
+        // 把「实际等了多久」与「本次预算」一起回显。CLI 与服务端现在
+        // 用同一个 `wait_for_timeout` 算超时，这里回显预算便于核对两侧是否一致。
+        object.insert("waited_ms".to_string(), json!(elapsed_ms));
+        object.insert("timeout_sec".to_string(), json!(timeout));
     }
+    value
 }
 
 /// selector / text 条件：复用 daemon 侧轮询等待，并按错误形态分类。
@@ -757,12 +820,13 @@ async fn run_dom_quiet_once(state: &AppState, session_key: &str, budget: Duratio
 /// 与「CLI 起 N 个线程各发一次请求」相比，这里只占一个 HTTP 往返，
 /// 也避免 N 个请求各自去争同一把会话锁。
 ///
-/// `wait_for`：`--wait-for` 条件，逐个目标在 `open_single` 里等待；
+/// `wait_for`： `--wait-for` 条件，逐个目标在 `open_single` 里等待；
 /// 某个目标等不到只把该目标标成 ok:false + wait_for_timeout，其余目标照常。
 pub(crate) async fn open_many(
     state: &AppState,
     req: OpenRequest,
     wait_for: Option<String>,
+    wait_for_timeout: Option<f64>,
 ) -> Value {
     let started = Instant::now();
     let targets = req.targets.clone();
@@ -778,11 +842,11 @@ pub(crate) async fn open_many(
         let permits = semaphore.clone();
         // task-local 不随 `spawn` 继承：不套 `with_agent` 的话，这批并发打开的标签
         // 会全部记到 `"default"` 名下——默认目标写到别人的 agent 上，`cleanup` 也
-        // 收不到自己开的页面。`multi.rs` / `run.rs` 都是这么包的。
+        // 收不到自己开的页面（X-13）。`multi.rs` / `run.rs` 都是这么包的。
         let agent = current_agent();
         let wait_for = wait_for.clone();
         set.spawn(with_agent(agent, async move {
-            // S1-05：`acquire_owned().await.ok()` 会把 Err 吞成 None，然后**没有许可也照常
+            // `acquire_owned.await.ok` 会把 Err 吞成 None，然后**没有许可也照常
             // 打开**——并发上限直接失效（一批几十个目标同时压浏览器）。这里改成显式
             // 失败：该目标标记 `concurrency_closed`，绝不无许可继续执行。
             let _permit = match permits.acquire_owned().await {
@@ -806,7 +870,7 @@ pub(crate) async fn open_many(
             // 逐目标计时：顶层 targets 的 elapsed_ms 要能回答「哪一个慢」，旧实现
             // 只有整批 elapsed_ms，定位慢页面还得逐个再测。
             let started = Instant::now();
-            let value = open_single(&state, single, false, wait_for.as_deref()).await;
+            let value = open_single(&state, single, false, wait_for.as_deref(), wait_for_timeout).await;
             (index, target, value, started.elapsed().as_millis() as u64)
         }));
     }
@@ -838,7 +902,7 @@ pub(crate) async fn open_many(
         })
         .collect();
     let mut active_keys: HashSet<String> = HashSet::new();
-    // S1-04：收尾刷新失败以前被 `let _ =` 吞掉，落单的目标只剩 `ready:false`，
+    // 收尾刷新失败以前被 `let _ =` 吞掉，落单的目标只剩 `ready:false`，
     // 没有任何原因可查。这里保留最后一次失败文本/归类，挂到仍未就绪的条目与顶层。
     let mut last_refresh_error: Option<String> = None;
     for attempt in 0..3 {
@@ -921,7 +985,7 @@ pub(crate) async fn open_many(
         if !ok {
             if !wait_matched {
                 // 条件未满足：错误信息以 wait_for 的为准（里面写了是哪个条件、等多久），
-                // error_code 也用内层的真实病因（：invalid_wait_for /
+                // error_code 也用内层的真实病因（invalid_wait_for /
                 // extension_unavailable / wait_for_timeout 不能一律压成超时）。
                 entry["error"] = wait_info
                     .get("error")
@@ -939,7 +1003,7 @@ pub(crate) async fn open_many(
                 }
             }
         }
-        // S1-04：这一条没就绪、并且收尾刷新确实失败过时，把失败原因挂到该条目上
+        // 这一条没就绪、并且收尾刷新确实失败过时，把失败原因挂到该条目上
         // （每条一个 `refresh_error`，`ok`/`error` 语义不变）。
         let refresh_message = if ready {
             None
@@ -973,7 +1037,7 @@ pub(crate) async fn open_many(
     })
 }
 
-/// 收尾刷新失败的归类（S1-04）：`ready:false` 必须能说明是「等超时」还是「扩展不可用」。
+/// 收尾刷新失败的归类：`ready:false` 必须能说明是「等超时」还是「扩展不可用」。
 ///
 /// 不能靠错误类型区分——`refresh_tabs_via_extension` 的失败全部是 `anyhow` 文本
 /// （超时分支自己拼的中文、扩展侧回包的英文……），所以只能按文本归类，
@@ -1000,6 +1064,42 @@ pub(crate) fn refresh_error_code(message: &str) -> &'static str {
         return "extension_unavailable";
     }
     "refresh_failed"
+}
+
+/// `open` 可以直接交给浏览器的特殊 scheme。
+///
+/// `resolve_open_target` 只放行 http/https/file，`about:blank`、`chrome://settings`、
+/// `data:`、`view-source:` 一律报 `unsupported_scheme`——但浏览器本身都能打开它们，
+/// CLI 的「空白页」语义也依赖 `about:blank`。这些值**不做任何 URL 归一化**：
+/// 原样作为 `navigation_url` 交给扩展，避免 `url` crate 把 `chrome://` 改写成 http。
+fn special_scheme_open_target(input: &str) -> Option<crate::open_target::ResolvedOpenTarget> {
+    let trimmed = input.trim();
+    let (scheme, rest) = trimmed.split_once(':')?;
+    if !matches!(
+        scheme.to_ascii_lowercase().as_str(),
+        "about" | "chrome" | "data" | "view-source"
+    ) {
+        return None;
+    }
+    // `about:` / `chrome:` 这种空载荷仍交给原解析器，报出更准确的参数错误。
+    if rest.is_empty() {
+        return None;
+    }
+    Some(crate::open_target::ResolvedOpenTarget {
+        navigation_url: trimmed.to_string(),
+        kind: TargetKind::Web,
+    })
+}
+
+/// 先放行特殊 scheme，其余一律走原有解析（含 cwd 校验、file:// 与相对路径语义）。
+fn resolve_open_target_compat(
+    input: &str,
+    cwd: Option<&std::path::Path>,
+) -> Result<crate::open_target::ResolvedOpenTarget, OpenTargetError> {
+    if let Some(resolved) = special_scheme_open_target(input) {
+        return Ok(resolved);
+    }
+    resolve_open_target(input, cwd)
 }
 
 pub(crate) fn resolve_request_target<'a>(
@@ -1182,6 +1282,10 @@ pub(crate) fn derive_session_key(
     executor_session_key: &str,
     opened_tab_id: &str,
 ) -> Option<String> {
+    // 解析侧必须用 `splitn(3, ...)`（而不是 `split`）才能兼容旧值——
+    // 旧版本可能把含 `:` 的 browser_id/profile_id 原样拼进来，多切一刀就会把
+    // tabId 当成 profile 的一部分。分量再做一次白名单净化，保证拼出来的新 key
+    // 与 `apply_tabs_snapshot` 侧的净化规则一致。
     let mut parts = executor_session_key.splitn(3, ':');
     let browser_id = parts.next()?;
     let profile_id = parts.next()?;
@@ -1190,8 +1294,55 @@ pub(crate) fn derive_session_key(
         return None;
     }
     Some(crate::protocol::make_session_key(
-        browser_id,
-        profile_id,
+        &sanitize_identity_component(browser_id),
+        &sanitize_identity_component(profile_id),
         opened_tab_id,
     ))
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    /// `about:` / `chrome:` / `data:` / `view-source:` 原样交给扩展，
+    /// 不做 URL 归一化（`chrome://` 一旦被改写成 http 就再也打不开）。
+    #[test]
+    fn special_schemes_are_passed_through_unmodified() {
+        for raw in [
+            "about:blank",
+            "chrome://settings",
+            "data:text/html,<b>x</b>",
+            "view-source:https://example.com",
+        ] {
+            let resolved = resolve_open_target_compat(raw, None).expect(raw);
+            assert_eq!(resolved.navigation_url, raw);
+            assert!(matches!(resolved.kind, TargetKind::Web));
+        }
+        // 空载荷仍走原解析器报参数错误，而不是拼一个 `about:` 出去。
+        assert!(resolve_open_target_compat("about:", None).is_err());
+        // 普通 scheme 不受影响：与直接调用原解析器的结果逐字相同
+        // （不写死归一化后的形态，避免测试绑定 url crate 的细节）。
+        assert_eq!(
+            resolve_open_target_compat("https://example.com", None)
+                .map(|resolved| resolved.navigation_url)
+                .unwrap_or_default(),
+            resolve_open_target("https://example.com", None)
+                .map(|resolved| resolved.navigation_url)
+                .unwrap_or_default()
+        );
+    }
+
+    /// 身份分量只留 `[A-Za-z0-9._-]`，空值补 `unknown`。
+    /// 含 `:` 的值必须被替换掉，否则 `session_key` 的分段解析会错位。
+    #[test]
+    fn identity_components_are_sanitized() {
+        assert_eq!(sanitize_identity_component("br:1"), "br_1");
+        assert_eq!(sanitize_identity_component("   "), "unknown");
+        assert_eq!(sanitize_identity_component(""), "unknown");
+        assert_eq!(
+            sanitize_identity_component("Edge.Beta-1_2"),
+            "Edge.Beta-1_2"
+        );
+        assert!(!sanitize_identity_component("a:b").contains(':'));
+    }
 }

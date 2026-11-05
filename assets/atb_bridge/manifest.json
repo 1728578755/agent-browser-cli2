@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ATB",
-  "version": "5.2.9",
+  "version": "5.3.0",
   "description": "Bridge for atb: read pages, click, fill, screenshot, inspect network.",
   "minimum_chrome_version": "120",
   "permissions": [
@@ -14,8 +14,6 @@
     "alarms",
     "storage",
     "declarativeNetRequest",
-    "management",
-    "contentSettings",
     "webNavigation",
     "downloads"
   ],
@@ -31,7 +29,6 @@
         "<all_urls>"
       ],
       "js": [
-        "config.js",
         "content.js"
       ],
       "run_at": "document_idle",

@@ -1,8 +1,22 @@
-
+// 挑战页 / 验证码识别与等待（page_challenge.js）。
+//
+// ---- world 与入口（代码侧注记）----
+// 本文件跑在 **MAIN world**（background.js 的 PAGE_OP_WORLD 决策表：challenge → MAIN）。
+// 原因：判定依赖站点自己挂在页面 window 上的全局 —— `window.turnstile`、
+// `window._cf_chl_opt`、hCaptcha 的 `__hcaptcha_cfg`。ISOLATED world 有独立的
+// window，读这些全局永远是 undefined，回退路径会稳定报「没有挑战」。
+// 代价是入口 `window.__abcChallenge` 对页面可见，因此必须：
+//   * 不可枚举（Object.keys(window) / for...in 看不到）；
+//   * 可配置（`delete window.__abcChallenge` 必须成功，否则 stealth scrub 永远
+//     报 remaining 里还有它）。
+// 这两条靠文件末尾的 defineProperty 挂载实现；整个文件包在 IIFE 里，
+// 不再使用顶层 `function __abcChallenge(){}`（classic script 里那是不可删除的
+// 全局绑定，且可枚举）。
+//
 // 识别方式：标题关键词 + 特征 DOM + 脚本/iframe 来源 + 少量正文兜底。
 // 全部走 querySelector / document.scripts；只有正文兜底会遍历文本，且累计 2000 字符即停。
-function __abcChallenge(opts) {
-  opts = opts || {};
+;(function () {
+function __abcChallenge(opts) {  opts = opts || {};
   const action = String(opts.action || 'status').toLowerCase();
   const now = () => (typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now());
 
@@ -40,7 +54,7 @@ function __abcChallenge(opts) {
   ///
   /// 不能用 `cdn-cgi/challenge-platform` 当判据：CF 会给**每一个**受保护站点注入
   /// `/cdn-cgi/challenge-platform/h/b/scripts/jsd/main.js`（隐形探测信标），
-  /// 正常页面也带它。拿它判拦截，等于把 kick.com 这种已放行的站点永远当拦截页，
+  /// 正常页面也带它。拿它判拦截，等于把 已放行的站点永远当拦截页，
   /// wait 会一直等到超时（实测 30s 白等，页面其实早已正常渲染）。
   ///
   /// 真正的挑战页加载的是 orchestrate 下的编排脚本（chl_page / managed / challenge），
@@ -57,8 +71,31 @@ function __abcChallenge(opts) {
   }
 
   /// CF 硬拦截页（"Sorry, you have been blocked"）：等多久都没用，不是「自动放行」类。
-  function isHardBlock() {
-    if (has('.cf-error-details') || has('#cf-error-details')) return true;
+  ///
+  /// 旧判据只要正文里出现 "access denied" 就算硬拦截 —— 普通 403
+  /// （自建站 / Nginx 默认页 / Akamai 的拒绝页）全被归因成「CF 硬拦截」，
+  /// hint 直接把用户引向「换出口 IP」，排查方向整体跑偏。
+  /// 现在必须叠加 **CF 专属证据**：
+  ///   * `.cf-error-details` / `#cf-error-details` / `[id^="cf-error"]` 容器；
+  ///   * 页脚 "Cloudflare Ray ID:（CF 错误页必带，普通 403 不会出现）。
+  /// 页面 JS 读不到响应头，`cf-ray` header 这条证据只能由 daemon 侧补充。
+  const CF_RAY_TEXT = /cloudflare ray id/i;
+  function cfBlockEvidence() {
+    const evidence = [];
+    try {
+      if (document.querySelector('.cf-error-details, #cf-error-details')) evidence.push('cf-error-details');
+      else if (document.querySelector('[id^="cf-error"], [class*="cf-error-details"]')) evidence.push('cf-error-container');
+    } catch (_) {}
+    if (evidence.length) return evidence;
+    // 没有错误容器时才去扫正文（最多 4000 字符，只在前半段找脚注）。
+    let text = '';
+    try { text = String((document.body && document.body.textContent) || '').slice(0, 4000); } catch (_) { text = ''; }
+    if (text && CF_RAY_TEXT.test(text)) evidence.push('cf-ray-id-footer');
+    return evidence;
+  }
+
+  /// 普通「看起来像被拦」的正文判据：只用于判断要不要继续等，不再单独决定 hard_block。
+  function blockTextHit() {
     try {
       const text = String((document.body && document.body.textContent) || '').slice(0, 4000);
       return /you have been blocked|has been blocked|access denied|error 1020|error 1015/i.test(text);
@@ -201,8 +238,11 @@ function __abcChallenge(opts) {
     return true;
   }
   let lastTextScanAt = 0;
-  // 命中后保持粘性：否则被节流跳过的那次判断会把「拦截页」误判成「已放行」。
-  let bodyTextMatched = false;
+  // 正文粘性：旧实现命中一次后 bodyTextMatched 永不复位 ——
+  // 同一次 wait 里页面已经从拦截页放行成正常页，后面每次 detect() 都还带着
+  // 「body-text 命中」的结论（配合 1s 节流，甚至盖过真正的放行信号）。
+  // 现在粘性绑定「URL + 最近一次扫描的正文摘要」：两者任一变化就重新判定。
+  let bodyTextScan = { url: '', digest: '', matched: false };
 
   function mayScanBodyText() {
     const at = now();
@@ -230,6 +270,28 @@ function __abcChallenge(opts) {
       }
     } catch (_) {}
     return out.length > limit ? out.slice(0, limit) : out;
+  }
+
+  /// 轻量摘要：长度 + 首尾片段。够区分「换了一页」，又不用把 2000 字符存两份。
+  function bodyTextDigest(head) {
+    const text = String(head || '');
+    return text.length + '|' + text.slice(0, 96) + '|' + text.slice(-48);
+  }
+
+  /// 当前页面的正文是否命中挑战文案。
+  /// 节流窗口内沿用上一次结论（避免每 250ms 序列化一遍正文），
+  /// 但 URL 一变立刻作废：SPA 换路由不重载是常态，旧结论不能跨路由粘住。
+  function bodyTextMatches() {
+    const url = String(location.href || '');
+    if (bodyTextScan.url !== url) bodyTextScan = { url: url, digest: '', matched: false };
+    if (!mayScanBodyText()) return bodyTextScan.matched;
+    const head = bodyTextHead(TEXT_SCAN_LIMIT);
+    const digest = bodyTextDigest(head);
+    if (digest !== bodyTextScan.digest) {
+      bodyTextScan.digest = digest;
+      bodyTextScan.matched = BODY_TEXT_HINT.test(head);
+    }
+    return bodyTextScan.matched;
   }
 
   function detect() {
@@ -264,7 +326,10 @@ function __abcChallenge(opts) {
     }
 
     // 先把「等也没用」的硬拦截判掉，避免 wait 把 30s 预算全耗在一个死页上。
-    const hardBlock = isHardBlock() && (!!vendor || /attention required|access denied|blocked/i.test(title));
+    // 硬拦截必须有 CF 专属证据，普通 403 只记 blocked，不判 hard_block。
+    const blockEvidence = cfBlockEvidence();
+    const hardBlock = blockEvidence.length > 0;
+    if (hardBlock) signals.push('cf-block-evidence:' + blockEvidence.join(','));
 
     // Cloudflare 的 JS 挑战页（会自动放行，值得等）
     if (has('#cf-challenge-running') || has('#challenge-form') || has('#challenge-stage') || has('#cf-please-wait')) {
@@ -272,7 +337,7 @@ function __abcChallenge(opts) {
     }
     // 注意：这里**只能**用「看得见的拦截页证据」判定 blocking。
     // CF 会在正常页面上也预置 `_cf_chl_opt` 引导对象、也注入 challenge-platform 脚本，
-    // 拿它们当判据会把已放行的站点永久判成拦截页（实测 kick.com 放行后仍报 blocking=true，
+    // 拿它们当判据会把已放行的站点永久判成拦截页（实测已放行站点仍报 blocking=true，
     // challenge wait 白等 30s）。真正还在拦的时候，标题与 #challenge-stage 一定在。
     const cfScript = challengeScript();
     if (cfScript) {
@@ -380,14 +445,20 @@ function __abcChallenge(opts) {
 
     // 标题兜底：标题空/很短的拦截页，正文里出现「verify you are human」也算。
     // 门槛很高（要遍历正文文本），所以三重门控：文档已加载完 + 上面所有特征都没命中 + 最多每 1s 扫一次。
-    if (!vendor && document.readyState === 'complete' && (bodyTextMatched || mayScanBodyText())) {
-      if (!bodyTextMatched) {
-        bodyTextMatched = BODY_TEXT_HINT.test(bodyTextHead(TEXT_SCAN_LIMIT));
-      }
-      if (bodyTextMatched) {
+    // bodyTextMatches 内部维护「URL + 正文摘要」粘性，换页即重新判定。
+    if (!vendor && document.readyState === 'complete') {
+      if (bodyTextMatches()) {
         hit('cloudflare-interstitial', 6, 'interstitial', true, false, true, 'body-text');
       }
     }
+
+    // 普通 403 / 拒绝页：标题像拦截、正文也像拦截，但没有任何 CF 专属证据。
+    // 只作为诊断字段回传（blocked:true, hard_block:false），不改变等待策略 ——
+    // 是否 blocking 由上面的 DOM 证据链决定（弱标题必须配实锤才升级）。
+    // 正文扫描只在标题可疑时才做：大页面上每 250ms 序列化一遍 body 会把页面拖死。
+    const suspiciousTitle = /access denied|forbidden|blocked|attention required|error 10(15|20)/i.test(title);
+    const plainBlocked = !hardBlock && suspiciousTitle && blockTextHit();
+    if (plainBlocked) signals.push('plain-blocked-no-cf-evidence');
 
     const hints = [];
     if (kind === 'blocked') {
@@ -513,6 +584,12 @@ function __abcChallenge(opts) {
       token_fields: tokens.token_fields,
       vendor: vendor,
       kind: kind,
+      // blocked —— 「这一页看起来挡住了内容」；hard_block —— 「挡的是 CF，等也没用」。
+      // 两者分开：普通 403 只置 blocked，hard_block 必须是 false。
+      blocked: !!blocking,
+      hard_block: !!hardBlock,
+      block_evidence: blockEvidence,
+      plain_blocked: plainBlocked || undefined,
       blocking: blocking,
       interactive: interactive,
       auto: auto,
@@ -565,16 +642,39 @@ function __abcChallenge(opts) {
         if (done) return;
         done = true;
         cleanup();
-        resolve(Object.assign({
-          ok: true,
+        const payload = Object.assign({
+          // `ok` 必须跟 `cleared` 走。
+          // 旧实现无条件 ok:true —— 超时 / need_human 都报成功，直接消费者
+          // （不经 daemon 补偿的调用方）会把「还在挑战页」当成「已通过」。
+          ok: cleared === true,
+          // `matched` 与 page_wait.js 的 wait 语义对齐：本轮是否达成目标。
+          // snapshot.rs 的 page_op_via_extension 明确把「ok:false + 有 matched」
+          // 当正常等待结果而不是通道错误 —— challenge wait 的「还没清除」也是正常结果，
+          // 少了这个字段它就会被当成 Err，daemon 侧的 stalled 计时也因此永远攒不起来。
+          matched: cleared === true,
           action: 'wait',
-          cleared: cleared,
+          cleared: cleared === true,
+          // 与 status 完全同口径（daemon 的等待循环按字段存在即判定）：
+          //   kind       —— 'blocked' 只在 CF 硬拦截证据成立时出现；
+          //   hard_block —— 必须叠加 CF 专属证据（cf-error-details / cf-error 容器 /
+          //                 页脚 Cloudflare Ray ID）；普通 403 只有 blocking:true；
+          //   detected   —— 是否识别出厂商，daemon 用它重置「已拦截多久」的计时；
+          //   probed     —— 本次扫描真的执行了（页面脚本没跑起来时 daemon 拿到的是
+          //                 通道错误，不会走到这里；这里显式声明，避免调用方把
+          //                 “没有 kind” 误读成 “kind:none”）。
+          kind: current.kind,
+          hard_block: current.hard_block === true,
+          detected: !!current.detected,
+          probed: true,
           vendor: current.vendor,
           blocking: current.blocking,
           interactive: current.interactive,
           checks: checks,
           elapsed_ms: Math.round(now() - started)
-        }, extra || {}));
+        }, extra || {});
+        // 结构化失败：优先用调用方给的 error，其次按 reason 生成，最后兜 'not_cleared'。
+        if (!payload.ok && !payload.error) payload.error = payload.reason || 'not_cleared';
+        resolve(payload);
       }
 
       function check(force) {
@@ -601,7 +701,7 @@ function __abcChallenge(opts) {
         // `blocking=false` 只表示「页面能浏览」，不表示「挑战已过」：登录页 / 结账页上
         // 挂着一个没勾的 Turnstile 就是这种形态。旧实现里 solve 模式还会在这里等 token，
         // 而 wait 模式（waitToken=false）直接落到下面的 `!blocking` 分支，250ms 后就
-        // 返回 cleared:true —— 调用方以为进去了，提交时才被拦。
+        // 返回 cleared:true —— 调用方以为进去了，提交时才被拦（B-26）。
         //
         // 只对「识别出厂商」的组件这么做：`interactive` 是启发式判据，没有厂商佐证时
         // 宁可沿用旧行为，免得把正常页面判成永远过不去（假阴性比假阳性更难排查）。
@@ -620,6 +720,8 @@ function __abcChallenge(opts) {
         if (focusAfterMs > 0 && (at - started) >= focusAfterMs) {
           return finish(false, {
             reason: 'need_human',
+            error: 'need_human',
+            error_code: 'challenge_need_human',
             need_human: true,
             vendor: current.vendor,
             hints: current.hints
@@ -647,7 +749,12 @@ function __abcChallenge(opts) {
       }
       timer = setInterval(function () { check(false); }, intervalMs);
       timeout = setTimeout(function () {
-        finish(false, { reason: 'timeout', hints: current.hints });
+        finish(false, {
+          reason: 'timeout',
+          error: 'timeout',
+          error_code: 'challenge_wait_timeout',
+          hints: current.hints
+        });
       }, timeoutMs);
     });
   }
@@ -655,8 +762,27 @@ function __abcChallenge(opts) {
   return { ok: false, error: 'challenge: 未知 action ' + action };
 }
 
-// 实现标记（与 page_net / page_stealth 同一套）：challenge 现在跑在
-// MAIN world（要读 window.turnstile / window._cf_chl_opt），入口全局对页面可见。
-// 页面若抢先定义同名函数，pageOp 会因缺少 __abcOwn 而拒绝执行页面提供的实现。
-try { Object.defineProperty(__abcChallenge, '__abcOwn', { value: true }); } catch (_) {}
-try { window.__abcChallenge = __abcChallenge; } catch (_) {}
+// 实现标记（与 page_net / page_stealth 同一套）：challenge 跑在
+// MAIN world，入口全局对页面可见，页面可以抢先把同名函数定义成自己的实现。
+// pageOp 只执行带这个标记的实现。不可枚举：不新增可被 Object.keys 看见的痕迹。
+try {
+  Object.defineProperty(__abcChallenge, '__abcOwn', {
+    value: true, enumerable: false, configurable: true
+  });
+} catch (_) {}
+
+// 入口挂载：可配置 —— stealth scrub 的 delete 才能真的成功；
+// 不可枚举 —— 不出现在 Object.keys(window) / for...in 里。
+try {
+  Object.defineProperty(window, '__abcChallenge', {
+    value: __abcChallenge,
+    writable: true,
+    enumerable: false,
+    configurable: true
+  });
+} catch (_) {
+  // 页面上已有旧版本留下的不可配置绑定：属性描述改不动，但值是 writable 的，
+  // 赋值能把实现换成本版本（仍然不可删，只能等页面重载）。
+  try { window.__abcChallenge = __abcChallenge; } catch (_) {}
+}
+})();

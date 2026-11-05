@@ -275,7 +275,7 @@ export function startMockExtension({ waitForReady = true, port = DEFAULT_EXT_POR
         };
       }
       if (isHook) {
-        // 真实 page_net 的 hook 回包同时给计数与真实数组（回归点：
+        // 真实 page_net 的 hook 回包同时给计数与真实数组（的回归点：
         // daemon 必须持久化 routes_list，而不是把计数当规则存进去）。
         if (Array.isArray(netOpts.routes)) state.netRoutes = netOpts.routes.slice();
         return {
@@ -349,7 +349,7 @@ export function startMockExtension({ waitForReady = true, port = DEFAULT_EXT_POR
         /* 用默认值 */
       }
       const base = { ok: true, title: "Mock Page", url: tab?.url || "https://mock.local/" };
-      // 每个场景的 status 形状决定 daemon 走快路径还是进 wait 循环（src/server/challenge.rs 的
+      // 每个场景的 status 形状决定 daemon 走快路径还是进 wait 循环（src/server.rs 的
       // `!blocking && (token_ready || !interactive)`）：
       //   cleared         → 命中快路径，via='no-challenge'、injections=0、challenge=status payload
       //   widget-cleared  → 卡住快路径（interactive && !token_ready），循环里 wait 不带 via → 兜成 'clear'
@@ -746,14 +746,18 @@ export function startMockExtension({ waitForReady = true, port = DEFAULT_EXT_POR
       }
       if (code.cmd === "pageOp") {
         // 无 eval 通道（页面 CSP）：扩展侧注入 ops/<op>.js 再调用入口函数。
-        // 回包形状与 background.js 的 handlePageOp 严格同形：{ ok, data: { op, value } }。
+        // 线上 WS 回包是 `res.data ?? null`（background.js 的 socketSend），也就是
+        // **已经剥掉 `{ok,data}` 外层** 的 `{ op, value }`。旧 mock 多包了一层，
+        // 和真实扩展不一致，这里按真实形状发送。
         const op = String(code.op || "");
         const value = handlePageOp(op, code.args, message.tabId);
-        ws.send({ type: "result", id, result: { ok: true, data: { op, value } } });
+        ws.send({ type: "result", id, result: { op, value } });
         return;
       }
       if (code.cmd === "cdp") {
-        ws.send({ type: "result", id, result: handleCdp(code) });
+        // 同上：handleCDP 的 `{ok,data}` 在 WS 层被剥成裸 CDP 结果。
+        const out = handleCdp(code);
+        ws.send({ type: "result", id, result: out && out.ok === true ? out.data : out });
         return;
       }
       if (code.cmd === "batch") {
@@ -778,7 +782,13 @@ export function startMockExtension({ waitForReady = true, port = DEFAULT_EXT_POR
             results.push({ ok: true });
           }
         }
-        ws.send({ type: "result", id, result: { ok: true, results } });
+        // 与 background.js 的 handleBatch 同形：{ ok, results, count, failed }
+        // （这一条**不**经过 data 层，WS 直接发送整个对象）。
+        ws.send({
+          type: "result",
+          id,
+          result: { ok: true, results, count: results.length, failed: 0 },
+        });
         return;
       }
       ws.send({ type: "result", id, result: { ok: true } });
@@ -1329,15 +1339,9 @@ function runSelfTest() {
     result = await run(["challenge", "solve", "--tab", tabId, "--timeout", "6"]);
     const chSolveToken = result.json?.result || {};
     assert(chSolveToken.passed === true && chSolveToken.via === "token", "拿到令牌时 via=token", chSolveToken);
-    // blocking=true 必须挡住「无挑战」快路径；但页面已经给出 token 时，求解循环会在
-    // 状态复查阶段直接收工（auto_solve.clicks=0、injections=0），这是预期行为。
-    assert(
-      chSolveToken.auto_solve?.via === "token",
-      "token 场景不得走无挑战快路径，应由求解循环判定已拿到令牌",
-      chSolveToken,
-    );
+    assert(chSolveToken.injections >= 1, "token 场景 blocking=true 卡住快路径，必走循环", chSolveToken.injections);
 
-    // 验证码一直没完成：必须 passed=false，且不得出现 passed=true（假通过回归点）。
+    // 验证码一直没完成：必须 passed=false，且不得出现 passed=true（的假通过回归点）。
     mock.state.challengeScenario = "timeout";
     result = await run(["challenge", "solve", "--tab", tabId, "--timeout", "2"]);
     const chSolveTimeout = result.json?.result || {};

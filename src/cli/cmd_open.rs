@@ -118,6 +118,14 @@ pub(crate) fn run_launch(args: LaunchArgs) -> Result<()> {
 /// `--tab url:` 的目标解析、`--dry-run` 的「只解析不执行」、`--async` 的 job 提交
 /// 都与其它页面命令同一条路径，不会再出现「back --tab @1 被当成 tab_id 字符串」。
 /// 底层 op 仍是 `exec`——它就是一段 JS，daemon 的目标解析与 job 白名单都按 exec 走。
+/// 导航命令的 HTTP 预算。
+///
+/// 导航脚本自己只等 `min(5s)`，把 `--timeout` 原样放大成 HTTP 预算会让
+/// `--timeout 600` 的 back/reload 在 daemon 已返回后还干等十分钟。取 `min(30)+5`。
+fn navigation_budget(timeout: f64) -> f64 {
+    timeout.min(30.0) + 5.0
+}
+
 pub(crate) fn run_navigation_command(
     op: &str,
     script: &str,
@@ -132,7 +140,7 @@ pub(crate) fn run_navigation_command(
             "默认 30 秒；导航类操作通常在 1 秒内完成",
         ));
     }
-    let payload = json!({
+    let mut payload = json!({
         "script": script,
         // clone：下面还要用 args.tab/browser/profile 做 dry-run 与多目标分发。
         "switch_tab_id": args.tab.clone(),
@@ -142,7 +150,29 @@ pub(crate) fn run_navigation_command(
         // 脚本只负责触发导航后立即返回；真正的等待交给页面加载，不占 exec 的预算。
         "timeout": args.timeout.min(5.0),
     });
+    // async 与同步路径必须对 `--tab @1` / `--tab url:` 给出一致结论。
+    // 以前 async 直接 submit_job，本地不解析目标，同一条命令只是去掉 --async 就
+    // 从「执行」变成「参数错误」/反之。现在先走同一份解析与预检。
+    let spec = match TargetSpec::parse(args.tab.as_deref().unwrap_or("")) {
+        Ok(spec) => spec,
+        Err(err) => return usage_error(&spec_problem(err)),
+    };
+    if let Err(problem) = finalize_page_payload("exec", &mut payload) {
+        return usage_error(&problem);
+    }
     if is_async {
+        // 需要 daemon 解析的多目标（all/@N/url:/title:/group:）在异步路径下拿不到
+        // 每条的 job 结果；与 submit_job 的拒绝语义对齐为 exit 2。
+        if spec.is_multi() || spec.needs_daemon_resolution() {
+            return usage_error(
+                &preflight::Problem::new(
+                    "unsupported_combination",
+                    "--async 不能和 all / @N / url: 这类需要解析的 --tab 一起用",
+                    "要么去掉 --async（同步路径会解析目标并执行），要么用明确的 tab id 逐个提交",
+                )
+                .with_example("atb exec --tab all 'return document.title'"),
+            );
+        }
         print_json(submit_job("exec", payload)?);
         return Ok(());
     }
@@ -153,7 +183,7 @@ pub(crate) fn run_navigation_command(
         args.tab.as_deref(),
         args.browser.as_deref(),
         args.profile.as_deref(),
-        args.timeout + 10.0,
+        navigation_budget(args.timeout),
     )?;
     Ok(())
 }
@@ -213,6 +243,30 @@ fn open_target_problem(err: crate::open_target::OpenTargetError) -> preflight::P
     preflight::Problem::new(err.code, err.message, hint).with_field("targets")
 }
 
+/// `--wait-for` 的语法校验。
+///
+/// 旧实现只 `starts_with("selector:")`：`--wait-for 'selector:'` / `'text:   '`
+/// 会被当成合法条件原样下发，daemon 等一个空条件直到超时，用户看到的是
+/// 「打开超时」。现在只接受四类，且 `selector:`/`text:` 的值 trim 后不能为空。
+fn validate_wait_for(cond: &str) -> std::result::Result<(), String> {
+    if cond == "networkidle" || cond == "dom-quiet" {
+        return Ok(());
+    }
+    if let Some(value) = cond.strip_prefix("selector:") {
+        if value.trim().is_empty() {
+            return Err("`selector:` 后面的 CSS 选择器不能为空".to_string());
+        }
+        return Ok(());
+    }
+    if let Some(value) = cond.strip_prefix("text:") {
+        if value.trim().is_empty() {
+            return Err("`text:` 后面的页面文本不能为空".to_string());
+        }
+        return Ok(());
+    }
+    Err(format!("--wait-for 的值 {cond:?} 不合法"))
+}
+
 pub(crate) fn cmd_open(args: OpenArgs, is_async: bool) -> Result<()> {
     reject_async_if_set("open", is_async)?;
     // 1e300 能通过 `is_finite` 与 `> 0`，但 `Duration::from_secs_f64` 会 panic。
@@ -244,14 +298,10 @@ pub(crate) fn cmd_open(args: OpenArgs, is_async: bool) -> Result<()> {
     // --wait-for 的语法在这里拦住（exit 2）：旧链路会把拼错的条件原样发给 daemon，
     // 页面里执行时才报错，用户看到的是「打开超时」，根本想不到是条件写错了。
     if let Some(cond) = args.wait_for.as_deref() {
-        let valid = cond == "networkidle"
-            || cond == "dom-quiet"
-            || cond.starts_with("selector:")
-            || cond.starts_with("text:");
-        if !valid {
+        if let Err(reason) = validate_wait_for(cond) {
             return Err(usage_failure(
                 "invalid_argument",
-                format!("--wait-for 的值 {cond:?} 不合法"),
+                format!("--wait-for {reason}"),
                 "支持 networkidle / dom-quiet / selector:<CSS选择器> / text:<页面文本>，例如 --wait-for 'selector:.result'",
             ));
         }
@@ -278,13 +328,26 @@ pub(crate) fn cmd_open(args: OpenArgs, is_async: bool) -> Result<()> {
                 Err(err) => return usage_error(&open_target_problem(err)),
             }
         }
+        // dry-run 的 `result.targets` 必须与真实 `/open` 回包同形
+        // （`targets[]{url, tab_id}`）。以前这里回的是原始输入字符串数组，
+        // 调用方按 dry-run 校准字段后再真跑必然解析失败。原始输入另放 `inputs`。
+        let planned_targets: Vec<Value> = resolved
+            .iter()
+            .map(|item| {
+                json!({
+                    "url": item.get("navigation_url").cloned().unwrap_or(Value::Null),
+                    "tab_id": Value::Null,
+                })
+            })
+            .collect();
         print_json(json!({
             "ok": true,
             "result": {
                 "dry_run": true,
                 "command": "open",
-                "count": args.targets.len(),
-                "targets": args.targets,
+                "count": planned_targets.len(),
+                "targets": planned_targets,
+                "inputs": args.targets,
                 "resolved": resolved,
                 "active": !args.background,
                 "note": "目标已解析通过；去掉 --dry-run 即执行。多个目标由 daemon 并发打开。",
@@ -301,16 +364,15 @@ pub(crate) fn cmd_open(args: OpenArgs, is_async: bool) -> Result<()> {
     } else {
         args.challenge_timeout.max(0.0)
     };
-    let request_timeout = (args.timeout + challenge_budget + 20.0).max(30.0);
-    // --wait-for 的等待预算也是 args.timeout（readiness_timeout）：open 本身可能已经
-    // 消耗过一次 timeout，HTTP 超时必须把两段都算进去，否则服务端还在等条件，
-    // CLI 已经断开并报超时（用户只看到「open 超时」，其实是 --wait-for 没等到）。
-    let wait_budget = if args.wait_for.is_some() {
-        args.timeout
+    let request_timeout = http_budget(args.timeout + challenge_budget + 10.0).max(30.0);
+    // `--wait-for` 的等待预算独立成字段（默认 = --timeout），CLI 与服务端
+    // 按同一字段计算；以前只有 CLI 侧用 args.timeout 估算，两边口径不一致。
+    let wait_for_timeout = args.timeout.max(0.0);
+    let request_timeout = if args.wait_for.is_some() {
+        (request_timeout + wait_for_timeout).max(30.0)
     } else {
-        0.0
+        request_timeout
     };
-    let request_timeout = (request_timeout + wait_budget).max(30.0);
     let payload = json!({
         // 目标统一走 targets 数组：daemon 内部并发，一个请求开完所有标签页。
         "targets": args.targets,
@@ -330,6 +392,8 @@ pub(crate) fn cmd_open(args: OpenArgs, is_async: bool) -> Result<()> {
         // 新 flag：daemon 侧按 OpenRequestExt（flatten 包装）读取，旧字段不动，
         // 旧版 daemon 收到多余字段会忽略，天然向后兼容。
         "wait_for": args.wait_for,
+        // 等待预算显式下发，默认与 readiness_timeout 相。
+        "wait_for_timeout": wait_for_timeout,
         "warm": args.warm,
     });
     print_json(request("POST", "/open", Some(payload), request_timeout)?);
@@ -374,6 +438,18 @@ fn close_targets_snapshot(targets: &[CloseTarget]) -> Value {
 
 pub(crate) fn cmd_close(args: CloseArgs, is_async: bool) -> Result<()> {
     reject_async_if_set("close", is_async)?;
+    // 空 `--tab` 以前会原样下发 `/close`，由 daemon 关掉「当前标签页」——
+    // 破坏性命令静默命中默认目标是不可接受的。close 必须给出明确目标。
+    if args.tab.trim().is_empty() {
+        return usage_error(
+            &preflight::Problem::new(
+                "target_not_found",
+                "close 需要明确的 --tab（不能为空）",
+                "先用 `atb tabs --ids` 看现有标签，再写 `--tab <tab_id>` / `--tab @1`；按组关闭用 `--tab group:<标题> --yes`",
+            )
+            .with_field("tab"),
+        );
+    }
     let spec = match TargetSpec::parse(&args.tab) {
         Ok(spec) => spec,
         Err(err) => return usage_error(&spec_problem(err)),
@@ -541,7 +617,20 @@ pub(crate) fn cmd_close(args: CloseArgs, is_async: bool) -> Result<()> {
         if let Some(title) = &target.title {
             payload["expect_title"] = json!(title);
         }
-        let value = request("POST", "/close", Some(payload), args.timeout)?;
+        // 单条 `/close` 失败（连接断、daemon 重启）以前用 `?` 提前返回。
+        // 此时前面的标签已经关掉、后面的还没处理，部分结果全丢，调用方既看不到
+        // 已关的也拿不到失败项。现在逐条降级为 `ok:false` 记录后继续。
+        let value = request("POST", "/close", Some(payload), http_budget(args.timeout))
+            .unwrap_or_else(|err| {
+                // 保留 tab/tab_id：单目标路径下这里会原样作为最终输出，调用方要能对上是哪一页。
+                json!({
+                    "ok": false,
+                    "tab": target.id,
+                    "tab_id": target.id,
+                    "error": err.to_string(),
+                    "error_code": "unexpected_error",
+                })
+            });
         let ok = value.get("ok").and_then(Value::as_bool).unwrap_or(false);
         if !ok {
             failed += 1;
@@ -801,19 +890,77 @@ pub(crate) fn process_identity(pid: u32) -> Option<String> {
     (!text.is_empty()).then_some(format!("cmdline={text}"))
 }
 
+/// `--force-assume-atb strict|loose` 的等价环境开关（`ATB_FORCE_ASSUME_ATB`）。
+///
+/// strict（默认）：进程名必须等于当前可执行文件名，且参数含独立词 `daemon`；
+/// loose：沿用旧的「路径含 exe / 同时含 atb+daemon」宽松判据（自动化救援用）。
+pub(crate) fn force_assume_atb() -> String {
+    crate::settings::env_enum("ATB_FORCE_ASSUME_ATB", "strict", &["strict", "loose"])
+}
+
+/// 从 `process_identity` 的输出里拆出 (exe, cmdline)。
+fn identity_parts(identity: &str) -> (String, String) {
+    let exe = identity
+        .split("exe=")
+        .nth(1)
+        .map(|rest| rest.split(" cmdline=").next().unwrap_or(rest))
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let cmdline = identity
+        .split("cmdline=")
+        .nth(1)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    (exe, cmdline)
+}
+
 /// 身份是否确实是「本机的 atb daemon」。
 ///
-/// 判据：命令行/路径里包含 `std::env::current_exe()`（同一份二进制），或同时出现
-/// `atb` 与 `daemon`（安装路径不同、通过软链启动时仍能认出）。
+/// 旧兜底是「命令行同时含 atb 与 daemon」的纯子串匹配，`/opt/atb-monitor/daemon`、
+/// `my-atb-daemon-watchdog`、`catb-daemon` 都会被判成自己的 daemon 并强杀。
+/// strict（默认）收紧为「进程名 == current_exe().file_name() 且参数含独立词 daemon」；
+/// loose 保留旧判据，供自动化救援场景显式开启。
 pub(crate) fn identity_is_atb_daemon(identity: &str) -> bool {
-    let lower = identity.to_ascii_lowercase();
-    if let Ok(exe) = env::current_exe() {
-        let exe = exe.to_string_lossy().to_ascii_lowercase();
-        if !exe.is_empty() && lower.contains(&exe) {
-            return true;
+    let (exe, cmdline) = identity_parts(identity);
+    if force_assume_atb() == "loose" {
+        let lower = identity.to_ascii_lowercase();
+        if let Ok(current) = env::current_exe() {
+            let current = current.to_string_lossy().to_ascii_lowercase();
+            if !current.is_empty() && lower.contains(&current) {
+                return true;
+            }
         }
+        return lower.contains("atb") && lower.contains("daemon");
     }
-    lower.contains("atb") && lower.contains("daemon")
+    let Some(expected) = env::current_exe().ok().and_then(|path| {
+        path.file_name()
+            .map(|name| name.to_string_lossy().to_ascii_lowercase())
+    }) else {
+        return false;
+    };
+    let raw_name = if !exe.is_empty() {
+        exe
+    } else {
+        cmdline
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_matches('"')
+            .to_string()
+    };
+    let process_name = Path::new(&raw_name)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if process_name != expected {
+        return false;
+    }
+    cmdline.split_whitespace().any(|word| {
+        word.trim_matches(|ch| ch == '"' || ch == '\'')
+            .eq_ignore_ascii_case("daemon")
+    })
 }
 
 #[cfg(windows)]
@@ -913,19 +1060,30 @@ fn finish_force_kill(pids: Vec<u32>, source: &str) -> Result<Vec<KillOutcome>> {
     }
     let outcomes: Vec<KillOutcome> = pids.iter().map(|pid| kill_verified_pid(*pid)).collect();
     if !outcomes.iter().any(|outcome| outcome.killed) {
+        // 一个都没杀时必须把待处理的 pid + identity 原样交回，用户才能
+        // 手工核对/处理；只给一句「身份不符」等于把问题藏起来。
         let details = outcomes
             .iter()
             .map(|outcome| {
-                outcome
+                let reason = outcome
                     .skipped_reason
                     .clone()
                     .or_else(|| outcome.error.clone())
-                    .unwrap_or_else(|| "未知原因".to_string())
+                    .unwrap_or_else(|| "未知原因".to_string());
+                format!(
+                    "pid={} identity={} 原因={reason}",
+                    outcome.pid,
+                    outcome
+                        .identity
+                        .clone()
+                        .unwrap_or_else(|| "<无法读取>".to_string())
+                )
             })
             .collect::<Vec<_>>()
             .join("；");
         return Err(anyhow!(
-            "占用 {PORT} 的进程没有通过身份核对，已放弃强杀（避免误杀其它程序）：{details}"
+            "占用 {PORT} 的进程没有通过身份核对，已放弃强杀（避免误杀其它程序）：{details}。\
+             若确认这些 pid 就是本机 atb daemon，可设 ATB_FORCE_ASSUME_ATB=loose 后重试"
         ));
     }
     Ok(outcomes)

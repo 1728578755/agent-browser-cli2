@@ -1,6 +1,6 @@
 {
   "name": "@g1728578755/atb",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "description": "Agent-oriented browser CLI with multi-tab and multi-agent isolation, backed by a native Rust daemon.",
   "license": "MIT",
   "keywords": [
@@ -19,6 +19,7 @@
   "files": [
     "npm/bin",
     "npm/postinstall.js",
+    "scripts/platforms.json",
     "assets",
     "skills",
     "README.md",
@@ -34,19 +35,19 @@
     "build": "node scripts/check-lock.mjs && cargo build --release --locked",
     "check:lock": "node scripts/check-lock.mjs",
     "test": "node --test",
-    "version": "node scripts/sync-optional-deps.mjs && node scripts/sync-version.mjs && git add package.json package-lock.json Cargo.toml Cargo.lock README.md README_EN.md",
+    "version": "node scripts/sync-version.mjs",
     "sync-version": "node scripts/sync-version.mjs",
     "sync:extension": "node scripts/sync-extension-assets.mjs",
     "check:extension": "node scripts/sync-extension-assets.mjs --check",
-    "prepack": "node scripts/sync-optional-deps.mjs && node scripts/sync-extension-assets.mjs",
+    "prepack": "node scripts/sync-version.mjs --deps && node scripts/sync-extension-assets.mjs",
     "postinstall": "node npm/postinstall.js"
   },
   "optionalDependencies": {
-    "@g1728578755/atb-darwin-arm64": "0.7.1",
-    "@g1728578755/atb-darwin-x64": "0.7.1",
-    "@g1728578755/atb-linux-x64": "0.7.1",
-    "@g1728578755/atb-linux-arm64": "0.7.1",
-    "@g1728578755/atb-win32-x64": "0.7.1"
+    "@g1728578755/atb-darwin-arm64": "0.7.2",
+    "@g1728578755/atb-darwin-x64": "0.7.2",
+    "@g1728578755/atb-linux-x64": "0.7.2",
+    "@g1728578755/atb-linux-arm64": "0.7.2",
+    "@g1728578755/atb-win32-x64": "0.7.2"
   },
   "engines": {
     "node": ">=18"

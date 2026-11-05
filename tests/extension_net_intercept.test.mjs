@@ -242,8 +242,12 @@ function requestPaused(params) {
 }
 
 async function main() {
-  const harness = buildHarness();
-  const { commands, dispatch, emitEvent } = harness;
+  // harness 不能是模块级单例。每个「场景组」重建一次，组内的累积统计
+  // （mock/abort/continue 各一次）是有意的，但组与组之间不继承日志、规则与统计。
+  let harness = buildHarness();
+  const dispatch = (message) => harness.dispatch(message);
+  const emitEvent = (method, params) => harness.emitEvent(method, params);
+  const commands = () => harness.commands;
 
   // 统计是在 CDP 命令 resolve 之后才 +1 的，轮询 status 等它落定。
   async function waitStatus(predicate, timeout = 1500) {
@@ -259,14 +263,14 @@ async function main() {
 
   // ---- 1. start 只开 Request 阶段 ----
   const mockBody = '{"msg":"中文 emoji 🚀"}';
-  let before = commands.length;
+  let before = commands().length;
   const startMock = await dispatch({
     cmd: 'netIntercept',
     action: 'start',
     tabId: 1,
     rules: [{ match: 'api/mock', method: '*', status: 201, body: mockBody }]
   });
-  let sent = commands.slice(before);
+  let sent = commands().slice(before);
   const enableMock = sent.filter((c) => c.method === 'Fetch.enable');
   const mockPatterns = enableMock.length ? enableMock[enableMock.length - 1].params.patterns : [];
   check('1. start 调用 Fetch.enable',
@@ -285,7 +289,19 @@ async function main() {
     JSON.stringify(mockPatterns));
 
   // ---- 3 / 9. 请求阶段伪造响应 + UTF-8 ----
-  before = commands.length;
+  // 重建 harness，再显式下发本组需要的 mock 规则：不依赖用例 1 留下的状态。
+  harness = buildHarness();
+  const freshStatus = await dispatch({ cmd: 'netIntercept', action: 'status', tabId: 1 });
+  check(' 重建 harness 后不继承前序规则/日志/统计',
+    freshStatus.ok === true && freshStatus.enabled === false && freshStatus.rules === 0 && freshStatus.logCount === 0,
+    JSON.stringify(freshStatus));
+  await dispatch({
+    cmd: 'netIntercept',
+    action: 'start',
+    tabId: 1,
+    rules: [{ match: 'api/mock', method: '*', status: 201, body: mockBody }]
+  });
+  before = commands().length;
   emitEvent('Fetch.requestPaused', requestPaused({
     requestId: 'r-mock',
     request: {
@@ -294,11 +310,11 @@ async function main() {
       headers: { 'content-type': 'application/json' }
     }
   }));
-  const gotMock = await waitFor(() => commands.slice(before).some((c) => c.method === 'Fetch.fulfillRequest'));
-  const mockCmd = commands.slice(before).find((c) => c.method === 'Fetch.fulfillRequest');
+  const gotMock = await waitFor(() => commands().slice(before).some((c) => c.method === 'Fetch.fulfillRequest'));
+  const mockCmd = commands().slice(before).find((c) => c.method === 'Fetch.fulfillRequest');
   check('3. mock 命中走 Fetch.fulfillRequest 且 status=201',
     gotMock && mockCmd && mockCmd.params.responseCode === 201,
-    JSON.stringify(commands.slice(before)));
+    JSON.stringify(commands().slice(before)));
   check('3b. mock 未指定 content-type 时补 application/json',
     !!mockCmd && headerValue(mockCmd.params.responseHeaders, 'content-type') === 'application/json',
     JSON.stringify(mockCmd && mockCmd.params.responseHeaders));
@@ -333,16 +349,16 @@ async function main() {
     tabId: 1,
     rules: [{ match: 'api/abort', abort: true }]
   });
-  before = commands.length;
+  before = commands().length;
   emitEvent('Fetch.requestPaused', requestPaused({
     requestId: 'r-abort',
     request: { url: 'https://example.com/api/abort', method: 'GET', headers: {} }
   }));
-  const gotAbort = await waitFor(() => commands.slice(before).some((c) => c.method === 'Fetch.failRequest'));
-  const abortCmd = commands.slice(before).find((c) => c.method === 'Fetch.failRequest');
+  const gotAbort = await waitFor(() => commands().slice(before).some((c) => c.method === 'Fetch.failRequest'));
+  const abortCmd = commands().slice(before).find((c) => c.method === 'Fetch.failRequest');
   check('4. abort 走 Fetch.failRequest，errorReason=Failed',
     gotAbort && abortCmd.params.requestId === 'r-abort' && abortCmd.params.errorReason === 'Failed',
-    JSON.stringify(commands.slice(before)));
+    JSON.stringify(commands().slice(before)));
   const logAfterAbort = await waitStatus(
     (s) => findLog(s.log, (item) => item.requestId === 'r-abort').length === 1
   );
@@ -359,7 +375,7 @@ async function main() {
     tabId: 1,
     rules: [{ match: 'api/hdr', requestHeaders: { 'x-token': 't2' }, requestBody: '{"a":2}' }]
   });
-  before = commands.length;
+  before = commands().length;
   emitEvent('Fetch.requestPaused', requestPaused({
     requestId: 'r-hdr',
     request: {
@@ -368,8 +384,8 @@ async function main() {
       headers: { 'x-token': 't1', accept: '*/*' }
     }
   }));
-  const gotHdr = await waitFor(() => commands.slice(before).some((c) => c.method === 'Fetch.continueRequest'));
-  const hdrCmd = commands.slice(before).find((c) => c.method === 'Fetch.continueRequest');
+  const gotHdr = await waitFor(() => commands().slice(before).some((c) => c.method === 'Fetch.continueRequest'));
+  const hdrCmd = commands().slice(before).find((c) => c.method === 'Fetch.continueRequest');
   const hdrEntries = (hdrCmd && hdrCmd.params.headers) || [];
   const tokenEntries = hdrEntries.filter((entry) => String(entry.name).toLowerCase() === 'x-token');
   check('5. 请求头基于原头合并：x-token 只剩一条且为 t2',
@@ -395,14 +411,22 @@ async function main() {
     JSON.stringify(midStatus.stats));
 
   // ---- 2. 规则含 response 时追加 Response 阶段 ----
-  before = commands.length;
+  // 先建立一个只有 Request 阶段的会话，再切到 Response 阶段，才能验证 disable+enable。
+  harness = buildHarness();
+  await dispatch({
+    cmd: 'netIntercept',
+    action: 'start',
+    tabId: 1,
+    rules: [{ match: 'api/rewrite', status: 200 }]
+  });
+  before = commands().length;
   const startRewrite = await dispatch({
     cmd: 'netIntercept',
     action: 'start',
     tabId: 1,
     rules: [{ match: 'api/rewrite', response: { status: 202, headers: { 'x-mock': '1' } } }]
   });
-  sent = commands.slice(before);
+  sent = commands().slice(before);
   const enableRewrite = sent.filter((c) => c.method === 'Fetch.enable');
   const rewritePatterns = enableRewrite.length ? enableRewrite[enableRewrite.length - 1].params.patterns : [];
   const stages = rewritePatterns.map((p) => p.requestStage);
@@ -434,10 +458,18 @@ async function main() {
   // ---- 6. 响应阶段只改状态 / 头：走 continueResponse，不碰 body ----
   // 走 getResponseBody + fulfillRequest 会把压缩响应重新编码一次，
   // content-encoding 与真实字节容易对不上；只改元信息时必须原地放行。
-  before = commands.length;
+  // 重建 harness 并重放「含 response 的 start」：6 不依赖 2 留下的会话。
+  harness = buildHarness();
+  await dispatch({
+    cmd: 'netIntercept',
+    action: 'start',
+    tabId: 1,
+    rules: [{ match: 'api/rewrite', response: { status: 202, headers: { 'x-mock': '1' } } }]
+  });
+  before = commands().length;
   emitEvent('Fetch.requestPaused', responseParams);
-  const gotRewrite = await waitFor(() => commands.slice(before).some((c) => c.method === 'Fetch.continueResponse'));
-  sent = commands.slice(before);
+  const gotRewrite = await waitFor(() => commands().slice(before).some((c) => c.method === 'Fetch.continueResponse'));
+  sent = commands().slice(before);
   const rewriteCmd = sent.find((c) => c.method === 'Fetch.continueResponse');
   check('6. 只改状态/头时走 continueResponse（不取 body）',
     gotRewrite && !!rewriteCmd && !sent.some((c) => c.method === 'Fetch.getResponseBody'),
@@ -459,10 +491,10 @@ async function main() {
     rules: [{ match: 'api/rewrite', response: { status: 201, body: '{"n":2}' } }]
   });
   harness.overrides.set('Fetch.getResponseBody', () => ({ body: originalBase64, base64Encoded: true }));
-  before = commands.length;
+  before = commands().length;
   emitEvent('Fetch.requestPaused', responseParams);
-  const gotBodyRewrite = await waitFor(() => commands.slice(before).some((c) => c.method === 'Fetch.fulfillRequest'));
-  sent = commands.slice(before);
+  const gotBodyRewrite = await waitFor(() => commands().slice(before).some((c) => c.method === 'Fetch.fulfillRequest'));
+  sent = commands().slice(before);
   const fulfillCmd = sent.find((c) => c.method === 'Fetch.fulfillRequest');
   check('6d. 换 body 时先 getResponseBody 再 fulfillRequest',
     gotBodyRewrite && sent.some((c) => c.method === 'Fetch.getResponseBody') && !!fulfillCmd,
@@ -490,13 +522,15 @@ async function main() {
   // ---- 7. 响应阶段无命中规则只放行 ----
   // 规则里没有 response 字段 → 阶段回到 Request（顺带验证 disable+enable），
   // 之后再送一次响应阶段事件，模拟「事件在路上时规则已被替换」。
+  // 重建 harness：本用例只关心「放行/日志开关」，不继承前面 rewrite 的日志与统计。
+  harness = buildHarness();
   await dispatch({
     cmd: 'netIntercept',
     action: 'rules',
     tabId: 1,
     rules: [{ match: 'api/other', status: 200 }]
   });
-  before = commands.length;
+  before = commands().length;
   emitEvent('Fetch.requestPaused', requestPaused({
     requestId: 'r-pass',
     request: { url: 'https://example.com/api/rewrite', method: 'GET', headers: {} },
@@ -504,9 +538,9 @@ async function main() {
     responseStatusText: 'OK',
     responseHeaders: [{ name: 'content-type', value: 'application/json' }]
   }));
-  const gotPass = await waitFor(() => commands.slice(before).length > 0);
+  const gotPass = await waitFor(() => commands().slice(before).length > 0);
   await wait(60); // 给可能的第二条命令留出时间，确保没有多余调用
-  sent = commands.slice(before);
+  sent = commands().slice(before);
   const passCmds = sent.filter((c) => c.method === 'Fetch.continueResponse' || c.method === 'Fetch.continueRequest');
   check('7. 响应阶段无命中规则只发一次放行命令且不 fulfillRequest',
     gotPass && passCmds.length === 1 && !sent.some((c) => c.method === 'Fetch.fulfillRequest'),
@@ -551,6 +585,8 @@ async function main() {
   });
 
   // ---- 11. 环形上限 ----
+  // 独立重建：环形缓冲断言不能受前面 mock/rewrite 日志条数的影响。
+  harness = buildHarness();
   await dispatch({
     cmd: 'netIntercept',
     action: 'rules',
@@ -600,6 +636,39 @@ async function main() {
   });
 
   // ---- status / 统计 ----
+  // 统计是每组独立重算的：重建后先制造「continueResponse 一次 + fulfill 一次」，
+  // 否则 8c 只能靠前面用例累积，顺序一变就红。
+  harness = buildHarness();
+  await dispatch({
+    cmd: 'netIntercept',
+    action: 'start',
+    tabId: 1,
+    rules: [{ match: 'api/rewrite', response: { status: 202, headers: { 'x-mock': '1' } } }]
+  });
+  emitEvent('Fetch.requestPaused', requestPaused({
+    requestId: 'r-stat-continue',
+    request: { url: 'https://example.com/api/rewrite', method: 'GET', headers: {} },
+    responseStatusCode: 200,
+    responseStatusText: 'OK',
+    responseHeaders: [{ name: 'content-type', value: 'application/json' }]
+  }));
+  await waitFor(() => commands().some((c) => c.method === 'Fetch.continueResponse'));
+  await dispatch({
+    cmd: 'netIntercept',
+    action: 'rules',
+    tabId: 1,
+    rules: [{ match: 'api/rewrite', response: { status: 201, body: '{"n":2}' } }]
+  });
+  harness.overrides.set('Fetch.getResponseBody', () => ({ body: encodeText('{"n":1}'), base64Encoded: true }));
+  emitEvent('Fetch.requestPaused', requestPaused({
+    requestId: 'r-stat-fulfill',
+    request: { url: 'https://example.com/api/rewrite', method: 'GET', headers: {} },
+    responseStatusCode: 200,
+    responseStatusText: 'OK',
+    responseHeaders: [{ name: 'content-type', value: 'application/json' }]
+  }));
+  await waitFor(() => commands().some((c) => c.method === 'Fetch.fulfillRequest'));
+  harness.overrides.delete('Fetch.getResponseBody');
   const status = await dispatch({ cmd: 'netIntercept', action: 'status', tabId: 1 });
   check('8b. status 返回 enabled/rules/patterns/stats',
     status.ok === true && status.enabled === true && status.rules === 1
@@ -610,9 +679,17 @@ async function main() {
     JSON.stringify(status.stats));
 
   // ---- 8. stop ----
-  before = commands.length;
+  // 独立会话：stop 只需要一个已 start 的拦截器，不继承统计组的规则/日志。
+  harness = buildHarness();
+  await dispatch({
+    cmd: 'netIntercept',
+    action: 'start',
+    tabId: 1,
+    rules: [{ match: 'api/stop-me', status: 200 }]
+  });
+  before = commands().length;
   const stopped = await dispatch({ cmd: 'netIntercept', action: 'stop', tabId: 1 });
-  sent = commands.slice(before);
+  sent = commands().slice(before);
   check('8. stop 调用 Fetch.disable',
     stopped.ok === true && stopped.action === 'stop' && sent.some((c) => c.method === 'Fetch.disable'),
     JSON.stringify(sent.map((c) => c.method)));
@@ -628,6 +705,8 @@ async function main() {
   // ---- 12. 空规则集：彻底关掉 Fetch，而不是留一个开着但什么都不拦的会话 ----
   // 「开着 CDP 引擎但规则被删空」（net unroute 删最后一条）是真实路径：
   // 此时必须 Fetch.disable，否则每个请求都要过一次 CDP 往返却没有规则可用。
+  // 重建 harness：12a 的「重新 start」必须是真正的冷启动，而不是复用 8 的会话。
+  harness = buildHarness();
   const restarted = await dispatch({
     cmd: 'netIntercept', action: 'start', tabId: 1,
     rules: [{ match: 'api/after-stop', status: 200 }]
@@ -637,9 +716,9 @@ async function main() {
       && (restarted.patterns || []).length === 1,
     JSON.stringify(restarted));
 
-  before = commands.length;
+  before = commands().length;
   const emptied = await dispatch({ cmd: 'netIntercept', action: 'rules', tabId: 1, rules: [] });
-  sent = commands.slice(before);
+  sent = commands().slice(before);
   check('12. 规则集清空时 Fetch.disable 且 fetchEnabled=false',
     emptied.ok === true && emptied.fetchEnabled === false
       && sent.some((c) => c.method === 'Fetch.disable')

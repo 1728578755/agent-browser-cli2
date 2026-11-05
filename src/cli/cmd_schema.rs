@@ -107,7 +107,9 @@ fn schema_entries() -> Vec<CmdSchema> {
             "--full": flag(),
             // --fields / --limit / --mine：精简输出三件套（未知字段 exit 2）。
             "--fields": opt("string"),
-            "--limit": with_default("int", json!(0)),
+            // clap 侧是 `Option<usize>`（无默认值）。以前写成 default 0，
+            // Agent 照表传 `--limit 0` 会拿到空列表；这里改为无默认的可选整数。
+            "--limit": opt("int"),
             "--mine": flag(),
         }),
         &["no_tabs", "invalid_api_token", "unsupported_flag"],
@@ -129,6 +131,12 @@ fn schema_entries() -> Vec<CmdSchema> {
         json!({
             "<subcommand>": { "type": "enum", "required": true, "enum": ["tab", "browser", "profile"] },
             "<arg>": required("string"),
+            // 子命令各自的必填位置参数与专属 flag（上层是扁平表，这里补细节）。
+            "<subcommand_args>": {
+                "tab": { "<arg>": required("string"), "--browser": opt("string"), "--profile": opt("string") },
+                "browser": { "<arg>": required("string") },
+                "profile": { "<arg>": required("string") },
+            },
             // 由反射测试补齐：`lookup tab` 支持按 browser/profile 缩小范围（LookupTabArgs），
             // 旧表漏了这两个 flag，Agent 会以为 lookup 不能带目标限定。
             "--browser": opt("string"),
@@ -178,7 +186,7 @@ fn schema_entries() -> Vec<CmdSchema> {
                 "--include-hidden": flag(),
                 "--budget-ms": opt("number"),
                 "--max-nodes": opt("number"),
-                // daemon 侧 `ReadRequest.inner_text_limit`（DOM 节点数阈值，非字符数）。
+                // X-15：daemon 侧 `ReadRequest.inner_text_limit`（DOM 节点数阈值，非字符数）。
                 // 不传或传 0 → 页面用默认 30000；正整数由 daemon clamp 到 1000..=500000。
                 // 字符量看 --max-chars（daemon clamp 1000..=400000）；本项越小越偏向
                 // 近似可见文本（visible-approx：更快但可能少内容），是精度/速度旋钮。
@@ -217,7 +225,7 @@ fn schema_entries() -> Vec<CmdSchema> {
                 "--js": flag(),
                 "--interactive-only": flag(),
                 "--max-nodes": with_default("number", json!(0)),
-                // 保留无障碍树里的 generic 容器节点（默认跳过）。
+                // X-15：保留无障碍树里的 generic 容器节点（默认跳过）。
                 "--no-skip-generic": flag(),
             }),
             page_args(30.0),
@@ -261,6 +269,9 @@ fn schema_entries() -> Vec<CmdSchema> {
             "invalid_frame",
             // 位置参数脚本与 --file 同时给。
             "unsupported_combination",
+            // 组合 wait 失败与受限页面必须能被调用方按码归类。
+            "wait_js_failed",
+            "page_protected",
         ],
     );
     push(
@@ -432,13 +443,24 @@ fn schema_entries() -> Vec<CmdSchema> {
                 "--confirm-ms": opt("number"),
                 "--frame": opt("int"),
             }),
-            page_args(15.0),
+            // `challenge` 的 `--timeout` 在 clap 里是 `Option<f64>`（不传时由
+            // 服务端按 action 取默认：wait 30s / solve 120s）。以前复用了
+            // `page_args(15.0)`，把「未指定」静默写成默认 15s，语义被这个表带偏。
+            // 这里显式列三项通用参数，保留 `--timeout` 的「无可选默认」。
+            json!({
+                "--tab": opt("string"),
+                "--browser": opt("string"),
+                "--profile": opt("string"),
+            }),
         ),
         &[
             "no_tabs",
             "target_not_found",
             "challenge_blocked",
             "wait_timeout",
+            // 探测不可用与整条点击链超时。
+            "challenge_probe_failed",
+            "challenge_click_timeout",
         ],
     );
     push(
@@ -479,6 +501,14 @@ fn schema_entries() -> Vec<CmdSchema> {
         &[
             "invalid_open_target",
             "invalid_timeout",
+            // open_target 解析器与 --wait-for 实际可发的码，以前表里漏了。
+            "unsupported_scheme",
+            "invalid_file_url",
+            "unsupported_file_host",
+            "file_not_found",
+            "wait_for_timeout",
+            "target_not_found",
+            "target_out_of_range",
             // --challenge-timeout 越界/非法。
             "invalid_argument",
             "no_tabs",
@@ -516,13 +546,24 @@ fn schema_entries() -> Vec<CmdSchema> {
         "back",
         "浏览器后退",
         page_args(30.0),
-        &["no_tabs", "target_not_found"],
+        // 导航命令的超时校验发 invalid_timeout；目标解析发 invalid_argument。
+        &[
+            "no_tabs",
+            "target_not_found",
+            "invalid_timeout",
+            "invalid_argument",
+        ],
     );
     push(
         "reload",
         "重新加载当前标签页",
         page_args(30.0),
-        &["no_tabs", "target_not_found"],
+        &[
+            "no_tabs",
+            "target_not_found",
+            "invalid_timeout",
+            "invalid_argument",
+        ],
     );
 
     // ---- 采集 / 文件 ----
@@ -537,15 +578,26 @@ fn schema_entries() -> Vec<CmdSchema> {
                 "--format": with_enum("string", "png", &["png", "jpeg", "webp"]),
                 "--quality": opt("int"),
                 "--full-page": flag(),
+                // CDP 主路径与拼图回落都按此上限截断（超出回 truncated:true）。
                 "--max-height": opt("int"),
             }),
             page_args(30.0),
         ),
-        &["output_path_collision", "no_tabs", "target_not_found"],
+        &[
+            "output_path_collision",
+            "no_tabs",
+            "target_not_found",
+            // 字节上限与调试器被占用。
+            "capture_too_large",
+            "debugger_blocked",
+            "page_protected",
+        ],
     );
     push(
         "save-pdf",
-        "把当前页面另存为 PDF",
+        // `--max-height` 现在在常规 CDP 打印路径也生效（超出截断并回
+        // truncated:true），不再只是图片型回落时的旋钮。
+        "把当前页面另存为 PDF（--max-height 限制输出高度，CDP 主路径与图片型回落均生效）",
         merge_args(
             json!({
                 "--out": opt("path"),
@@ -553,11 +605,20 @@ fn schema_entries() -> Vec<CmdSchema> {
                 "--landscape": flag(),
                 "--scale": with_default("number", json!(1.0)),
                 "--no-print-background": flag(),
+                // 输出高度上限（设备像素），默认 20000；主路径与图片型回落都生效。
                 "--max-height": opt("int"),
             }),
             page_args(30.0),
         ),
-        &["output_path_collision", "no_tabs", "target_not_found"],
+        &[
+            "output_path_collision",
+            "no_tabs",
+            "target_not_found",
+            // 超长页切片失败与输出字节上限。
+            "pdf_too_tall",
+            "capture_too_large",
+            "debugger_blocked",
+        ],
     );
     push(
         "cookies",
@@ -579,6 +640,14 @@ fn schema_entries() -> Vec<CmdSchema> {
         "抓取页面网络请求",
         json!({
             "<subcommand>": { "type": "enum", "required": true, "enum": ["start", "list", "detail", "clear", "stop"] },
+            // detail 需要 request_id；list 支持 --filter/--limit。
+            "<subcommand_args>": {
+                "start": {},
+                "list": { "--filter": opt("string"), "--limit": with_default("number", json!(100)) },
+                "detail": { "<request_id>": required("string") },
+                "clear": {},
+                "stop": {}
+            },
             // 由反射测试补齐：这些 flag 分散在 network 的各子命令上
             // （start/clear/stop 用 TabOnlyArgs，list 另有 --filter/--limit，detail 取 request_id），
             // 旧表只写了 <subcommand>，Agent 会以为 network 不支持目标限定与过滤。
@@ -612,7 +681,18 @@ fn schema_entries() -> Vec<CmdSchema> {
         "网络拦截：fetch / hook / mock / log",
         json!({
             "<subcommand>": { "type": "enum", "required": true, "enum": ["fetch", "hook", "log", "mock", "routes", "unroute", "reset"] },
-            // 只对 net fetch 生效的两个页面侧开关（其余子命令忽略）。
+            // net 的必填位置参数按子命令区分（fetch <url> / mock|unroute <pattern>）；
+            // 扁平表只有 <subcommand>，Agent 不知道后面还要跟一个参数。
+            "<subcommand_args>": {
+                "fetch": { "<url>": required("string") },
+                "hook": {},
+                "log": {},
+                "mock": { "<pattern>": required("string") },
+                "routes": {},
+                "unroute": { "<pattern>": required("string") },
+                "reset": {}
+            },
+            // X-15：只对 net fetch 生效的两个页面侧开关（其余子命令忽略）。
             "--credentials": with_enum("string", "include", &["include", "omit", "same-origin"]),
             "--no-parse-json": flag(),
             // 由反射测试补齐：net 是**扁平表项 + 子命令**，下面这些 flag 分散在
@@ -676,7 +756,12 @@ fn schema_entries() -> Vec<CmdSchema> {
             }),
             page_args(30.0),
         ),
-        &["no_tabs", "target_not_found"],
+        &[
+            "no_tabs",
+            "target_not_found",
+            // 文件名净化拒绝。
+            "invalid_filename",
+        ],
     );
     push(
         "download-wait",
@@ -693,7 +778,12 @@ fn schema_entries() -> Vec<CmdSchema> {
                 "--profile": opt("string"),
             }),
         ),
-        &["no_tabs", "wait_timeout"],
+        &[
+            "no_tabs",
+            "wait_timeout",
+            // 关闭自动认领后必须显式 --id。
+            "download_id_required",
+        ],
     );
 
     // ---- 编排 ----
@@ -703,6 +793,13 @@ fn schema_entries() -> Vec<CmdSchema> {
         json!({
             "<subcommand>": { "type": "enum", "required": true, "enum": ["list", "get", "wait", "cancel"] },
             "<id>": optional("string"),
+            // get / wait / cancel 必须带 <id>（list 不需要）。
+            "<subcommand_args>": {
+                "list": { "--limit": with_default("number", json!(20)) },
+                "get": { "<id>": required("string") },
+                "wait": { "<id>": required("string"), "--timeout": with_default("number", json!(300.0)), "--interval": with_default("number", json!(0.3)) },
+                "cancel": { "<id>": required("string") }
+            },
             "--timeout": opt("number"),
             "--limit": opt("number"),
             "--interval": opt("number"),
@@ -730,7 +827,8 @@ fn schema_entries() -> Vec<CmdSchema> {
     );
     push(
         "broadcast",
-        "对所有或指定 browser/profile 并发执行同一操作",
+        // 路径绝对化默认开启；无同名 CLI flag，用 ATB_ALLOW_RELATIVE_OUT=1 保留旧行为。
+        "对所有或指定 browser/profile 并发执行同一操作（ATB_ALLOW_RELATIVE_OUT=1 可关闭输出路径绝对化）",
         json!({
             "<op>": required("string"),
             "--script": opt("string"),
@@ -772,7 +870,8 @@ fn schema_entries() -> Vec<CmdSchema> {
     push(
         "schema",
         "输出全部命令的机器可读 schema",
-        json!({ "--json": with_default("bool", json!(true)) }),
+        // clap 侧是普通开关（默认 false）；JSON 输出本来就是缺省行为，`--json` 只是显式声明。
+        json!({ "--json": flag() }),
         &[],
     );
     push(
@@ -821,7 +920,7 @@ fn schema_entries() -> Vec<CmdSchema> {
     push("stop", "停止后台 daemon", json!({}), &[]);
     push(
         "restart",
-        "重启 daemon",
+        "重启 daemon（强杀时的身份核对严格度由 ATB_FORCE_ASSUME_ATB=strict|loose 控制）",
         // 由反射测试补齐：`restart --force` 是唯一的手工救援路径（旧 daemon 占端口
         // 且 token 失配时），旧表写成空对象，Agent 根本发现不了它。
         json!({ "--force": flag() }),
@@ -832,7 +931,8 @@ fn schema_entries() -> Vec<CmdSchema> {
     // ---- 批量抓取 ----
     push(
         "scrape",
-        "批量抓取：分批开页 → 执行 JS → 收集 → 关页，失败退避重试",
+        // CMD-*：`--out` 已存在时的覆盖策略由 ATB_IO_OVERWRITE 控制（backup/force/ask/append）。
+        "批量抓取：分批开页 → 执行 JS → 收集 → 关页，失败退避重试（覆盖策略见 ATB_IO_OVERWRITE）",
         json!({
             "--urls": required("string"),
             "--js-file": opt("path"),
@@ -1049,6 +1149,277 @@ mod schema_reflection_tests {
         assert!(
             problems.is_empty(),
             "schema 表与 clap 定义漂移，共 {} 处：\n{}",
+            problems.len(),
+            problems.join("\n")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 名称集合一致只是最低要求。
+    // 下面再逐项比对 default / type / enum / required / variadic / 位置参数，
+    // 并断言命令总数；表里写错默认值（如 tabs --limit 默认 0）也会失败。
+    // -----------------------------------------------------------------------
+
+    fn value_to_default_string(value: &serde_json::Value) -> String {
+        match value {
+            serde_json::Value::String(text) => text.clone(),
+            serde_json::Value::Bool(flag) => flag.to_string(),
+            other => other.to_string(),
+        }
+    }
+
+    /// 数值默认值统一按 f64 归一：`30` 与 `30.0` 视为相同。
+    fn normalize_default(raw: &str) -> String {
+        let trimmed = raw.trim();
+        match trimmed.parse::<f64>() {
+            Ok(number) if number.is_finite() => format!("{number}"),
+            _ => trimmed.to_string(),
+        }
+    }
+
+    fn clap_args_by_long(command: &clap::Command) -> BTreeMap<String, &clap::Arg> {
+        command
+            .get_arguments()
+            .filter_map(|arg| arg.get_long().map(|long| (long.to_string(), arg)))
+            .collect()
+    }
+
+    /// 表里的「叶子位置参数」：`<target>` 这类带 `type` 的键。
+    /// `<subcommand>` / `<subcommand_args>` 是分层节点，不参与位置参数比对。
+    fn table_positionals(args: &serde_json::Value) -> BTreeSet<String> {
+        args.as_object()
+            .map(|map| {
+                map.iter()
+                    .filter(|(key, value)| {
+                        key.starts_with('<')
+                            && value.get("type").is_some()
+                            && key.as_str() != "<subcommand>"
+                            && key.as_str() != "<subcommand_args>"
+                    })
+                    .map(|(key, _)| (*key).clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn clap_positionals(command: &clap::Command) -> BTreeSet<String> {
+        command
+            .get_positionals()
+            .map(|arg| format!("<{}>", arg.get_id().as_str()))
+            .collect()
+    }
+
+    /// 表里声明的 error_codes 至少要覆盖这些「实际会发」的码。
+    ///
+    /// 无法在测试里静态推导 daemon 端会发哪些码，所以这里列出本轮新增/易漂移的
+    /// 关键对；新增分支时应同步往这里加一行。
+    const REQUIRED_ERROR_CODES: &[(&str, &str)] = &[
+        ("open", "invalid_open_target"),
+        ("open", "invalid_timeout"),
+        ("open", "unsupported_scheme"),
+        ("open", "wait_for_timeout"),
+        ("back", "invalid_timeout"),
+        ("reload", "invalid_timeout"),
+        ("capabilities", "daemon_not_running"),
+        ("tabs", "no_tabs"),
+        ("job", "job_not_found"),
+        ("trust-extension", "invalid_argument"),
+    ];
+
+    #[test]
+    fn schema_semantics_match_clap() {
+        let cli = Cli::command();
+        let entries = schema_entries();
+
+        // ---- 0) 命令总数：新增/删除命令必须同步 schema ----
+        let clap_names: BTreeSet<String> = cli
+            .get_subcommands()
+            .map(|sub| sub.get_name().to_string())
+            .filter(|name| name != "help")
+            .collect();
+        assert_eq!(
+            entries.len(),
+            55,
+            "schema 表项数应为 55（新增命令需同步本断言）：{:?}",
+            entries.iter().map(|entry| entry.name).collect::<Vec<_>>()
+        );
+        assert_eq!(clap_names.len(), 55, "clap 顶层命令数应为 55");
+
+        let mut problems: Vec<String> = Vec::new();
+
+        // ---- 1) error_codes 覆盖关键码 ----
+        for (command, code) in REQUIRED_ERROR_CODES {
+            let Some(entry) = entries.iter().find(|entry| entry.name == *command) else {
+                problems.push(format!(
+                    "schema 缺少命令 `{command}`，无法校验 error_code `{code}`"
+                ));
+                continue;
+            };
+            if !entry.error_codes.contains(code) {
+                problems.push(format!(
+                    "命令 `{command}` 的 error_codes 缺少 `{code}`（实际会发但表里没有）"
+                ));
+            }
+        }
+
+        // ---- 2) 逐命令语义比对（只覆盖无子命令的叶子命令） ----
+        for entry in &entries {
+            let Some(command) = cli
+                .get_subcommands()
+                .find(|sub| sub.get_name() == entry.name)
+            else {
+                continue;
+            };
+            // 带子命令的表项是扁平并集，default/enum 在不同子命令上本就不同，
+            // 这里只做名称集合比对（第 1 个测试已覆盖）。
+            if command.get_subcommands().next().is_some() {
+                continue;
+            }
+            let args = clap_args_by_long(command);
+            let table = entry.args.as_object();
+            if let Some(table) = table {
+                for (key, spec) in table {
+                    let Some(long) = key.strip_prefix("--") else {
+                        continue;
+                    };
+                    let Some(arg) = args.get(long) else {
+                        continue; // 缺参数已由另一个测试报出
+                    };
+                    let schema_type = spec
+                        .get("type")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    let action = arg.get_action();
+                    let schema_required = spec
+                        .get("required")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    if schema_required != arg.is_required_set() {
+                        problems.push(format!(
+                            "`{} {key}`：required 不一致（表={schema_required}，clap={}）",
+                            entry.name,
+                            arg.is_required_set()
+                        ));
+                    }
+                    // `Arg::get_action()` 返回 `&ArgAction`（该枚举不是 Copy/PartialEq），
+                    // 用 matches! 做引用匹配最稳。
+                    if matches!(action, clap::ArgAction::SetTrue) {
+                        // 布尔开关：表里必须是 bool，默认只能是 false。
+                        if schema_type != "bool" {
+                            problems.push(format!(
+                                "`{} {key}`：clap 是开关，表里 type={schema_type}（应为 bool）",
+                                entry.name
+                            ));
+                        }
+                        if let Some(default) = spec.get("default") {
+                            if default != &serde_json::Value::Bool(false) {
+                                problems.push(format!(
+                                    "`{} {key}`：布尔开关的默认值应为 false，表里是 {default}",
+                                    entry.name
+                                ));
+                            }
+                        }
+                    } else {
+                        if schema_type == "bool" {
+                            problems.push(format!(
+                                "`{} {key}`：表里写成 bool，但 clap 需要取值（不是开关）",
+                                entry.name
+                            ));
+                        }
+                        let schema_default = spec.get("default").map(value_to_default_string);
+                        let clap_default = arg
+                            .get_default_values()
+                            .first()
+                            .map(|value| value.to_string_lossy().into_owned());
+                        match (&schema_default, &clap_default) {
+                            (None, None) => {}
+                            (Some(a), Some(b)) if normalize_default(a) == normalize_default(b) => {}
+                            _ => problems.push(format!(
+                                "`{} {key}`：default 不一致（表={:?}，clap={:?}）",
+                                entry.name, schema_default, clap_default
+                            )),
+                        }
+                    }
+                    // enum：clap 声明的可选值必须都在表里（表可以更宽松，但不能漏）。
+                    //
+                    // 布尔开关（SetTrue）的 `true`/`false` 是 clap 自动派生的取值，
+                    // 不是业务枚举；表里的 `type:"bool"` 已经表达了这个语义，
+                    // 把它当成「漏写 enum」会让每个开关都误报。
+                    let clap_values: Vec<String> = if matches!(action, clap::ArgAction::SetTrue) {
+                        Vec::new()
+                    } else {
+                        arg.get_possible_values()
+                            .iter()
+                            .filter(|value| !value.is_hide_set())
+                            .map(|value| value.get_name().to_string())
+                            .collect()
+                    };
+                    if !clap_values.is_empty() {
+                        let schema_values: Vec<String> = spec
+                            .get("enum")
+                            .and_then(serde_json::Value::as_array)
+                            .map(|values| {
+                                values
+                                    .iter()
+                                    .filter_map(serde_json::Value::as_str)
+                                    .map(str::to_string)
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        for value in clap_values {
+                            if !schema_values.contains(&value) {
+                                problems.push(format!(
+                                    "`{} {key}`：clap 可选值 `{value}` 未写进表里的 enum {:?}",
+                                    entry.name, schema_values
+                                ));
+                            }
+                        }
+                    }
+                    // variadic：Append 型参数（Vec）必须在表里标 variadic。
+                    let schema_variadic = spec
+                        .get("variadic")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    let clap_variadic = matches!(action, clap::ArgAction::Append);
+                    if schema_variadic != clap_variadic {
+                        problems.push(format!(
+                            "`{} {key}`：variadic 不一致（表={schema_variadic}，clap={clap_variadic}）",
+                            entry.name
+                        ));
+                    }
+                }
+            }
+            // 位置参数：名字、数量与 required 都要对上（`<target>` ↔ clap 的 `target` 字段）。
+            let table_pos = table_positionals(&entry.args);
+            let clap_pos = clap_positionals(command);
+            if table_pos != clap_pos {
+                problems.push(format!(
+                    "`{}`：位置参数不一致（表={:?}，clap={:?}）",
+                    entry.name, table_pos, clap_pos
+                ));
+            }
+            for arg in command.get_positionals() {
+                let key = format!("<{}>", arg.get_id().as_str());
+                let Some(spec) = entry.args.get(key.as_str()) else {
+                    continue;
+                };
+                let schema_required = spec
+                    .get("required")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                if schema_required != arg.is_required_set() {
+                    problems.push(format!(
+                        "`{} {key}`：位置参数 required 不一致（表={schema_required}，clap={}）",
+                        entry.name,
+                        arg.is_required_set()
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            problems.is_empty(),
+            "schema 语义漂移，共 {} 处：\n{}",
             problems.len(),
             problems.join("\n")
         );

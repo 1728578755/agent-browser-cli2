@@ -78,7 +78,7 @@ atb cleanup             # 关闭本智能体 open 的标签页
 
 ## 5. 版本配套与升级
 
-三个版本：CLI/daemon 的 API 协议（当前 5）、扩展的消息协议（当前 4）、扩展的文件版本（当前 5.2.9）。
+三个版本：CLI/daemon 的 API 协议（当前 5）、扩展的消息协议（当前 4）、扩展的文件版本（当前 5.3.0）。
 
 ```bash
 atb status | jq '.compatibility'
@@ -123,7 +123,38 @@ atb status | jq '.compatibility'
 
 
 
-## 9. 被站点判定为自动化时怎么排查
+## 8. 结果语义：`ok:true` 不等于「动作成了」
+
+组合命令（`--wait-js`、`broadcast`、`scrape`、`run`、`batch`）会同时带回结果与子结论。判断成败以 **顶层 `ok`** 为准，不要只看退出码为 0：
+
+- `exec --wait-js`：脚本本身跑成功但等待失败时，`js_return` 里是 `{result, wait}` 或带 `combined_wait:true`，daemon 会写 `error_code:"wait_js_failed"` 并把顶层置为 `ok:false`、退出码 1。**看到 `wait_js_failed` 一律按失败处理**，不要当成「脚本跑完就继续」。
+- 页面上 `wait.ok=false` / `matched=false` 是结论，不是噪声；重试要带新的 deadline，而不是原样重发。
+- 严格度可调：`ATB_RESULT_STRICT=off|warn|strict`（默认 `warn`）。CI 与批量脚本建议 `strict`——任一子结论失败即整体 `ok:false`。
+- `outcome_unknown`（退出码 4）表示「请求已发出，响应没回来」。只有带同一个 `--idempotency-key` 才可安全重发；不要换 key 重试副作用命令。
+
+---
+
+## 9. 超时预算：一条命令一个 deadline
+
+`--timeout` 只管单次等待，**不管整条命令**；多 iframe、多次重试、分片轮询会把它成倍放大。默认由 daemon 维护总预算：
+
+| 变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `ATB_WAIT_MAX_TOTAL_SEC` | 600 | `wait` / `--wait-js` 整条命令的总上限（不是每片） |
+| `ATB_WAIT_MIN_INTERVAL_MS` | 50 | 轮询下限，防 `--interval 0` 忙轮询 |
+| `ATB_HTTP_SLACK_SEC` | 10 | CLI 发 HTTP 时在业务超时上追加的余量 |
+| `ATB_CHALLENGE_CLICK_TIMEOUT_SEC` | 8 | 挑战坐标点击整条链的硬上限 |
+| `ATB_CHALLENGE_MAX_IFRAMES` | 8 | 单次挑战探测处理的 iframe 上限（按面积取前 K） |
+
+实践：
+
+- 外层给总预算，内层用「剩余时间」：不要把同一个 `Duration` 复用到循环每一轮。
+- 预计超过 30 秒的操作改用 `--async` + `job wait`，把等待从命令行移到 daemon。
+- `job wait` 超时的退出码是 `3`，普通 `wait` 超时是 `1`；脚本按码分支，不要解析文本。
+
+---
+
+## 10. 被站点判定为自动化时怎么排查
 
 先别改浏览器参数，先看**站点到底读到了什么**。这一步只有 `atb stealth audit` 能回答：
 
@@ -176,7 +207,7 @@ atb stealth scrub
 
 ---
 
-## 10. 排障顺序
+## 11. 排障顺序
 
 ```text
 命令报错
@@ -188,9 +219,25 @@ atb stealth scrub
   ├─ 站点判定为自动化
   │   ├─ stealth audit → 看 findings[].scope
   │   ├─ self         → stealth scrub / network stop
-  │   └─ browser      → 换有头模式、真实 GPU（见第 9 节）
+  │   └─ browser      → 换有头模式、真实 GPU（见第 10 节）
   └─ 连接类问题
       ├─ status       看 summary / compatibility / next_steps
       ├─ doctor       逐项自检（不启动 daemon）
       └─ logs --tail  看 daemon 日志
 ```
+
+## 12. 安全档位选择
+
+默认安装是「单机单人」档：`ATB_WS_TRUST_MODE=compat`，谁装了扩展谁就能连 18765。需要更强隔离时按场景选：
+
+| 场景 | 建议 | 命令 |
+| --- | --- | --- |
+| 单机、单人、只用一份扩展 | 保持默认 `compat` | — |
+| 同机装了多份扩展 / 只想允许一份 | `ATB_WS_TRUST_MODE=whitelist` + `trust-extension <id>` | `atb trust-extension <extensionId>` 后 `ATB_WS_TRUST_MODE=whitelist atb restart` |
+| 共用机器（有别的系统用户或不可信进程） | `both`（白名单 + token） | `atb trust-extension <id> --token <value>`，再 `ATB_WS_TRUST_MODE=both atb restart` |
+| 只想要握手 token、不维护白名单 | `token` | `atb trust-extension --token <value>` 后切档 |
+
+- 非 `compat` 档是 fail-closed：配置缺失或校验失败会直接拒绝握手，不会退回放行。
+- 切档后跑一次 `atb status`：`security.mode` 与 `security.warning` 会告诉你当前档位；`compat` 一定带告警。
+- 关掉 `ATB_NO_DEBUGGER` 之外的加固：`ATB_NO_DEBUGGER=1` 禁止 attach；`ATB_IDEMPOTENCY_PERSIST=redacted`（默认）确保幂等记录不写响应体。
+- 白名单/token 只约束「谁能连 daemon」；扩展仍然无法验证「对端是不是真 daemon」，这是单向信任的已知边界。

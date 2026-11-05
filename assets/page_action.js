@@ -36,6 +36,48 @@ function __abcActTextMode() {
   return __abcActNodeCount <= __ABC_TEXT_INNER_LIMIT ? 'innerText' : 'textContent';
 }
 
+/// ---- shadow DOM 定位----
+/// find / snapshot 现在会把 open shadow root 里的元素也返回，选择器写成
+/// `"<host 文档路径> >>> <shadow 内相对路径>"`（pierce:true）。动作侧必须认这种
+/// 写法，否则「找到了却点不到」，工具链等于只修了一半。
+/// `>>>` 不是合法 CSS：主文档 querySelectorAll 会抛错，所以先按分隔符解析。
+const __ABC_ACT_SHADOW_MAX_ROOTS = 200;
+
+function __abcActShadowScopes() {
+  const out = [document];
+  const queue = [{ root: document, depth: 0 }];
+  while (queue.length) {
+    const item = queue.shift();
+    let hosts = [];
+    try { hosts = item.root.querySelectorAll('*'); } catch (_) { hosts = []; }
+    for (const el of hosts) {
+      let shadow = null;
+      try { shadow = el.shadowRoot; } catch (_) { shadow = null; }
+      if (!shadow) continue;
+      if (item.depth >= 8 || out.length > __ABC_ACT_SHADOW_MAX_ROOTS) continue;
+      out.push(shadow);
+      queue.push({ root: shadow, depth: item.depth + 1 });
+    }
+  }
+  return out;
+}
+
+/// `host >>> inner` 逐层进 open shadow root。任一层缺失返回 null（目标不在）。
+/// closed shadow root（host.shadowRoot === null）无法从页面 JS 进入，直接返回 null。
+function __abcActResolvePierce(raw) {
+  const parts = String(raw).split('>>>').map((item) => item.trim()).filter(Boolean);
+  if (!parts.length) return null;
+  let el = document.querySelector(parts[0]);
+  for (let i = 1; i < parts.length; i += 1) {
+    if (!el) return null;
+    let shadow = null;
+    try { shadow = el.shadowRoot; } catch (_) { shadow = null; }
+    if (!shadow) return null;
+    el = shadow.querySelector(parts[i]);
+  }
+  return el;
+}
+
 function __abcResolve(target, index) {
   if (!target) return null;
   if (typeof target === 'object' && target.selector) target = target.selector;
@@ -44,18 +86,34 @@ function __abcResolve(target, index) {
   let nodes = [];
   if (raw.startsWith('text=')) {
     const needle = raw.slice(5).trim().toLowerCase();
-    const all = document.querySelectorAll('body *');
+    const all = [];
+    // 文本匹配同样要进 shadow root：页面主体用 Web Components 时，
+    // 只在主文档里搜会把「看得见的按钮」判成不存在。
+    for (const scope of __abcActShadowScopes()) {
+      let found = [];
+      try {
+        // 主文档只扫 body 子树（保持历史口径：head/title 不是可点目标）；
+        // shadow root 没有 body 概念，直接扫全部。
+        found = scope === document
+          ? document.querySelectorAll('body *')
+          : scope.querySelectorAll('*');
+      } catch (_) { found = []; }
+      for (const el of found) all.push(el);
+    }
     const mode = __abcActTextMode();
     for (const el of all) {
       if (el.children.length > 3) continue;
       const text = mode === 'innerText' ? (el.innerText || el.textContent || '') : (el.textContent || '');
-      const t = text.trim().toLowerCase();
+      const t = String(text).trim().toLowerCase();
       if (t && t.includes(needle)) nodes.push(el);
       if (nodes.length > 200) break;
     }
   } else if (raw.startsWith('xpath=')) {
     const snapshot = document.evaluate(raw.slice(6), document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
     for (let i = 0; i < snapshot.snapshotLength; i += 1) nodes.push(snapshot.snapshotItem(i));
+  } else if (raw.indexOf('>>>') >= 0) {
+    const el = __abcActResolvePierce(raw);
+    if (el) nodes = [el];
   } else {
     nodes = Array.from(document.querySelectorAll(raw));
   }
@@ -262,9 +320,13 @@ function __abcAct(op, target, params) {
 
     if (op === 'setValue') {
       const value = params.value == null ? '' : String(params.value);
+      // append 的基准必须是**写入前**的当前值：
+      // 旧实现先按默认 clear 清空再读 el.value，于是 `append:true` 实际拿到空串，
+      // 行为退化成覆盖，调用方以为追加成功（回包 applied:true），输入框却被清空。
+      const base = String(el.value == null ? '' : el.value);
       if (params.clear !== false) __abcSetNativeValue(el, '');
-      // 期望值必须在写之前算好：append 的基准是「清空后」的当前值。
-      const want = params.append ? String(el.value) + value : value;
+      // 语义：append=true 时「base + value」；否则就是 value（clear 与否都不拼接）。
+      const want = params.append ? base + value : value;
       __abcSetNativeValue(el, want);
       __abcDispatch(el, 'input', {});
       __abcDispatch(el, 'change', {});

@@ -35,6 +35,150 @@ pub(crate) fn ws_trust_allows(trust: &WsTrust, extension_id: &str) -> bool {
             .any(|item| item.trim().eq_ignore_ascii_case(extension_id))
 }
 
+/// WS 握手信任档位（`ATB_WS_TRUST_MODE`）。
+///
+/// `Origin` 头是客户端自断言、可被本机任意进程伪造的，所以它只能当「像不像扩展」
+/// 的第一道筛子，不能当身份证明。真正的档位由用户在配置里显式选择：
+/// - `compat`（默认，向后兼容）：沿用旧行为，只校验 Origin 前缀 + 配置了才校验的
+///   白名单/token；握手回包带 `x-atb-ws-security-warning` 头提示风险。
+/// - `whitelist`：必须配置非空 `extension_ids`，且扩展 id 在名单内。
+/// - `token`：必须配置 `ws-trust.json` 的 token，且握手 `?token=` 恒定时间匹配。
+/// - `both`：白名单与 token 同时满足（多人共用机器的推荐档）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WsTrustMode {
+    Compat,
+    Whitelist,
+    Token,
+    Both,
+}
+
+impl WsTrustMode {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            WsTrustMode::Compat => "compat",
+            WsTrustMode::Whitelist => "whitelist",
+            WsTrustMode::Token => "token",
+            WsTrustMode::Both => "both",
+        }
+    }
+}
+
+/// 解析档位；非法值回落到 `compat`（与 `settings::ws_trust_mode` 的白名单一致，
+/// 这里再兜一层，保证直接从原始字符串构造时也不会 panic）。
+pub(crate) fn parse_ws_trust_mode(raw: &str) -> WsTrustMode {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "whitelist" => WsTrustMode::Whitelist,
+        "token" => WsTrustMode::Token,
+        "both" => WsTrustMode::Both,
+        _ => WsTrustMode::Compat,
+    }
+}
+
+/// 握手被拒绝时的结构化信息。`error_code` 稳定，供 CLI/ext 分支处理。
+#[derive(Debug)]
+pub(crate) struct WsHandshakeReject {
+    pub(crate) status: StatusCode,
+    pub(crate) error_code: &'static str,
+    pub(crate) message: String,
+    pub(crate) hint: &'static str,
+}
+
+/// 握手信任判定（纯函数，便于单测）。
+///
+/// 返回 `Ok(Some(warning))` 表示放行且应在回包里带安全告警（只有 compat 档），
+/// `Ok(None)` 表示放行且无需告警。
+pub(crate) fn ws_handshake_check(
+    mode: WsTrustMode,
+    trust: &WsTrust,
+    extension_id: &str,
+    provided_token: Option<&str>,
+) -> Result<Option<&'static str>, WsHandshakeReject> {
+    let token_matches = |expected: &str| {
+        provided_token.is_some_and(|provided| constant_time_eq(provided, expected))
+    };
+    let untrusted = |extension_id: &str| {
+        WsHandshakeReject {
+        status: StatusCode::FORBIDDEN,
+        error_code: "ws_untrusted_extension",
+        message: format!("扩展未信任：{extension_id} 不在 ws-trust.json 的 extension_ids 内"),
+        hint: "运行 atb trust-extension <扩展ID> 加入白名单，或把 ATB_WS_TRUST_MODE 改回 compat（不推荐）",
+    }
+    };
+    let token_invalid = || {
+        WsHandshakeReject {
+        status: StatusCode::UNAUTHORIZED,
+        error_code: "ws_token_invalid",
+        message: "WebSocket token 无效".to_string(),
+        hint: "在扩展里填写与 ws-trust.json 的 token 一致的值（atb trust-extension <扩展ID> --token <值>）",
+    }
+    };
+    let whitelist_missing = || WsHandshakeReject {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        error_code: "ws_whitelist_not_configured",
+        message: "ATB_WS_TRUST_MODE=whitelist/both，但 ws-trust.json 没有配置 extension_ids"
+            .to_string(),
+        hint: "运行 atb trust-extension <扩展ID> 写入白名单；或把 ATB_WS_TRUST_MODE 改回 compat",
+    };
+    let token_missing = || {
+        WsHandshakeReject {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        error_code: "ws_token_not_configured",
+        message: "ATB_WS_TRUST_MODE=token/both，但 ws-trust.json 没有配置 token".to_string(),
+        hint: "运行 atb trust-extension <扩展ID> --token <值> 写入 token；或把 ATB_WS_TRUST_MODE 改回 compat",
+    }
+    };
+
+    match mode {
+        // 兼容档：完整保留旧行为（配置了白名单/token 才校验），只在成功时给出告警。
+        WsTrustMode::Compat => {
+            if !ws_trust_allows(trust, extension_id) {
+                return Err(untrusted(extension_id));
+            }
+            if let Some(expected) = trust.token_value() {
+                if !token_matches(expected) {
+                    return Err(token_invalid());
+                }
+            }
+            Ok(Some(
+                "compat: origin header is forgeable; set ATB_WS_TRUST_MODE=token or run atb trust-extension",
+            ))
+        }
+        WsTrustMode::Whitelist => {
+            if trust.extension_ids.is_empty() {
+                return Err(whitelist_missing());
+            }
+            if !ws_trust_allows(trust, extension_id) {
+                return Err(untrusted(extension_id));
+            }
+            Ok(None)
+        }
+        WsTrustMode::Token => {
+            let Some(expected) = trust.token_value() else {
+                return Err(token_missing());
+            };
+            if !token_matches(expected) {
+                return Err(token_invalid());
+            }
+            Ok(None)
+        }
+        WsTrustMode::Both => {
+            if trust.extension_ids.is_empty() {
+                return Err(whitelist_missing());
+            }
+            if !ws_trust_allows(trust, extension_id) {
+                return Err(untrusted(extension_id));
+            }
+            let Some(expected) = trust.token_value() else {
+                return Err(token_missing());
+            };
+            if !token_matches(expected) {
+                return Err(token_invalid());
+            }
+            Ok(None)
+        }
+    }
+}
+
 /// `/reload-trust` 的判定核心：`Some(reason)` = 撤销，`None` = 保留。
 ///
 /// 判定顺序固定为「损坏 → 白名单 → token」，理由如下：
@@ -146,7 +290,7 @@ pub(crate) fn extension_id_from_origin(headers: &HeaderMap) -> Option<String> {
     }
 }
 
-/// 仅测试使用：判断 Origin 是否来自合法扩展。
+/// 仅作为「Origin 是否是合法扩展」的谓词保留（单元测试与文档用途）；
 /// 生产握手路径用 `extension_id_from_origin`，因为它还要拿 id 做白名单比对。
 #[cfg(test)]
 pub(crate) fn is_allowed_extension_origin(headers: &HeaderMap) -> bool {
@@ -169,7 +313,7 @@ pub(crate) fn query_param(query: Option<&str>, key: &str) -> Option<String> {
 /// **不**把裸 `+` 当空格：`+` 只在 `application/x-www-form-urlencoded` 的
 /// **请求体**里有空格含义，query 里的 `+` 是合法字面字符。以前这里把 `+`
 /// 解成空格，token 里带 `+` 且客户端没有 `encodeURIComponent` 时握手恒失败——
-/// 表现是「token 明明抄对了却 401」（A1-03）。真正的空格请用 `%20`。
+/// 表现是「token 明明抄对了却 401」。真正的空格请用 `%20`。
 pub(crate) fn percent_decode(value: &str) -> String {
     let bytes = value.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -231,48 +375,61 @@ pub(crate) async fn ws_handler(
                 .into_response();
         }
     };
-    // 2) 白名单：仅在配置了 extension_ids 时生效（空白名单 = 兼容模式，放行）。
-    if !ws_trust_allows(&trust, &extension_id) {
-        let path = ws_trust_path()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "<用户配置目录>/ws-trust.json".to_string());
-        return (
-            StatusCode::FORBIDDEN,
-            format!(
-                "扩展未信任：把 {extension_id} 加入 {path} 的 extension_ids，或运行 atb trust-extension {extension_id}"
-            ),
-        )
-            .into_response();
-    }
-    // 3) token：仅在配置了 token 时生效，从 `?token=` 取。
+    // 2) 档位 + 白名单 + token 统一走纯函数判定。
     //
-    // 无论配没配都记下"这次实际提供了什么"，登记连接时用它的指纹：
-    // 配置后来才收紧（白名单空 + token 有值）时，`/reload-trust` 靠这份指纹
-    // 把"当初没带 token 就进来了"的连接踢掉（§4.1）。
+    // 旧实现只把 Origin 头当身份证明：本机任意进程伪造 `chrome-extension://<id>`
+    // 就能接入（白名单也要先伪造 id 才绕得过，但 id 不是秘密）。现在由用户显式
+    // 选择信任档位；默认 compat 完全保持旧行为，只多返回一条安全告警。
+    let trust_mode = parse_ws_trust_mode(&crate::settings::ws_trust_mode());
     let provided_token = query_param(uri.query(), "token");
-    if let Some(expected) = trust.token_value() {
-        // 恒定时间比较，避免本地进程用响应时间侧信道逐字节猜 token（A1-04）。
-        if !provided_token
-            .as_deref()
-            .is_some_and(|provided| constant_time_eq(provided, expected))
-        {
-            return (
-                StatusCode::UNAUTHORIZED,
-                "WebSocket token 无效：请在扩展里填写与 ws-trust.json 中 token 一致的值",
-            )
-                .into_response();
-        }
-    }
-    // 4) 两者都没配 = 兼容模式。每个进程只提醒一次，别在握手热路径刷屏。
-    if !trust.enforces_identity() && !state.ws_security_warned.swap(true, Ordering::Relaxed) {
+    let security_warning =
+        match ws_handshake_check(trust_mode, &trust, &extension_id, provided_token.as_deref()) {
+            Ok(warning) => warning,
+            Err(reject) => {
+                eprintln!(
+                    "WebSocket 握手被拒绝（mode={} extension={extension_id}）：{}",
+                    trust_mode.as_str(),
+                    reject.message
+                );
+                return (
+                    reject.status,
+                    Json(json!({
+                        "ok": false,
+                        "error": reject.message,
+                        "error_code": reject.error_code,
+                        "hint": reject.hint,
+                        "trust_mode": trust_mode.as_str(),
+                    })),
+                )
+                    .into_response();
+            }
+        };
+    // 3) compat 档且**完全没配**身份校验时，每个进程只提醒一次，别在握手热路径刷屏。
+    if trust_mode == WsTrustMode::Compat
+        && !trust.enforces_identity()
+        && !state.ws_security_warned.swap(true, Ordering::Relaxed)
+    {
         eprintln!(
-            "WebSocket 未启用身份校验，任意 Chrome 扩展均可连接；可用 atb trust-extension <id> 加固"
+            "WebSocket 未启用身份校验（ATB_WS_TRUST_MODE=compat），任意 Chrome 扩展/本机进程均可连接；可用 atb trust-extension <id> 或 ATB_WS_TRUST_MODE=token 加固"
         );
     }
     // 只留指纹进登记表，明文 token 不落地。
     let conn_token_fp = provided_token.as_deref().map(token_fingerprint);
-    ws.on_upgrade(move |socket| handle_socket(socket, state, extension_id, conn_token_fp))
-        .into_response()
+    let mut response = ws
+        .on_upgrade(move |socket| handle_socket(socket, state, extension_id, conn_token_fp))
+        .into_response();
+    // 兼容档在握手回包里给出机器可读告警（ASCII，避免非法 header 字节）。
+    if let Some(warning) = security_warning {
+        response.headers_mut().insert(
+            "x-atb-ws-security-warning",
+            axum::http::HeaderValue::from_static(warning),
+        );
+        response.headers_mut().insert(
+            "x-atb-ws-trust-mode",
+            axum::http::HeaderValue::from_static("compat"),
+        );
+    }
+    response
 }
 
 /// 撤销信号的轮询间隔。信任配置变更极少发生，所以用轮询而不是全局条件变量：
@@ -295,15 +452,15 @@ pub(crate) const WS_INBOUND_SILENCE_LIMIT: Duration = Duration::from_secs(90);
 /// 单条下行消息的发送上限。
 ///
 /// `socket.send(...).await` 在对端不读时会一直挂着（TCP 缓冲区满），所以它必须
-/// 带超时：超时即主动断开，扩展会按自己的重试节奏重连，比僵在这里好（A1-08）。
+/// 带超时：超时即主动断开，扩展会按自己的重试节奏重连，比僵在这里好。
 ///
-/// S1-02：等待发送完成的这段时间**也**必须能被撤销打断——只把这个值当上限是不够的，
+/// 等待发送完成的这段时间**也**必须能被撤销打断——只把这个值当上限是不够的，
 /// 那意味着撤销最多被拖后 `WS_SEND_TIMEOUT` 才生效。实际实现在发送期间每
 /// `WS_REVOKE_POLL_INTERVAL`（500ms）查一次撤销位（见 `handle_socket`），
 /// 所以「撤销后 ≤500ms 断开」的承诺与实现一致；本值只是「对端一直不读」时的兜底上限。
 pub(crate) const WS_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// 发送 Close 帧，带超时（S1-01）。
+/// 发送 Close 帧，带超时。
 ///
 /// 撤销断开时旧实现直接 `socket.send(Message::Close(None)).await` 并把结果丢掉：对端不读
 /// （TCP 缓冲区满）时这一句会一直挂着，而连接循环已经准备退出，挂住的代价是
@@ -337,18 +494,219 @@ pub(crate) fn ws_connections_lock(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// 连接注销守卫。`handle_socket` 无论正常 break、提前 return 还是 panic 展开，
-/// `Drop` 都会把这次连接从登记表里删掉——漏删会让登记表无限增长，
-/// 而且 `/reload-trust` 会对着早已死掉的连接反复置撤销位。
+/// 单条连接的下行控制队列上限（`ATB_WS_OUTBOUND_MAX`，默认 512）。
+///
+/// 值域 `8..=65536`：太小会让正常心跳被丢，太大失去「有界」的意义。
+/// 说明：本轮只把它用在 pong 专用队列上；命令队列的完整背压需要跨文件把
+/// `Session.sender` 换成有界通道（见台账残余说明）。
+pub(crate) fn ws_outbound_max() -> usize {
+    crate::settings::env_usize_clamped("ATB_WS_OUTBOUND_MAX", 512, 8, 65_536)
+}
+
+/// 单帧发送的结果（发送/撤销/超时三态，供命令队列与 pong 队列共用）。
+enum WsSendOutcome {
+    Sent,
+    Failed(String),
+    TimedOut,
+    Revoked,
+}
+
+/// 带超时且可被撤销打断地发送一条文本帧。
+///
+/// 与旧内联实现等价：`WS_SEND_TIMEOUT` 是对端一直不读时的兜底上限；
+/// 等待期间每 `WS_REVOKE_POLL_INTERVAL` 查一次撤销位，保证「撤销后 ≤500ms 断开」。
+async fn send_text_guarded(
+    socket: &mut WebSocket,
+    text: String,
+    revoked: &AtomicBool,
+) -> WsSendOutcome {
+    let send = socket.send(Message::Text(text));
+    tokio::pin!(send);
+    let deadline = tokio::time::sleep(WS_SEND_TIMEOUT);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            result = &mut send => {
+                return match result {
+                    Ok(()) => WsSendOutcome::Sent,
+                    Err(err) => WsSendOutcome::Failed(err.to_string()),
+                };
+            }
+            _ = &mut deadline => return WsSendOutcome::TimedOut,
+            _ = tokio::time::sleep(WS_REVOKE_POLL_INTERVAL) => {
+                // 撤销位一旦置位就立刻放弃这条消息（连接马上就要断）。
+                if revoked.load(Ordering::Relaxed) {
+                    return WsSendOutcome::Revoked;
+                }
+            }
+        }
+    }
+}
+
+/// 连接结束后的会话清理。
+///
+/// 从 `handle_socket` 末尾抽出来，既供正常路径 `await`，也供守卫在 panic 展开时
+/// spawn 兜底。只处理「确实属于这条连接」的会话：扩展重载时新旧连接会短暂并存，
+/// 旧连接晚一步收尾不能把新连接刚注册的会话标成断开再删掉。
+///
+/// 连接代际 + 兜底：`session_key` 是确定性拼接，新连接重注册后会拿到
+/// **同一个 key**。判定因此是「`conn_id` 相等 **或**（`conn_id == 0` 且 sender 同通道）」：
+/// - `conn_id` 相等 = 显式代数匹配；
+/// - `conn_id == 0` 是 refresh 登记路径在「找不到连接」时的占位值，历史实现里这类
+///   会话永远清不掉（`0 != conn_id` 恒成立），必须按 `same_channel` 兜底。
+///
+/// 先克隆登记表（std Mutex，语句结束即释放）再取 driver 写锁：两把锁从不嵌套，
+/// 与 `apply_tabs_snapshot`（driver → registry，且 registry 在 drop 之后才取）一致。
+pub(crate) async fn cleanup_conn_sessions(
+    state: &AppState,
+    conn_id: u64,
+    sender: &mpsc::UnboundedSender<String>,
+    registered_ids: &std::sync::Mutex<HashSet<String>>,
+) {
+    let owned: Vec<String> = {
+        let registered_all: Vec<String> = registered_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .cloned()
+            .collect();
+        let mut driver = state.driver.write().await;
+        let mut owned = Vec::new();
+        for id in &registered_all {
+            if let Some(session) = driver.sessions.get_mut(id) {
+                let same_sender = session.sender.same_channel(sender);
+                // `conn_id == 0` 的会话靠 sender 兜底，否则永远清不掉。
+                let belongs_to_this =
+                    session.conn_id == conn_id || (session.conn_id == 0 && same_sender);
+                if !belongs_to_this {
+                    // 同一 key 已被新一代连接接管：这是**别人的**会话，跳过并留痕。
+                    eprintln!(
+                        "ws: 连接 {conn_id} 断开时跳过会话 {id}（当前代际 {} 已接管）",
+                        session.conn_id
+                    );
+                    continue;
+                }
+                session.disconnected_at = Some(Instant::now());
+                owned.push(id.clone());
+            }
+        }
+        owned
+    };
+    // 扩展断开时，挂在这些会话上的命令不会再有结果。
+    // 立即以 extension_disconnected 失败，别让 CLI 干等到 15~60 秒超时。
+    //
+    // 只对本连接**确实拥有**的会话取在途执行：`execs.active` 是「exec_id -> session_key」，
+    // 按 key 批量取会把新代际在同一标签上的在途执行一起打死。
+    {
+        let mut execs = state.execs.lock().await;
+        for session_key in owned.iter() {
+            for pending in execs.take_session(session_key) {
+                let _ = pending.tx.send(Err(anyhow!(
+                    "extension_disconnected: 浏览器扩展连接已断开，命令未完成（daemon 可能重启或插件被重载）"
+                )));
+            }
+        }
+    }
+    // 连接已断 = 会话确实销毁，会话级缓存（snapshots / page_scale / session_locks）
+    // 一并回收；扩展重连会重新 ExtReady 注册，代价只是重新探测一次页面规模。
+    //
+    // A2：断线走 `forget_session_after_disconnect`——它额外把「原来的默认目标」记进
+    // preferred，等重连后同一个 session_key 回到快照时再设回默认。真实关闭（close/prune/
+    // tab 关闭事件）仍走 `forget_session`，会把这个记忆一起忘掉。
+    for session_key in owned.iter() {
+        forget_session_after_disconnect(state, session_key).await;
+    }
+    // 登记表随会话回收。这个 Arc 在连接断开后本来就没有读者，
+    // 但 refresh 路径可能还短暂持有它（`connection_session_registry` 返回克隆），
+    // 清空后即便被读到也不会再指向已销毁的会话。
+    registered_ids
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+}
+
 pub(crate) struct WsConnGuard {
     pub(crate) state: AppState,
     pub(crate) conn_id: u64,
 }
 
-impl Drop for WsConnGuard {
-    fn drop(&mut self) {
+impl WsConnGuard {
+    /// 幂等注销：连接循环一 break 就调用，别等函数末尾的 Drop。
+    ///
+    /// 旧实现把注销完全交给 Drop，`break` 之后还要排队做会话清理、`forget_session`、
+    /// 向扩展发 debugClearAll……这整个异步窗口里死连接仍在 `ws_connections` 里，
+    /// 广播/`/reload-trust` 仍会选中它并静默丢消息。`remove` 本身幂等，重复调用无害。
+    pub(crate) fn unregister(&self) {
         // 全程无 await（std Mutex），所以能在 Drop 里安全完成。
         ws_connections_lock(&self.state).remove(&self.conn_id);
+    }
+}
+
+impl Drop for WsConnGuard {
+    fn drop(&mut self) {
+        self.unregister();
+    }
+}
+
+/// 会话清理守卫：会话清理是异步的（driver/execs 都是 tokio 锁），
+/// 没法放进 `Drop` 直接做，所以分两层：
+/// - 正常路径在 `handle_socket` 末尾显式 `cleanup_conn_sessions(...).await`，
+///   成功后 `disarm()`；
+/// - 只有 panic 展开等异常路径才会走到 `Drop`：同步注销连接（幂等），
+///   再把清理任务 spawn 到当前 runtime，保证会话不会永久滞留在「已连接」状态。
+pub(crate) struct WsSessionCleanupGuard {
+    state: AppState,
+    conn_id: u64,
+    sender: mpsc::UnboundedSender<String>,
+    registered_ids: Arc<std::sync::Mutex<HashSet<String>>>,
+    armed: bool,
+}
+
+impl WsSessionCleanupGuard {
+    pub(crate) fn new(
+        state: AppState,
+        conn_id: u64,
+        sender: mpsc::UnboundedSender<String>,
+        registered_ids: Arc<std::sync::Mutex<HashSet<String>>>,
+    ) -> Self {
+        Self {
+            state,
+            conn_id,
+            sender,
+            registered_ids,
+            armed: true,
+        }
+    }
+
+    /// 显式清理已经完成，Drop 时不再重复 spawn。
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for WsSessionCleanupGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        // 同步部分：注销登记（再调一次也幂等）。
+        ws_connections_lock(&self.state).remove(&self.conn_id);
+        // 异步部分：交给当前 runtime；不在 runtime 上下文（理论不可达）时只能放弃。
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            eprintln!(
+                "ws: 连接 {} 异常结束时不在 tokio runtime 内，跳过会话清理兜底",
+                self.conn_id
+            );
+            return;
+        };
+        let state = self.state.clone();
+        let conn_id = self.conn_id;
+        let sender = self.sender.clone();
+        let registered = self.registered_ids.clone();
+        handle.spawn(async move {
+            cleanup_conn_sessions(&state, conn_id, &sender, &registered).await;
+        });
     }
 }
 
@@ -365,6 +723,14 @@ pub(crate) async fn handle_socket(
     // 下行通道必须先建好：登记表要带着它，断开清理与 refresh 才能按 `same_channel`
     // 找到"这条连接登记过哪些会话"。
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    //  （部分）：pong 走独立的有界控制通道，不再和命令挤同一个无界队列。
+    //
+    // 命令队列的背压需要把 `Session.sender`/`WsConn.sender` 一起换成有界
+    // `mpsc::Sender`（跨 protocol.rs/state.rs/sessions.rs/exec.rs），本轮不改
+    // state.rs，因此**结果类消息仍是无界排队**；这里先把「控制帧优先」这一半做掉：
+    // 控制队列满时丢弃 pong（下个心跳会重发，比拖住命令更划算）。
+    let (pong_tx, mut pong_rx) = mpsc::channel::<String>(ws_outbound_max());
+    let mut pong_dropped = 0usize;
     // 会话登记表放进登记表共享给 refresh 路径：refresh 自己攒一份再丢掉的旧写法，
     // 会让"由 refresh 首次登记的会话"在断开时漏清理。
     let registered_ids: Arc<std::sync::Mutex<HashSet<String>>> =
@@ -380,10 +746,36 @@ pub(crate) async fn handle_socket(
         },
     );
     // 注销靠 Drop：正常 break / 提前 return / panic 都不会漏。
-    let _conn_guard = WsConnGuard {
+    // 正常路径在 break 后立刻显式 `unregister`（见循环之后），Drop 只是兜底。
+    let conn_guard = WsConnGuard {
         state: state.clone(),
         conn_id,
     };
+    // 会话清理的异常安全兜底（panic 展开时也能清掉会话）。
+    let mut session_guard =
+        WsSessionCleanupGuard::new(state.clone(), conn_id, tx.clone(), registered_ids.clone());
+    // 收帧循环只负责「读帧 / 刷新 last_inbound / 跑定时器」，
+    // `handle_ws_message` 派发到独立 task 串行执行（独立 channel 保序）。
+    //
+    // 旧实现把 `handle_ws_message(...).await` 放在 select 分支体里：慢分发（等
+    // driver 写锁、apply_tabs_snapshot）期间 select 不再轮询 90s/500ms 定时器，
+    // 健康连接会被误判半开，撤销轮询也会停摆。
+    let (dispatch_tx, mut dispatch_rx) = mpsc::unbounded_channel::<WsIncoming>();
+    let dispatch_state = state.clone();
+    let dispatch_sender = tx.clone();
+    let dispatch_registry = registered_ids.clone();
+    let mut dispatch_task = tokio::spawn(async move {
+        while let Some(incoming) = dispatch_rx.recv().await {
+            handle_ws_message(
+                incoming,
+                &dispatch_state,
+                dispatch_sender.clone(),
+                conn_id,
+                &dispatch_registry,
+            )
+            .await;
+        }
+    });
     // 撤销检查走独立定时分支：连接里只读一个 AtomicBool，不查询全局登记表。
     let mut revoke_tick = tokio::time::interval(WS_REVOKE_POLL_INTERVAL);
     // 最后一次收到**任何**入站帧的时刻（文本/二进制/ping 都算）。
@@ -394,69 +786,59 @@ pub(crate) async fn handle_socket(
     // 首次 tick 立刻完成，等价于「进来就查一次」，不影响后续节奏。
     //
     // 外层循环带标号：发送分支里「超时 / 发送失败 / 被撤销」都要直接结束整条连接
-    // （普通 `break` 只会退出内层选择，S1-02）。
+    // （普通 `break` 只会退出内层选择）。
     'connection: loop {
         tokio::select! {
             Some(outgoing) = rx.recv() => {
-                // 带超时的发送：对端不读时不能把整个连接循环（含 revoke 轮询）拖死。
-                //
-                // S1-02：等待发送完成期间同样要能被撤销打断。旧实现把整段 `send` 包在
-                // `timeout` 里当**唯一**的等待方式，于是对端不读时撤销轮询最多停摆
-                // 一个 `WS_SEND_TIMEOUT`（10s），与注释承诺的「≤500ms 断开」不符。
-                // 现在 send / 超时 / 撤销检查放在同一个内层 select：
-                // - `outgoing` 已经移进被 pin 的 send future，没被丢弃就仍是同一条消息，
-                //   消息顺序不变（只有「马上要被撤销断开」时才会提前放弃这条消息）；
-                // - 每轮新起一个 500ms 定时器，醒来只读一次 `revoked`，没撤销就继续等 send。
-                //
-                // send future 持有 `&mut socket`，所以整段等待放进独立作用域：
-                // 离开作用域后才能再借用 socket 发 Close（撤销分支就在下面）。
-                let mut send_failed: Option<String> = None;
-                let mut timed_out = false;
-                {
-                    let send = socket.send(Message::Text(outgoing));
-                    tokio::pin!(send);
-                    let deadline = tokio::time::sleep(WS_SEND_TIMEOUT);
-                    tokio::pin!(deadline);
-                    loop {
-                        tokio::select! {
-                            result = &mut send => {
-                                if let Err(err) = result {
-                                    send_failed = Some(err.to_string());
-                                }
-                                break;
-                            }
-                            _ = &mut deadline => {
-                                timed_out = true;
-                                break;
-                            }
-                            _ = tokio::time::sleep(WS_REVOKE_POLL_INTERVAL) => {
-                                // 撤销位一旦置位就立刻放弃这条消息（连接马上就要断）。
-                                if revoked.load(Ordering::Relaxed) {
-                                    break;
-                                }
-                            }
-                        }
+                // 带超时 + 可被撤销打断的发送（实现见 `send_text_guarded`）：
+                // 对端不读时不能把整个连接循环（含 revoke 轮询）拖死；等待期间
+                // 撤销位一旦置位就立刻放弃这条消息（连接马上就要断）。
+                match send_text_guarded(&mut socket, outgoing, revoked.as_ref()).await {
+                    WsSendOutcome::Sent => {}
+                    WsSendOutcome::Failed(err) => {
+                        eprintln!(
+                            "扩展 {extension_id} 下行发送失败，断开连接等待重连（connection_id={conn_id}）: {err}"
+                        );
+                        break 'connection;
+                    }
+                    WsSendOutcome::TimedOut => {
+                        eprintln!(
+                            "扩展 {extension_id} 在 {}s 内没有读走下行消息，断开连接等待重连（connection_id={conn_id}）",
+                            WS_SEND_TIMEOUT.as_secs()
+                        );
+                        break 'connection;
+                    }
+                    WsSendOutcome::Revoked => {
+                        eprintln!(
+                            "扩展 {extension_id} 已不再满足当前信任配置，断开其现有连接（connection_id={conn_id}）"
+                        );
+                        close_socket(&mut socket, &extension_id, conn_id).await;
+                        break 'connection;
                     }
                 }
-                if let Some(err) = send_failed {
-                    eprintln!(
-                        "扩展 {extension_id} 下行发送失败，断开连接等待重连（connection_id={conn_id}）: {err}"
-                    );
-                    break 'connection;
-                }
-                if timed_out {
-                    eprintln!(
-                        "扩展 {extension_id} 在 {}s 内没有读走下行消息，断开连接等待重连（connection_id={conn_id}）",
-                        WS_SEND_TIMEOUT.as_secs()
-                    );
-                    break 'connection;
-                }
-                if revoked.load(Ordering::Relaxed) {
-                    eprintln!(
-                        "扩展 {extension_id} 已不再满足当前信任配置，断开其现有连接（connection_id={conn_id}）"
-                    );
-                    close_socket(&mut socket, &extension_id, conn_id).await;
-                    break 'connection;
+            }
+            // pong 走独立优先通道。命令队列积压时心跳仍能按时回，
+            // 扩展不会因为「daemon 正在发大批结果」而误判断线。
+            Some(pong) = pong_rx.recv() => {
+                match send_text_guarded(&mut socket, pong, revoked.as_ref()).await {
+                    WsSendOutcome::Sent => {}
+                    WsSendOutcome::Revoked => {
+                        close_socket(&mut socket, &extension_id, conn_id).await;
+                        break 'connection;
+                    }
+                    WsSendOutcome::Failed(err) => {
+                        eprintln!(
+                            "扩展 {extension_id} 的 pong 发送失败，断开连接等待重连（connection_id={conn_id}）: {err}"
+                        );
+                        break 'connection;
+                    }
+                    WsSendOutcome::TimedOut => {
+                        eprintln!(
+                            "扩展 {extension_id} 在 {}s 内没有读走 pong，断开连接等待重连（connection_id={conn_id}）",
+                            WS_SEND_TIMEOUT.as_secs()
+                        );
+                        break 'connection;
+                    }
                 }
             }
             msg = socket.recv() => {
@@ -474,15 +856,17 @@ pub(crate) async fn handle_socket(
                 let Message::Text(text) = msg else { continue; };
                 if is_app_ping(&text) {
                     // 回一条应用层 pong（旧实现直接 `continue`，扩展永远收不到回应，
-                    // 只能靠 HTTP 探活兜底）。这里**不**新开裸 send：pong 塞进本连接的
-                    // 下行通道，复用下面「带超时 + 可被撤销打断」的发送分支，
-                    // 发送失败/超时按同一条路径断开重连。
+                    // 只能靠 HTTP 探活兜底）。 ：pong 走独立的有界优先通道，
+                    // 满时丢弃这一条（下个心跳周期会重发），绝不拖住命令下行。
                     let pong = json!({ "type": "pong" }).to_string();
-                    if tx.send(pong).is_err() {
-                        eprintln!(
-                            "扩展 {extension_id} 的 pong 无法入队（下行接收端已退出，connection_id={conn_id}），断开等待重连"
-                        );
-                        break 'connection;
+                    if pong_tx.try_send(pong).is_err() {
+                        pong_dropped += 1;
+                        if pong_dropped == 1 || pong_dropped.is_multiple_of(64) {
+                            eprintln!(
+                                "扩展 {extension_id} 的控制队列已满（ATB_WS_OUTBOUND_MAX={}），已丢弃 {pong_dropped} 条 pong（connection_id={conn_id}）",
+                                ws_outbound_max()
+                            );
+                        }
                     }
                     continue;
                 }
@@ -496,8 +880,14 @@ pub(crate) async fn handle_socket(
                 }
                 match serde_json::from_str::<WsIncoming>(&text) {
                     Ok(incoming) => {
-                        handle_ws_message(incoming, &state, tx.clone(), conn_id, &registered_ids)
-                            .await
+                        // 派发到独立 task 串行处理，收帧循环立即回到 select，
+                        // 90s 半开检测/撤销轮询不再被慢分发饿死。
+                        if dispatch_tx.send(incoming).is_err() {
+                            eprintln!(
+                                "扩展 {extension_id} 的消息分发队列已关闭，断开连接（connection_id={conn_id}）"
+                            );
+                            break 'connection;
+                        }
                     }
                     Err(err) => eprintln!("WebSocket 消息解析失败: {err}: {text}"),
                 }
@@ -533,76 +923,25 @@ pub(crate) async fn handle_socket(
             }
         }
     }
-    // 只处理「确实属于这条连接」的会话：扩展重载时新旧连接会短暂并存，
-    // 旧连接晚一步收尾不能把新连接刚注册的会话标成断开再删掉。
-    //
-    // 连接代际：`session_key` 是确定性拼接，新连接重注册后会拿到**同一个 key**。
-    // 判定因此有两道：`conn_id` 相等（主判据，显式代数）与 `sender` 同通道（兜底，
-    // 覆盖 refresh 登记时 conn_id 缺失的历史路径）。任一不等就整条跳过——
-    // 不 take_session、不 forget_session、不动 disconnected_at。
-    //
-    // 先克隆登记表（std Mutex，语句结束即释放）再取 driver 写锁：两把锁从不嵌套，
-    // 与 `apply_tabs_snapshot`（driver → registry，且 registry 在 drop 之后才取）一致。
-    let owned: Vec<String> = {
-        let registered_all: Vec<String> = registered_ids
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .iter()
-            .cloned()
-            .collect();
-        let mut driver = state.driver.write().await;
-        let mut owned = Vec::new();
-        for id in &registered_all {
-            if let Some(session) = driver.sessions.get_mut(id) {
-                if !session.sender.same_channel(&tx) {
-                    // 同一 key 已被新一代连接接管：这是**别人的**会话，跳过并留痕。
-                    eprintln!("ws: 连接 {conn_id} 断开时跳过会话 {id}（登记的通道属于另一条连接）");
-                    continue;
-                }
-                if session.conn_id != conn_id {
-                    eprintln!(
-                        "ws: 连接 {conn_id} 断开时跳过会话 {id}（当前代际 {} 已接管）",
-                        session.conn_id
-                    );
-                    continue;
-                }
-                session.disconnected_at = Some(Instant::now());
-                owned.push(id.clone());
-            }
-        }
-        owned
-    };
-    // 扩展断开时，挂在这些会话上的命令不会再有结果。
-    // 立即以 extension_disconnected 失败，别让 CLI 干等到 15~60 秒超时。
-    //
-    // 只对本连接**确实拥有**的会话取在途执行：`execs.active` 是「exec_id -> session_key」，
-    // 按 key 批量取会把新代际在同一标签上的在途执行一起打死。
-    {
-        let mut execs = state.execs.lock().await;
-        for session_key in owned.iter() {
-            for pending in execs.take_session(session_key) {
-                let _ = pending.tx.send(Err(anyhow!(
-                    "extension_disconnected: 浏览器扩展连接已断开，命令未完成（daemon 可能重启或插件被重载）"
-                )));
-            }
+    // 先把这条连接从登记表摘掉，再做后续异步清理。旧实现要等到函数
+    // 末尾（会话清理、forget_session 全部完成之后）才靠 Drop 注销，这个窗口里
+    // 死连接仍会被广播 / `/reload-trust` 选中并静默丢消息。`remove` 幂等。
+    conn_guard.unregister();
+    // 先让分发队列把已经收到的消息处理完，再清理会话——否则最后一条
+    // `ext_ready`/`tabs_update` 可能在清理之后才落库，把刚清掉的会话重新登记。
+    drop(dispatch_tx);
+    match tokio::time::timeout(Duration::from_secs(5), &mut dispatch_task).await {
+        Ok(_) => {}
+        Err(_) => {
+            eprintln!(
+                "ws: 连接 {conn_id} 的消息分发任务未在 5s 内退出，强制中止（避免拖住断开清理）"
+            );
+            dispatch_task.abort();
         }
     }
-    // 连接已断 = 会话确实销毁，会话级缓存（snapshots / page_scale / session_locks）
-    // 一并回收；扩展重连会重新 ExtReady 注册，代价只是重新探测一次页面规模。
-    //
-    // A2：断线走 `forget_session_after_disconnect`——它额外把「原来的默认目标」记进
-    // preferred，等重连后同一个 session_key 回到快照时再设回默认。真实关闭（close/prune/
-    // tab 关闭事件）仍走 `forget_session`，会把这个记忆一起忘掉。
-    for session_key in owned.iter() {
-        forget_session_after_disconnect(&state, session_key).await;
-    }
-    // 登记表随会话回收。这个 Arc 在连接断开后本来就没有读者，
-    // 但 refresh 路径可能还短暂持有它（`connection_session_registry` 返回克隆），
-    // 清空后即便被读到也不会再指向已销毁的会话。
-    registered_ids
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clear();
+    // 正常路径显式清理；守卫在 panic 展开时用 spawn 兜底。
+    cleanup_conn_sessions(&state, conn_id, &tx, &registered_ids).await;
+    session_guard.disarm();
 }
 
 pub(crate) fn should_set_default_session(driver: &DriverState, session_key: &str) -> bool {
@@ -630,12 +969,12 @@ pub(crate) fn should_set_default_session(driver: &DriverState, session_key: &str
     }
 }
 
-/// 迟到结果暂存的保留时间（A1-09）：5 分钟内可凭 exec_id 查回。
+/// 迟到结果暂存的保留时间：5 分钟内可凭 exec_id 查回。
 pub(crate) const LATE_RESULT_TTL: Duration = Duration::from_secs(300);
 /// 迟到结果暂存的兜底上限：防异常扩展灌爆内存，超出淘汰最旧一项。
 pub(crate) const LATE_RESULT_LIMIT: usize = 512;
 
-/// 把迟到结果/错误存入暂存表（A1-09）。
+/// 把迟到结果/错误存入暂存表。
 ///
 /// 旧实现在 pending 已被超时/断开路径 take 掉之后收到扩展回包，直接静默丢弃：
 /// 调用方只知道「超时」，动作实际已执行成什么样永远查不到。暂存 5 分钟后，
@@ -663,7 +1002,7 @@ pub(crate) async fn store_late_result(state: &AppState, exec_id: &str, value: Va
 /// **锁约束（旧报告 #1 的死锁，防止回归）**：扩展的回包必须先进入这条消息循环
 /// 才能被处理，所以任何"持锁等回包"都是死锁。当前实现遵守：
 /// - `Ack` / `Result` / `Error` 只碰 `execs`（`state.execs`）与**同步**的
-///   `ws_connections` 登记表（代际比对），不碰 `driver`、不做跨任务等待；
+///   `ws_connections` 登记表（的代际比对），不碰 `driver`、不做跨任务等待；
 /// - `driver` 锁只在 `apply_tabs_snapshot` 内短暂持有，持锁期间没有任何 await
 ///   外部回包（登记表合并也挪到了 drop 之后）；
 /// - 需要等结果的地方一律「取 sender → 释放 `driver` 锁 → 等 oneshot」
@@ -725,25 +1064,32 @@ pub(crate) async fn handle_ws_message(
             result,
             new_tabs,
         } => {
-            let (pending, session_key) = {
+            // 代际判定必须在 `take(id)` **之前**。
+            //
+            // 旧实现先 take 再判 owner：一旦这条 Result 来自旧连接，pending 已被
+            // 移走，oneshot 被静默丢弃，调用方只能等到泛化的 RecvError/超时；
+            // 而真正属于新连接的结果也不会再来。现在「不属于本连接」就整条放弃、
+            // **保留** pending/active 登记，让命令按自己的超时（或新连接的正常回包）收敛。
+            //
+            // 锁序：execs（tokio）→ ws_connections → session_registry（后两者 std），
+            // 与 ACK 分支、模块注释里的约定一致；取得 execs 之后不再 await。
+            let pending = {
                 let mut execs = state.execs.lock().await;
                 let session_key = execs.active.get(id).cloned();
-                (execs.take(id), session_key)
-            };
-            // 结果必须来自「该会话当前归属的那一代连接」。旧连接迟到的回包
-            // 在语义上属于一条已经作废的通道，照收会把结果交给不对的调用方。
-            if let Some(session_key) = session_key.as_deref() {
-                if let Some(owner) = session_owner_conn(state, session_key) {
-                    if owner != conn_id {
-                        eprintln!(
-                            "ws: 丢弃连接 {conn_id} 的迟到结果 {id}（会话 {session_key} 已由连接 {owner} 接管）"
-                        );
-                        // 不放 late_results：那是「请求已完成但调用方超时」的补偿路径，
-                        // 而这一条根本没被执行者认可过，缓存它只会误导后续查询。
-                        return;
+                if let Some(session_key) = session_key.as_deref() {
+                    if let Some(owner) = session_owner_conn(state, session_key) {
+                        if owner != conn_id {
+                            eprintln!(
+                                "ws: 丢弃连接 {conn_id} 的迟到结果 {id}（会话 {session_key} 已由连接 {owner} 接管，保留原登记）"
+                            );
+                            // 不放 late_results：那是「请求已完成但调用方超时」的补偿路径，
+                            // 而这一条根本没被执行者认可过，缓存它只会误导后续查询。
+                            return;
+                        }
                     }
                 }
-            }
+                execs.take(id)
+            };
             if let Some(pending) = pending {
                 let _ = pending.tx.send(Ok(ExecResult {
                     data: Some(result.clone()),
@@ -752,7 +1098,7 @@ pub(crate) async fn handle_ws_message(
                     new_tabs: new_tabs.clone(),
                 }));
             } else {
-                // A1-09 迟到结果暂存：pending 不存在说明请求已被超时/断开路径
+                // 迟到结果暂存：pending 不存在说明请求已被超时/断开路径
                 // take 掉（或 id 未知）。旧实现在这里静默丢弃——调用方只知道
                 // 「超时」，动作实际已执行成什么样永远查不到。现在暂存 5 分钟，
                 // CLI 可凭错误信息里的 exec_id 用 GET /exec-result/:id 查回。
@@ -769,21 +1115,22 @@ pub(crate) async fn handle_ws_message(
             error,
             new_tabs,
         } => {
-            let (pending, session_key) = {
+            // 同 Result 分支——代际不符时保留登记，不 take。
+            let pending = {
                 let mut execs = state.execs.lock().await;
                 let session_key = execs.active.get(id).cloned();
-                (execs.take(id), session_key)
-            };
-            if let Some(session_key) = session_key.as_deref() {
-                if let Some(owner) = session_owner_conn(state, session_key) {
-                    if owner != conn_id {
-                        eprintln!(
-                            "ws: 丢弃连接 {conn_id} 的迟到错误 {id}（会话 {session_key} 已由连接 {owner} 接管）"
-                        );
-                        return;
+                if let Some(session_key) = session_key.as_deref() {
+                    if let Some(owner) = session_owner_conn(state, session_key) {
+                        if owner != conn_id {
+                            eprintln!(
+                                "ws: 丢弃连接 {conn_id} 的迟到错误 {id}（会话 {session_key} 已由连接 {owner} 接管，保留原登记）"
+                            );
+                            return;
+                        }
                     }
                 }
-            }
+                execs.take(id)
+            };
             if let Some(pending) = pending {
                 let mut value = json!({ "error": error.clone() });
                 if let Some(tabs) = new_tabs.clone() {
@@ -791,7 +1138,7 @@ pub(crate) async fn handle_ws_message(
                 }
                 let _ = pending.tx.send(Err(anyhow!(value.to_string())));
             } else {
-                // A1-09：迟到错误同样暂存（对称于 Result 分支），不再静默丢弃。
+                // 迟到错误同样暂存（对称于 Result 分支），不再静默丢弃。
                 let value = json!({ "result": Value::Null, "error": error.clone() });
                 store_late_result(state, id, value).await;
             }
@@ -823,7 +1170,7 @@ pub(crate) async fn handle_ws_message(
             warnings,
             tabs,
         } => {
-            // 扩展自检信息以前被 serde 静默丢弃：最典型的是
+            // 扩展自检信息以前被 serde 静默丢弃（R-19）：最典型的是
             // 「queryTabs 失败 → 上报 0 个标签」，用户只看到「没有可用标签页」，
             // 完全不知道扩展自己已经报了错。留最近一次快照给 `/health` 展示。
             if !warnings.is_empty() {

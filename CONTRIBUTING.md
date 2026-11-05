@@ -144,11 +144,11 @@ PR 描述写清三件事：改了哪一层、为什么改、怎么验证。输�
 
 - 版本唯一真相源是 `package.json`。
 - 改版本后跑 `npm run sync-version`，它写 `Cargo.toml`、`README.md`、`README_EN.md`，并 `git add`。
-- 平台包清单必须四处一致：`package.json` 的 `optionalDependencies`、`scripts/sync-optional-deps.mjs`、`.github/workflows/publish.yml` 的 matrix、`npm/bin/atb.js` 的 `platformPackageName`。
+- 平台包清单必须四处一致：`package.json` 的 `optionalDependencies`、`node scripts/sync-version.mjs --deps`、`.github/workflows/publish.yml` 的 matrix、`npm/bin/atb.js` 的 `platformPackageName`。
 - 扩展版本独立维护：改 `assets/atb_bridge/manifest.json`，同步文档里的版本断言。
 - 发布由 push tag `v*` 触发，也可手动 dispatch。workflow 构建 5 个平台包后发布 npm。
 
-`node scripts/sync-version.mjs` 同时校验 `package-lock.json` 与 `Cargo.lock` 的根包版本。锁文件不由它写入：前者用 `node scripts/sync-optional-deps.mjs`，后者交给 cargo。
+`node scripts/sync-version.mjs` 同时校验 `package-lock.json` 与 `Cargo.lock` 的根包版本。锁文件不由它写入：前者用 `node scripts/sync-version.mjs --deps`，后者交给 cargo。
 
 ## 文档规则
 

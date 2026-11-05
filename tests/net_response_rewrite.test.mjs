@@ -16,6 +16,17 @@ import vm from 'node:vm';
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PAGE_NET = join(HERE, '..', 'assets', 'page_net.js');
 
+// 脚本是顶层 await，任意一次 fetch 卡住都会让 CI 永久挂起。
+// 所有跨进程/页面边界都套一层硬超时，失败时给出明确断言而不是无声等待。
+const TIMEOUT_MS = 5000;
+function withTimeout(promise, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} 超过 ${TIMEOUT_MS}ms 未返回`)), TIMEOUT_MS);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 const results = [];
 function check(name, ok, detail) {
   results.push({ name, ok, detail });
@@ -64,6 +75,7 @@ function loadPageNet(originalFetch, XhrClass) {
     XMLHttpRequest: Xhr,
     removeEventListener: () => {},
     location: { href: 'https://example.com/page' },
+    navigator: { userAgent: 'Mozilla/5.0 (ATB test)', language: 'en-US' },
     performance: { now: () => Date.now() },
     setTimeout,
     clearTimeout,
@@ -72,7 +84,8 @@ function loadPageNet(originalFetch, XhrClass) {
   const context = vm.createContext({
     window,
     self: window,
-    document: { addEventListener: () => {}, readyState: 'complete', documentElement: {} },
+    navigator: window.navigator,
+    document: { addEventListener: () => {}, readyState: 'complete', documentElement: {}, title: 'ATB test' },
     location: window.location,
     console,
     setTimeout,
@@ -118,7 +131,7 @@ function loadPageNet(originalFetch, XhrClass) {
   let returned;
   let threw = null;
   try {
-    returned = await window.fetch('https://example.com/api/thing');
+    returned = await withTimeout(window.fetch('https://example.com/api/thing'), 'fetch thing');
   } catch (err) {
     threw = err;
   }
@@ -158,7 +171,7 @@ function loadPageNet(originalFetch, XhrClass) {
   let returned = null;
   let threw = null;
   try {
-    returned = await window.fetch('https://example.com/api/no-content');
+    returned = await withTimeout(window.fetch('https://example.com/api/no-content'), 'fetch no-content');
   } catch (err) {
     threw = err;
   }
@@ -178,7 +191,7 @@ function loadPageNet(originalFetch, XhrClass) {
   let returned;
   let threw = null;
   try {
-    returned = await window.fetch('https://example.com/api/patched');
+    returned = await withTimeout(window.fetch('https://example.com/api/patched'), 'fetch patched');
   } catch (err) {
     threw = err;
   }
@@ -186,7 +199,7 @@ function loadPageNet(originalFetch, XhrClass) {
   check('显式 body 时不抛错', threw === null, threw && threw.message);
   check('返回的是新响应，不是原对象', returned !== original, '返回了原对象，说明改写被跳过');
   if (returned && returned !== original) {
-    const text = await returned.text();
+    const text = await withTimeout(returned.text(), '读取改写后的 body');
     check('新响应带规则里的 body', text === '{"patched":true}', text);
     check('新响应带规则里的 status', returned.status === 201, String(returned.status));
   }
@@ -194,6 +207,7 @@ function loadPageNet(originalFetch, XhrClass) {
   const log = net({ action: 'log' });
   const patchedEntries = (log.items || log.entries || []).filter((item) => String(item.url || '').includes('/api/patched'));
   const entry = patchedEntries.find((item) => 'response_modified' in item) || patchedEntries[patchedEntries.length - 1];
+  check('显式 body 场景有日志（兜底，避免整组断言静默跳过）', Boolean(entry), JSON.stringify(log).slice(0, 300));
   if (entry) {
     check('显式 body 时日志标记已改写', entry.response_modified === true, JSON.stringify(entry));
   }
@@ -215,14 +229,15 @@ function loadPageNet(originalFetch, XhrClass) {
 
   let returned;
   try {
-    returned = await window.fetch('https://example.com/api/readable');
+    returned = await withTimeout(window.fetch('https://example.com/api/readable'), 'fetch readable');
   } catch (err) {
     returned = null;
     check('可读 body 场景不应抛错', false, err.message);
   }
+  check('可读 body 场景有返回对象（兜底，避免整组断言静默跳过）', Boolean(returned), 'fetch 没有返回响应');
   if (returned) {
     check('可读 body 时仍然改写（未被保护误伤）', returned !== original, '返回了原对象');
-    check('body 保留原内容', (await returned.text()) === 'real-body', '');
+    check('body 保留原内容', (await withTimeout(returned.text(), '读取透传后的 body')) === 'real-body', '');
     check('status 已按规则改写', returned.status === 202, String(returned.status));
   }
 }
@@ -333,6 +348,7 @@ function loadPageNet(originalFetch, XhrClass) {
     xhr.fire('loadend');
 
     const entry = xhrLog(net, '/api/xhr-blob');
+    check('XHR blob 场景有日志（兜底，避免整组断言静默跳过）', Boolean(entry), '没有该请求的日志');
     if (entry) {
       check('XHR blob 只改 status 时标记已改写', entry.response_modified === true, JSON.stringify(entry));
       check(
@@ -365,8 +381,10 @@ function loadPageNet(originalFetch, XhrClass) {
 
 const failed = results.filter((item) => !item.ok);
 console.log(`\n${results.length - failed.length}/${results.length} passed`);
+process.exitCode = failed.length ? 1 : 0;
 if (failed.length) {
   console.log('failed:');
   for (const item of failed) console.log('  - ' + item.name);
   process.exit(1);
 }
+process.exit(0);

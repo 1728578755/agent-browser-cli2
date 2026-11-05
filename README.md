@@ -9,9 +9,8 @@
 <p>
   <a href="https://github.com/1728578755/atb-cli"><img src="https://img.shields.io/badge/CLI-atb-2ea44f" alt="CLI atb"></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-green" alt="License MIT"></a>
-  <a href="https://github.com/1728578755/atb-cli/actions/workflows/ci.yml"><img src="https://github.com/1728578755/atb-cli/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/1728578755/atb-cli"><img src="https://img.shields.io/badge/sys-win%2Fmac%2Flinux-0078D6?labelColor=0078D6&color=C0C0C0" alt="sys win/mac/linux"></a>
-  <a href="https://github.com/1728578755/atb-cli/releases"><img src="https://img.shields.io/badge/release-v0.7.1-orange" alt="release v0.7.1"></a>
+  <a href="https://github.com/1728578755/atb-cli/releases"><img src="https://img.shields.io/badge/release-v0.7.2-orange" alt="release v0.7.2"></a>
   <a href="https://github.com/1728578755/atb-cli/pulls"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen" alt="PRs welcome"></a>
 </p>
 
@@ -89,7 +88,7 @@ npm i -g @g1728578755/atb
 atb status
 ```
 
-预编译二进制按平台从 `optionalDependencies` 安装，不需要 Rust 工具链。npm 包只提供一个命令名 `atb`。
+预编译二进制按平台从 `optionalDependencies` 安装，不需要 Rust 工具链。
 
 ### 源码构建
 
@@ -105,7 +104,7 @@ cargo build --release
 1. 从 [最新 Release](https://github.com/1728578755/atb-cli/releases/latest) 下载 `chrome-extensions.zip`，解压到一个固定目录（zip 根目录就是扩展文件，`manifest.json` 直接在该目录里），或直接用仓库里的 `assets/atb_bridge`。
 2. 打开 `chrome://extensions`（Edge 为 `edge://extensions`），开启开发者模式，点「加载已解压的扩展程序」，选中直接含 `manifest.json` 的那一层目录。
 3. 浏览器里至少留一个正常网页标签页，不要只停在 `about:blank` 或 `chrome://`。
-4. **本版本需要扩展 5.2.9**。覆盖扩展目录后，daemon 在下次握手时会让扩展自动重载；daemon 未运行就到扩展管理页手动点「重新加载」——只覆盖文件不重载，页面里跑的还是旧代码。
+4. **本版本需要扩展 5.3.0**。覆盖扩展目录后，daemon 在下次握手时会让扩展自动重载；daemon 未运行就到扩展管理页手动点「重新加载」——只覆盖文件不重载，页面里跑的还是旧代码。
 
 ### 验证
 
@@ -147,7 +146,22 @@ WSL 需 `WSL 2.0.0+`，建议 Windows 11 22H2+ 并在 `.wslconfig` 开 `networki
 
 ### 协议
 
-三个版本必须配套：CLI ↔ daemon 的 API 协议（当前 **5**）、扩展消息协议（当前 **4**）、扩展文件版本（当前 **5.2.9**）。`atb status` 的 `compatibility` 字段会同时给出期望值与实际值，不配套时带 `fixes[]`。
+三个版本必须配套：CLI ↔ daemon 的 API 协议（当前 **5**）、扩展消息协议（当前 **4**）、扩展文件版本（当前 **5.3.0**）。`atb status` 的 `compatibility` 字段会同时给出期望值与实际值，不配套时带 `fixes[]`。
+
+### 0.7.2 / 扩展 5.3.0 的新增能力
+
+| 能力 | 说明 |
+| --- | --- |
+| Shadow DOM | `find` / `snapshot` / `read` 递归 open shadow root，结果带 `scope:"shadow"`、`host_selector`、`shadow_path`，选择器写作 `宿主 >>> 相对路径`；closed shadow root 不可达，回包用 `shadow_closed_unreachable` 明示 |
+| PDF 分页 | 图片型 PDF 按 14200pt 切片成多页，并先按 `dpr` 归一化，HiDPI 下不再放大；回包给 `pages` / `width_pt` / `height_pt` |
+| `--max-height` | CDP 主截图路径与拼图回落都生效，超出截断并标 `truncated:true` |
+| 下载名净化 | `download --filename` 取 basename，拒绝 `..` / 分隔符 / Windows 保留名；回包 `filename_sanitized` |
+| 下载取消 | `ATB_DOWNLOAD_CANCEL_ON_TIMEOUT=1` 让 `download-wait` 超时时主动取消，`ATB_DOWNLOAD_CANCEL_ERASE=1` 再擦除记录 |
+| `broadcast` | `--args` 里的路径按工作目录绝对化，`--dry-run` 在本地出计划 |
+| `scrape` | 传输层失败标 `outcome_unknown`（退出码 4）且不重试；`--concurrency` / `--batch` 值域 1..=32 |
+| `tabs --limit 0` | 表示不截断；`tabs_count` 仍是原始总数 |
+| `logs` | 输出 JSON：`{ok, lines[], path, truncated}` |
+| WS 信任档位 | `ATB_WS_TRUST_MODE=compat\|whitelist\|token\|both`，默认 `compat`；共用机器建议 `both` |
 
 ## 常用工作流
 
@@ -291,14 +305,14 @@ atb logs --tail 100
 
 | 项 | 值 |
 | --- | --- |
-| CLI / daemon | `0.7.1` |
+| CLI / daemon | `0.7.2` |
 | CLI ↔ daemon API 协议 | `5` |
 | 扩展消息协议 | `4` |
-| 扩展文件版本 | `5.2.9` |
+| 扩展文件版本 | `5.3.0` |
 | 最低 Chrome | `120` |
 
-- 当前版本：`0.7.1`
-- 配套扩展：`5.2.9`（显示名 `ATB`）
+- 当前版本：`0.7.2`
+- 配套扩展：`5.3.0`（显示名 `ATB`）
 
 ```bash
 atb status
@@ -333,12 +347,141 @@ atb install-skill                # 主目录 ~/.agents/skills/atb；五个 Agent
 
 升级 CLI：`npm i -g @g1728578755/atb@latest`，然后按「加载扩展」一节更新扩展文件。完整版本记录见 [CHANGELOG.md](./CHANGELOG.md)，交给 AI 执行的升级流程见 [AI_INSTALL.md](./AI_INSTALL.md)。
 
+## 环境变量
+
+所有阈值、档位与开关都能用 `ATB_*` 显式调参；旧前缀 `AGENT_BROWSER_CLI_*` 仍兼容，新名优先。下表是用户可见的 56 个，测试/CI 专用的 9 个单列在最后。
+
+### 身份与运行位置
+
+| 变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `ATB_AGENT` | 终端会话标识 → `default` | 调用方身份，决定默认目标与 `cleanup` 范围 |
+| `ATB_HOME` | `~/.atb` | 配置目录；只影响配置与 token，不影响 `~` 展开 |
+| `ATB_BIN` | 自动解析 | 指向自编译的 atb 二进制 |
+| `ATB_EXIT0` | 关 | `status` 恢复旧的恒 0 退出码，值须为 `1` / `true` |
+| `ATB_NO_DEBUGGER` | 关 | 彻底禁止 `chrome.debugger` attach |
+
+### 结果语义与超时
+
+| 变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `ATB_RESULT_STRICT` | `warn` | 组合命令严格度：`off` / `warn` / `strict` |
+| `ATB_WAIT_MAX_TOTAL_SEC` | 600 | `wait` / `--wait-js` 整条命令总预算（1–3600 秒） |
+| `ATB_WAIT_MIN_INTERVAL_MS` | 50 | 轮询下限，防 `interval=0` 忙轮询 |
+| `ATB_HTTP_SLACK_SEC` | 10 | CLI HTTP 超时在业务超时上追加的余量 |
+| `ATB_CHALLENGE_MAX_IFRAMES` | 8 | 单次挑战探测处理的 iframe 数（1–64） |
+| `ATB_CHALLENGE_CLICK_TIMEOUT_SEC` | 8 | 挑战坐标点击整条链的硬上限 |
+| `ATB_DIAG_DEPTH` | 3 | 诊断里保留的底层错误条数（0–20） |
+
+### 文件与产物
+
+| 变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `ATB_IO_OVERWRITE` | `backup` | `--out` 已存在时：`backup` / `force` / `ask` / `append` |
+| `ATB_IO_SANITIZE_FILENAME` | `strict` | 下载名净化；`compat` 只告警不改名 |
+| `ATB_IO_MAX_OUTPUT_MB` | 50 | 单文件 / 内存缓冲上限（1–512MB） |
+| `ATB_CAPTURE_MAX_PIXELS` | 80000000 | 拼接截图 / 图片 PDF 的像素总量上限（100 万–5 亿） |
+
+### 隐私与幂等
+
+| 变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `ATB_IDEMPOTENCY_PERSIST` | `redacted` | 幂等记录落盘：`redacted`（只存元数据）/ `full`（含响应体）/ `off` |
+| `ATB_IDEMPOTENCY_FILE_MAX_MB` | 32 | `idempotency.jsonl` 运行期上限，超限后台压缩（1–512MB） |
+
+### 会话与多智能体
+
+| 变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `ATB_SESSION_ISOLATION` | `legacy` | `strict` 时具名 agent 无默认目标直接 `target_lost` |
+| `ATB_MULTI_SCOPE` | `agent` | `--tab all` 的默认归属范围；`all` 才跨 agent |
+| `ATB_PREFERRED_MISS_LIMIT` | 3 | 首选默认目标连续未命中多少次后放弃 |
+| `ATB_PREFERRED_MISS_TTL_SEC` | 120 | 首选默认目标未命中持续多久后放弃（1–86400 秒） |
+
+### 下载
+
+| 变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `ATB_DOWNLOAD_AUTO_CLAIM` | `true` | `download-wait` 无 `--id` 时是否自动认领 |
+| `ATB_DOWNLOAD_CLAIM_TTL_SEC` | 600 | 自动认领的「近期完成」窗口（30–900 秒） |
+| `ATB_DOWNLOAD_REGISTRY_DEPTH` | 8 | 每个 agent 记住的下载 id 条数（1–64） |
+| `ATB_DOWNLOAD_WAIT_LIMIT` | 200 | `download-wait` 每轮查询条数（1–500） |
+| `ATB_DOWNLOAD_CANCEL_ON_TIMEOUT` | 关 | 超时是否向浏览器发起取消 |
+| `ATB_DOWNLOAD_CANCEL_ERASE` | 关 | 取消后是否擦除下载记录 |
+
+### 安全与网络边界
+
+| 变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `ATB_WS_TRUST_MODE` | `compat` | WS 信任档位：`compat` / `whitelist` / `token` / `both` |
+| `ATB_WS_OUTBOUND_MAX` | 512 | 扩展下行控制通道容量（8–65536） |
+| `ATB_FILE_HOSTS` | 空 | 允许的 `file://host/...` 主机，逗号分隔（默认只允许 localhost） |
+| `ATB_HTTP_NO_PROXY` | `true` | CLI 对回环地址跳过系统代理 |
+
+### 网络与监控
+
+| 变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `ATB_NET_LOG_ITEM_CHARS` | 8192 | 单条 url/body/headers 字符上限（256–1M） |
+| `ATB_NET_RULE_MAX_BYTES` | 2MiB | 单条规则 body 字节上限（1KiB–16MiB） |
+| `ATB_NET_RULE_MAX_RULES` | 64 | 每 profile 规则条数上限（1–500） |
+| `ATB_NET_MAX_ENTRIES` | 5000 | network 缓冲上限（100–100000） |
+| `ATB_CONSOLE_MAX_ENTRIES` | 5000 | console 缓冲上限（100–100000） |
+| `ATB_MONITOR_SAMPLES` | 50 | `--monitor` 保留的样本条数（1–500） |
+
+### 启动与锁
+
+| 变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `ATB_LOCK_RETRIES` | 40 | 锁文件重试次数 |
+| `ATB_LOCK_RETRY_MS` | 25 | 锁重试间隔（毫秒） |
+| `ATB_PROC_CMD_TIMEOUT_MS` | 5000 | 进程枚举 / `tasklist` 类命令超时 |
+| `ATB_LAUNCH_SETTLE_MS` | 800 | `launch` 后等待窗口稳定的时间 |
+| `ATB_LAUNCH_CLOSE_WAIT_MS` | 3000 | 温和关闭浏览器的最长等待 |
+| `ATB_LAUNCH_KILL_WAIT_MS` | 8000 | 强杀后的最长等待 |
+| `ATB_LAUNCH_POLL_MS` | 500 | 启动期进程轮询间隔 |
+| `ATB_BROWSER_EXE` | 自动探测 | 指定浏览器可执行文件路径 |
+
+### 挑战与 HTML
+
+| 变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `ATB_HTML_KEEP_SCRIPTS` | 关 | HTML 优化保留 `<script>`（调试用） |
+| `ATB_CHALLENGE_SRCDOC_MIN_AREA` | 2000 | srcdoc / about: iframe 纳入候选的最小面积（px²） |
+| `ATB_CHALLENGE_FOCUS_ON_NEED_HUMAN` | `true` | 挑战需要人工时自动切前台 |
+| `ATB_EXTENSION_ID` | 自动探测 | 多份扩展共存时用于识别自身 iframe |
+
+### 空闲与并发
+
+| 变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `ATB_IDLE_TTL` | 300 | 无扩展连接时的空闲退出秒数 |
+| `ATB_MAX_RUNNING_JOBS` | 32 | 同时运行的 job 上限，硬淘汰前先 abort |
+| `ATB_REQUIRE_TAB` | 关 | 写类命令缺 `--tab` 时直接退出 2 |
+| `ATB_FORCE_ASSUME_ATB` | `strict` | `restart --force` / `doctor --fix` 的身份判据；`loose` 放宽 |
+| `ATB_ALLOW_RELATIVE_OUT` | 关 | `broadcast` 输出路径保留旧的相对路径行为 |
+| `ATB_BROWSERS_SNAPSHOT_TTL_SEC` | 5 | `browsers` 快照短 TTL，`force_refresh` 可绕过 |
+
+### 测试与 CI 专用（不面向日常使用）
+
+| 变量 | 作用 |
+| --- | --- |
+| `ATB_E2E` / `ATB_E2E_BIN` / `ATB_E2E_AGENT` | 端到端脚本的场景选择、二进制路径与 agent 名 |
+| `ATB_EXT_DIR` | 扩展目录覆盖（仅部署/测试脚本） |
+| `ATB_PACKAGE_DIR` | npm 包目录覆盖 |
+| `ATB_PLATFORM_OVERRIDE` | 强制平台 key（`npm/bin/atb.js` 选包用） |
+| `ATB_SKIP_POSTINSTALL_CHECK` | 跳过 postinstall 的二进制探测 |
+| `ATB_ALLOW_VERSION_MISMATCH` | 允许平台子包与主包版本不一致（仅告警） |
+| `ATB_LOCK_ALLOW_MISSING_INTEGRITY` | 锁检查允许 `integrity` 缺失（发版窗口用） |
+
 ## 安全与隐私
 
 - CLI、daemon、扩展之间的通信都在 `127.0.0.1`；无遥测、无远程代码、无广告 SDK。你操作的网页仍会按站点自身逻辑联网。
 - `trust-extension` 是单向的：只约束「谁能连 daemon」，不校验「扩展连的是不是真 daemon」。
 - daemon 在没有扩展连接且空闲 300 秒后退出；只 `atb stop` 会释放 18765 而扩展仍会重连，要收口就同时禁用扩展或关闭浏览器。
-- 扩展声明了 `<all_urls>`、`cookies`、`debugger`、`scripting`、`management`、`contentSettings` 等权限；页面数据只在你或 CLI 主动下命令时读取；`management` 用于扩展自身重载，以及在调试器被拒时把「挡路的扩展」名字报出来（`blockingExtensions`）。
+- 扩展声明的权限：`cookies`、`tabs`、`tabGroups`、`activeTab`、`debugger`、`scripting`、`alarms`、`storage`、`declarativeNetRequest`、`webNavigation`、`downloads`（完整列表以 `assets/atb_bridge/manifest.json` 为准）。页面数据只在你或 CLI 主动下命令时读取；`blockingExtensions` 只回报挡路扩展的 id / 来源，不再反查扩展名。
+- WS 信任默认是 `compat`：任何本机进程都能连 18765。共用机器请配白名单 + token 并把 `ATB_WS_TRUST_MODE` 设为 `both` 再 `atb restart`；只配置不切档不会生效。`atb status` 的 `security.warning` 会提示当前档位。
+- 幂等记录默认 `ATB_IDEMPOTENCY_PERSIST=redacted`，只存 key / scope / 时间 / 状态，不存响应体；`daemon.log` 为 0600、目录 0700，`ws-trust.json` 与 `api-token` 同等收紧。
 - `challenge` 会主动与页面上的验证组件交互（点击并等待），但不保证通过；图片判读、短信/邮箱验证仍需人工。
 
 报告漏洞见 [SECURITY.md](./SECURITY.md)，本地数据清单与删除方式见 [PRIVACY.md](./PRIVACY.md)。两者都只承诺代码能保证的事，其余写作「边界」。
@@ -388,4 +531,4 @@ atb install-skill                # 主目录 ~/.agents/skills/atb；五个 Agent
 
 ## 许可证
 
-MIT License，Copyright (c) 2026 1728578755。上游归属见 [NOTICE](./NOTICE)。
+MIT License，Copyright (c) 2026 sleepinginsummer。见 [LICENSE](./LICENSE)。

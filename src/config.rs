@@ -32,6 +32,8 @@ impl Default for AppConfig {
 /// 旧实现会在只读 HOME / 容器里因为写盘失败让整条只读命令直接失败，也会给只读
 /// 命令留下创建 `~/.atb/config.json` 的副作用。需要「首次运行就落盘」的入口
 /// （`set-extension-port`、daemon 启动）才用 `load_or_create`。
+// 旧注释声称 cmd_status 尚未切换到本函数，实际 cmd_status.rs 已改用 config::load()
+// （v8 修复），过期的 allow(dead_code) 连同该注释一并删除，避免误导后来者。
 pub fn load() -> Result<AppConfig> {
     let path = config_path()?;
     match read_json_with_backup::<AppConfig>(&path)? {
@@ -141,6 +143,17 @@ pub fn env_compat(suffix: &str) -> Option<std::ffi::OsString> {
     env::var_os(format!("AGENT_BROWSER_CLI_{suffix}"))
 }
 
+/// 用户主目录的**唯一**解析入口。
+///
+/// 旧实现有三套口径：配置用 `HOME`/`USERPROFILE`、`~` 展开与 daemon cwd 用
+/// `dirs::home_dir()`。Windows Git-Bash / WSL 下 `HOME` 可能指向 `/home/...`，
+/// 与 Known Folder 不一致，`~` 和 `install-skill` 会落到错误位置。这里统一走
+/// `dirs::home_dir()`（Windows 用 Known Folder API，Unix 用 `$HOME`），调用方
+/// 只应在明确需要「用户主目录」时使用它。
+pub(crate) fn home_dir() -> Option<PathBuf> {
+    dirs::home_dir()
+}
+
 pub fn user_config_dir() -> Result<PathBuf> {
     // `ATB_HOME` 直接指定配置目录：测试桩（mock 扩展自检）必须能跑一份**独立**的
     // daemon，否则会撞上真实 daemon 的 18765/18767。Windows 上 `dirs::home_dir()`
@@ -151,10 +164,8 @@ pub fn user_config_dir() -> Result<PathBuf> {
             return Ok(dir);
         }
     }
-    let home = env::var_os("HOME")
-        .or_else(|| env::var_os("USERPROFILE"))
-        .ok_or_else(|| anyhow!("无法定位用户主目录，不能创建 atb 配置文件"))?;
-    Ok(PathBuf::from(home).join(".atb"))
+    let home = home_dir().ok_or_else(|| anyhow!("无法定位用户主目录，不能创建 atb 配置文件"))?;
+    Ok(home.join(".atb"))
 }
 
 pub fn log_dir() -> Result<PathBuf> {
@@ -202,27 +213,50 @@ fn save_net_hooks_to(path: &Path, map: &HashMap<String, serde_json::Value>) -> R
     let content = serde_json::to_string_pretty(map)? + "\n";
     write_file_locked(path, content.as_bytes(), Some(0o600))?;
     // 0o600 只在 Unix 生效；Windows 上由 write_file_locked 内部的 ACL 收紧负责，
-    // 这里再对最终文件和 `.bak` 补一次（R1-08）。
+    // 这里再对最终文件和 `.bak` 补一次。
     #[cfg(windows)]
-    restrict_file_and_backup_acl(path);
+    if let Err(err) = restrict_file_and_backup_acl(path) {
+        eprintln!("警告: {err}");
+    }
     Ok(())
 }
 
 pub fn load_api_token() -> Result<Option<String>> {
     let path = api_token_path()?;
-    let content = match read_with_backup(&path) {
-        Ok(content) => content,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(err) => {
-            return Err(err).with_context(|| format!("读取 API token 失败: {}", path.display()))
-        }
-    };
+    // token 文件**不**走通用 `.bak` 回退。`replace_file_atomically` 的
+    // 退化路径会先把旧目标改名成 `.bak`，如果读方在真空期回退去读 `.bak`，就会拿到
+    // 轮换前的旧 token，随后被 daemon 拒绝（表现为随机的 401）。读方只信 target：
+    // 缺失就返回 `None`，由调用方重新生成/重读。
+    //
+    // 与 `cleanup_stale_backup` 共用同一把跨进程锁：写方持有排他锁时读方会等待，
+    // 不会再读到「目标刚被移走、备份马上被删」的中间态。
+    let content = read_token_target_locked(&path)
+        .with_context(|| format!("读取 API token 失败: {}", path.display()))?;
     let token = content.trim();
     if token.is_empty() {
         // 空 token 文件等价于「尚未生成 token」，不要让整条命令直接失败。
         return Ok(None);
     }
     Ok(Some(token.to_string()))
+}
+
+/// 在共享锁下读 token 目标文件；不存在返回空串（等价于 `Ok(None)`）。
+fn read_token_target_locked(path: &Path) -> std::io::Result<String> {
+    // 锁文件打不开（目录不可写等）不阻断读取：拿不到锁只意味着不能与写方互斥，
+    // 比让只读命令直接失败更合理。
+    let lock = open_lock_file(&lock_path(path)).ok();
+    if let Some(lock) = &lock {
+        let _ = fs2::FileExt::lock_shared(lock);
+    }
+    let result = match fs::read_to_string(path) {
+        Ok(content) => Ok(content),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(String::new()),
+        Err(err) => Err(err),
+    };
+    if let Some(lock) = &lock {
+        let _ = fs2::FileExt::unlock(lock);
+    }
+    result
 }
 
 pub fn save_api_token(token: &str) -> Result<()> {
@@ -237,22 +271,58 @@ pub fn save_api_token(token: &str) -> Result<()> {
     // `~/.atb/api-token` 并劫持本地 HTTP 端口（旧报告 #7）。这里用系统自带 icacls
     // 收紧权限，比为了改 ACL 引入 windows-sys 依赖便宜得多。`.bak` 同样处理。
     #[cfg(windows)]
-    restrict_file_and_backup_acl(&path);
+    if let Err(err) = restrict_file_and_backup_acl(&path) {
+        eprintln!("警告: {err}");
+    }
     Ok(())
 }
 
+/// 确保 daemon 日志文件存在，并把它收紧到「只有当前用户可读写」。
+///
+/// `daemon.log` 会接住 daemon 的全部 stdout/stderr（URL、错误上下文、会话信息）。
+/// 旧实现用默认权限创建：Unix 上是 0644（同机其他用户可读），Windows 上继承目录
+/// ACL。这里与 `api-token` 保持一致：目录 0700、文件 0600（Unix）+ ACL（Windows）。
 pub fn ensure_log_file() -> Result<PathBuf> {
     let path = daemon_log_path()?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("创建日志目录失败: {}", parent.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(err) = fs::set_permissions(parent, fs::Permissions::from_mode(0o700)) {
+                eprintln!(
+                    "警告: 无法把日志目录收紧到 0700（{}）: {err}",
+                    parent.display()
+                );
+            }
+        }
     }
-    if !path.exists() {
-        fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .with_context(|| format!("创建日志文件失败: {}", path.display()))?;
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(&path)
+        .with_context(|| format!("创建日志文件失败: {}", path.display()))?;
+    drop(file);
+    // 旧版本创建的文件可能已经是宽松权限：每次启动都再收紧一次。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(err) = fs::set_permissions(&path, fs::Permissions::from_mode(0o600)) {
+            eprintln!(
+                "警告: 无法把 daemon.log 收紧到 0600（{}）: {err}",
+                path.display()
+            );
+        }
+    }
+    #[cfg(windows)]
+    if let Err(err) = restrict_windows_acl(&path) {
+        eprintln!("警告: {err}");
     }
     Ok(path)
 }
@@ -301,13 +371,20 @@ fn write_file_locked(target: &Path, content: &[u8], mode: Option<u32>) -> Result
             options.mode(mode);
         }
         // Windows 上没有 unix mode：0o600 的语义（只有当前用户可读写）改用 ACL 收紧。
-        // 在文件被改名成目标之前就对临时文件设好，改名会保留它自己的安全描述符，
-        // 因此不会出现「先落盘、再收紧」之间被别的用户读到的窗口（R1-08）。
+        // 必须在写入内容**之前**完成：旧实现先 write/sync 再收紧，中间存在
+        // 一段「临时文件已是明文、ACL 还是默认继承」的窗口，同机其他用户可读走 token。
+        // 改名会保留文件自己的安全描述符，所以这里收紧后就不会再变回宽松。
         #[cfg(windows)]
         let restrict_acl = mode == Some(0o600);
         let mut file = options
             .open(&temp_path)
             .with_context(|| format!("创建临时文件失败: {}", temp_path.display()))?;
+        #[cfg(windows)]
+        if restrict_acl {
+            if let Err(err) = restrict_windows_acl(&temp_path) {
+                eprintln!("警告: {err}");
+            }
+        }
         file.write_all(content)?;
         file.sync_all()?;
         #[cfg(unix)]
@@ -317,10 +394,6 @@ fn write_file_locked(target: &Path, content: &[u8], mode: Option<u32>) -> Result
         }
         // Windows 上打开中的文件无法被 rename，先显式关闭句柄。
         drop(file);
-        #[cfg(windows)]
-        if restrict_acl {
-            restrict_windows_acl(&temp_path);
-        }
         replace_file_atomically(&temp_path, target)
             .with_context(|| format!("写入文件失败: {}", target.display()))?;
         Ok(())
@@ -339,8 +412,13 @@ fn write_file_locked(target: &Path, content: &[u8], mode: Option<u32>) -> Result
 /// Windows 上另一个进程刚打开/关闭同名文件时，`CreateFileW` 偶尔返回
 /// `ERROR_ACCESS_DENIED`；短暂重试即可，不该让一次配置保存直接失败。
 fn open_lock_file(path: &Path) -> Result<fs::File> {
+    // 默认 40 次 × 25ms ≈ 1s（旧实现 10 × 20ms ≈ 200ms）：杀软扫描 / 慢盘上
+    // 200ms 就放弃会让 token 写入失败、daemon 起不来。可用
+    // `ATB_LOCK_RETRIES` / `ATB_LOCK_RETRY_MS` 调整。
+    let retries = crate::settings::env_u64_clamped("ATB_LOCK_RETRIES", 40, 1, 500) as usize;
+    let retry_ms = crate::settings::env_u64_clamped("ATB_LOCK_RETRY_MS", 25, 1, 2_000);
     let mut last_error = None;
-    for _ in 0..10 {
+    for _ in 0..retries {
         match OpenOptions::new()
             .create(true)
             // 锁文件只用于加排他锁，内容无关；显式声明「不截断」，
@@ -353,7 +431,7 @@ fn open_lock_file(path: &Path) -> Result<fs::File> {
             Ok(file) => return Ok(file),
             Err(err) if err.kind() == ErrorKind::PermissionDenied => {
                 last_error = Some(err);
-                std::thread::sleep(std::time::Duration::from_millis(20));
+                std::thread::sleep(std::time::Duration::from_millis(retry_ms));
             }
             Err(err) => {
                 return Err(err).with_context(|| format!("打开写锁失败: {}", path.display()))
@@ -402,54 +480,130 @@ fn lock_path(path: &Path) -> PathBuf {
     path.with_file_name(format!("{name}.lock"))
 }
 
-/// Windows：去掉继承权限，只保留当前用户可读写。
+/// Windows：去掉继承权限与已知宽松 ACE，只保留当前用户可读写。
 ///
-/// 失败只打印警告不返回错误：权限收紧是加固动作，不该让 `atb daemon` 直接起不来。
+/// 身份优先用当前进程的 SID（`whoami /user` 解析出 `S-1-5-21-...`，用 icacls 的
+/// `*S-1-...` 形式授权），拿不到才退回 `USERDOMAIN\USERNAME`。
+/// 旧实现只用可伪造的 `USERNAME`，且在已有显式 ACE 时 `grant:r` 不会移除那些宽松项。
+///
+/// 失败返回 `Err` 交由调用方打印警告：权限收紧是加固动作，不该让 daemon 起不来，
+/// 但也绝不能静默失败。
 #[cfg(windows)]
-fn restrict_windows_acl(path: &Path) {
-    let user = match env::var("USERNAME") {
-        Ok(user) if !user.trim().is_empty() => user,
-        _ => {
-            eprintln!(
-                "警告: 读不到 USERNAME，无法收紧 {} 的权限（同机其他用户可能可读）",
-                path.display()
-            );
-            return;
-        }
-    };
-    let grant = format!("{user}:F");
-    let status = std::process::Command::new("icacls")
-        .arg(path)
-        .arg("/inheritance:r")
-        .arg("/grant:r")
-        .arg(&grant)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-    match status {
-        Ok(status) if status.success() => {}
-        Ok(status) => eprintln!(
-            "警告: 收紧 {} 的权限失败（icacls 退出码 {:?}），同机其他用户可能能读到这个 token",
-            path.display(),
-            status.code()
-        ),
-        Err(err) => eprintln!(
-            "警告: 收紧 {} 的权限失败（无法执行 icacls: {err}），同机其他用户可能能读到这个 token",
-            path.display()
-        ),
+fn restrict_windows_acl(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
     }
+    let identity = current_user_identity().ok_or_else(|| {
+        format!(
+            "读不到当前用户身份，无法收紧 {} 的权限（同机其他用户可能可读）",
+            path.display()
+        )
+    })?;
+
+    let no_window = |command: &mut std::process::Command| {
+        command
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+    };
+
+    // 1) 去掉继承来的 ACE（不展开成显式 ACE）。
+    let mut inheritance = std::process::Command::new("icacls");
+    inheritance.arg(path).arg("/inheritance:r");
+    no_window(&mut inheritance);
+    let inheritance_status = inheritance.status();
+
+    // 2) 移除显式宽松 ACE：Everyone / Users / Authenticated Users / INTERACTIVE。
+    //    用 well-known SID 而不是本地化组名，避免非英文 Windows 上匹配不到。
+    let mut remove = std::process::Command::new("icacls");
+    remove.arg(path).args([
+        "/remove:g",
+        "*S-1-1-0",
+        "*S-1-5-32-545",
+        "*S-1-5-11",
+        "*S-1-5-4",
+    ]);
+    no_window(&mut remove);
+    let remove_status = remove.status();
+
+    // 3) 只给当前用户完全控制。
+    let grant = format!("{identity}:F");
+    let mut command = std::process::Command::new("icacls");
+    command.arg(path).args(["/grant:r", &grant]);
+    no_window(&mut command);
+    match command.status() {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!(
+            "收紧 {} 的权限失败（icacls 退出码 {:?}，继承清理 {:?} / 移除宽松 ACE {:?}），\
+             同机其他用户可能能读到这个文件",
+            path.display(),
+            status.code(),
+            inheritance_status.as_ref().ok().and_then(|s| s.code()),
+            remove_status.as_ref().ok().and_then(|s| s.code())
+        )),
+        Err(err) => Err(format!(
+            "收紧 {} 的权限失败（无法执行 icacls: {err}），同机其他用户可能能读到这个文件",
+            path.display()
+        )),
+    }
+}
+
+/// 当前用户身份：优先 `*S-1-...`（icacls 的 SID 形式），否则 `DOMAIN\User`。
+#[cfg(windows)]
+fn current_user_identity() -> Option<String> {
+    if let Some(sid) = current_user_sid() {
+        return Some(format!("*{sid}"));
+    }
+    let user = env::var("USERNAME")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())?;
+    match env::var("USERDOMAIN") {
+        Ok(domain) if !domain.trim().is_empty() => Some(format!("{}\\{}", domain.trim(), user)),
+        _ => Some(user),
+    }
+}
+
+/// 从 `whoami /user /fo csv /nh` 的输出里取当前用户 SID。
+#[cfg(windows)]
+fn current_user_sid() -> Option<String> {
+    let output = std::process::Command::new("whoami")
+        .args(["/user", "/fo", "csv", "/nh"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.split(|ch: char| ch == '"' || ch == ',' || ch.is_whitespace())
+        .map(str::trim)
+        .find(|token| token.starts_with("S-1-") && token.len() > 4)
+        .map(str::to_string)
 }
 
 /// 给目标文件和它的 `.bak` 都收紧权限。
 ///
 /// 只收紧目标是不够的：`.bak` 里可能是上一版 token / 配置，权限宽松等于白收紧
-/// 主文件（R1-07）。
+/// 主文件。`pub(crate)` 是给 `cli/trust.rs` 复用：
+/// 对 `.tmp`、最终文件、`.bak` 都可直接调用。
 #[cfg(windows)]
-fn restrict_file_and_backup_acl(path: &Path) {
-    restrict_windows_acl(path);
+pub(crate) fn restrict_file_and_backup_acl(path: &Path) -> Result<(), String> {
+    let mut first_error = None;
+    if let Err(err) = restrict_windows_acl(path) {
+        first_error = Some(err);
+    }
     let backup = backup_path(path);
     if backup.exists() {
-        restrict_windows_acl(&backup);
+        if let Err(err) = restrict_windows_acl(&backup) {
+            if first_error.is_none() {
+                first_error = Some(err);
+            }
+        }
+    }
+    match first_error {
+        Some(err) => Err(err),
+        None => Ok(()),
     }
 }
 
@@ -554,14 +708,14 @@ pub fn replace_file_atomically(temp_path: &Path, target: &Path) -> std::io::Resu
     }
     // Windows: 先用 Win32 的 `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` —— 同一卷上它是
     // 原子替换，读方任何时刻看到的要么是旧文件、要么是新文件，不会出现「目标不存在」的
-    // 真空期。
+    // 真空期（首轮 #5 /）。
     #[cfg(windows)]
     {
         if let Err(err) = move_file_replace(temp_path, target) {
             // 目标被其它进程短暂占用（杀软扫描、编辑器持有句柄）时 MoveFileExW 会失败。
             // 这时退回「备份 + 改名」：牺牲原子性换可用性，但绝不让目标文件消失。
             // 打一行日志，避免「为什么这条路径没走原子替换」变成悬案；带上路径和错误码，
-            // 出问题时能直接定位是哪个文件、哪种 Win32 错误（R1-07）。
+            // 出问题时能直接定位是哪个文件、哪种 Win32 错误。
             eprintln!(
                 "原子替换失败（错误码 {:?}，{err}），退回备份+改名：{} -> {}",
                 err.raw_os_error(),
@@ -581,6 +735,11 @@ pub fn replace_file_atomically(temp_path: &Path, target: &Path) -> std::io::Resu
 ///
 /// 只在目标文件已经写入成功时调用：此时 `.bak` 里是更旧的内容，读路径不会再需要它。
 /// 删不掉不影响结果（下次写入还会尝试），但必须留警告，别让残留副本悄无声息地留着。
+///
+/// 锁：本函数在 `write_file_locked` 的排他锁内被调用；token 读方
+/// （`read_token_target_locked`）在同一把 `*.lock` 上取共享锁，因此不会出现
+/// 「读方刚发现目标缺失、备份就被删掉」的竞态。若有调用方直接调用
+/// `replace_file_atomically`，需自行持有同一把锁。
 #[cfg(windows)]
 fn cleanup_stale_backup(target: &Path) {
     let backup = backup_path(target);
@@ -657,7 +816,7 @@ fn replace_file_with_backup(temp_path: &Path, target: &Path) -> std::io::Result<
         if had_target {
             // 回滚是把旧文件放回去。这里**必须**上抛：旧实现 `let _ =` 会把回滚失败
             // 彻底吞掉，用户只看到「替换失败」，却不知道旧内容只剩 `.bak` 这一份
-            // （而且下次写入可能又把它覆盖掉）。两个路径都要写进错误里（R1-07）。
+            // （而且下次写入可能又把它覆盖掉）。两个路径都要写进错误里。
             if let Err(rollback) = fs::rename(&backup, target) {
                 return Err(std::io::Error::new(
                     err.kind(),
@@ -912,6 +1071,48 @@ mod tests {
             .any(|entry| entry.file_name().to_string_lossy().contains(".corrupt-"));
         assert!(quarantined, "空文件应先备份再重建");
 
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_api_token_never_falls_back_to_backup() {
+        // token 轮换时会短暂出现「目标被移走、旧内容只在 .bak」的窗口。读方如果回退
+        // 到 .bak 就会拿到旧 token，所以这里必须返回 None。
+        let dir = temp_dir("token-no-backup");
+        let path = dir.join("api-token");
+        fs::write(backup_path(&path), "stale-token\n").expect("seed backup");
+        assert!(load_api_token_with(&dir).is_none());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_api_token_prefers_target_over_backup() {
+        let dir = temp_dir("token-target-wins");
+        let path = dir.join("api-token");
+        fs::write(&path, "fresh-token\n").expect("seed target");
+        fs::write(backup_path(&path), "stale-token\n").expect("seed backup");
+        assert_eq!(load_api_token_with(&dir).as_deref(), Some("fresh-token"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    fn load_api_token_with(home: &Path) -> Option<String> {
+        with_home(home, || load_api_token().expect("load token"))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_log_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("log-private");
+        let path = with_home(&dir, || ensure_log_file().expect("ensure log"));
+        let file_mode = fs::metadata(&path).expect("stat log").permissions().mode() & 0o777;
+        assert_eq!(file_mode, 0o600, "daemon.log 必须是 0600");
+        let dir_mode = fs::metadata(dir.join("logs"))
+            .expect("stat log dir")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700, "日志目录必须是 0700");
         fs::remove_dir_all(&dir).ok();
     }
 }

@@ -5,7 +5,7 @@ use clap::{Args, Parser, Subcommand};
 /// 可选数值字段为 `None` 时不要下发 `null`。
 ///
 /// `preflight` 把数值字段的 `null` 当成「用户写了 NaN/Inf，`json!` 序列化成了 null」
-/// 并报 `invalid_number`（检测手段）；但 `Option<usize>` 的 `None` 同样
+/// 并报 `invalid_number`（的检测手段）；但 `Option<usize>` 的 `None` 同样
 /// 序列化成 null —— 那是「没传、用服务端默认」，不是错误。两者在 JSON 里无法区分，
 /// 所以在构造 payload 时就把 None 摘掉，让 null 只剩「显式传入非有限值」一种来源。
 fn omit_absent_numbers(payload: &mut Value, keys: &[&str]) {
@@ -17,6 +17,55 @@ fn omit_absent_numbers(payload: &mut Value, keys: &[&str]) {
             map.remove(*key);
         }
     }
+}
+
+/// CLI 侧统一的 HTTP 超时预算：业务超时 + `ATB_HTTP_SLACK_SEC`（默认 10s）。
+///
+/// 以前每个命令各自写 `args.timeout` / `+5.0` / `+10.0`：同样是 30s 的业务超时，
+/// cookies 只给 30s、snapshot 30s，daemon 还在等待时 CLI 已经断开并报「超时」
+/// 。所有直接用 `args.timeout` 的客户端超时统一走这里。
+pub(crate) fn http_budget(timeout: f64) -> f64 {
+    if !timeout.is_finite() {
+        return 30.0;
+    }
+    timeout.max(0.0) + crate::settings::http_slack_sec()
+}
+
+/// 写/破坏性命令是否强制要求显式 `--tab`（`ATB_REQUIRE_TAB=1`，默认关闭）。
+///
+/// 默认行为保持不变：不设环境变量时，缺省 `--tab` 仍作用于 daemon 当前标签页。
+pub(crate) fn require_tab_enabled() -> bool {
+    crate::settings::env_bool("ATB_REQUIRE_TAB", false)
+}
+
+/// 写类 op 缺少 `--tab` 时直接以用法错误拒绝。
+///
+/// 只在 `ATB_REQUIRE_TAB=1` 时生效：写/破坏性操作误作用到用户正在看的标签页
+/// 代价很高，开启后强制调用方明确目标；关闭时完全沿用旧行为。
+pub(crate) fn enforce_write_tab(op: &str, tab: Option<&str>) -> Result<()> {
+    const WRITE_OPS: &[&str] = &[
+        "click",
+        "mouse-click",
+        "fill",
+        "send-keys",
+        "select",
+        "check",
+        "hover",
+        "scroll",
+        "upload",
+        "inject",
+    ];
+    if !require_tab_enabled() || !WRITE_OPS.contains(&op) {
+        return Ok(());
+    }
+    if tab.map(str::trim).is_some_and(|value| !value.is_empty()) {
+        return Ok(());
+    }
+    Err(usage_failure(
+        "target_not_found",
+        format!("{op}: 写/破坏性操作必须显式指定 --tab（已开启 ATB_REQUIRE_TAB）"),
+        "先 atb tabs --ids 看清目标，再 --tab <tab_id>；确实要操作当前标签时显式写 --tab current",
+    ))
 }
 
 /// 页面级 payload 的统一收尾：路径绝对化 → 参数预检 → 目标语法解析。
@@ -61,6 +110,8 @@ pub(crate) fn dispatch_page(
     timeout: f64,
 ) -> Result<()> {
     let mut payload = payload;
+    // 写类命令的显式目标护栏：默认关闭，ATB_REQUIRE_TAB=1 时生效。
+    enforce_write_tab(op, tab)?;
     if let Err(problem) = finalize_page_payload(op, &mut payload) {
         return usage_error(&problem);
     }
@@ -100,7 +151,7 @@ pub(crate) fn dispatch_page(
             "profile": profile,
             "dry_run": dry_run,
         });
-        let value = request("POST", "/multi", Some(body), timeout + 10.0)?;
+        let value = request("POST", "/multi", Some(body), timeout)?;
         if dry_run {
             // dry-run 的字段形状要和真实执行一致，否则 Agent 用 dry-run 校准字段名后
             // 正式执行必然解析失败。
@@ -168,7 +219,7 @@ pub(crate) fn cmd_scan(args: ScanArgs, is_async: bool) -> Result<()> {
             args.tab.as_deref(),
             args.browser.as_deref(),
             args.profile.as_deref(),
-            args.timeout + 5.0,
+            http_budget(args.timeout),
         )?;
     }
     Ok(())
@@ -250,7 +301,7 @@ pub(crate) fn cmd_exec(args: ExecArgs, is_async: bool) -> Result<()> {
             args.tab.as_deref(),
             args.browser.as_deref(),
             args.profile.as_deref(),
-            args.timeout + args.wait_timeout + 10.0,
+            http_budget(args.timeout + args.wait_timeout),
         )?;
     }
     Ok(())
@@ -277,7 +328,7 @@ pub(crate) fn cmd_cookies(args: CookiesArgs, is_async: bool) -> Result<()> {
             args.tab.as_deref(),
             args.browser.as_deref(),
             args.profile.as_deref(),
-            args.timeout,
+            http_budget(args.timeout),
         )?;
     }
     Ok(())
@@ -304,7 +355,7 @@ pub(crate) fn cmd_upload(args: UploadArgs, is_async: bool) -> Result<()> {
             args.tab.as_deref(),
             args.browser.as_deref(),
             args.profile.as_deref(),
-            args.timeout + 5.0,
+            http_budget(args.timeout),
         )?;
     }
     Ok(())
@@ -323,7 +374,7 @@ pub(crate) fn cmd_snapshot(args: SnapshotArgs, is_async: bool) -> Result<()> {
         "js": args.js,
         "interactive_only": args.interactive_only,
         "max_nodes": args.max_nodes,
-        // daemon 的 /snapshot 早就有 skip_generic 字段，CLI 却一直没有下发通道，
+        // X-15：daemon 的 /snapshot 早就有 skip_generic 字段，CLI 却一直没有下发通道，
         // 于是「不想被通用容器节点挤满 @e 编号」的用户无法表达。默认行为保持不变
         // （skip_generic=true），加 --no-skip-generic 才显式关闭。
         "skip_generic": !args.no_skip_generic,
@@ -340,7 +391,7 @@ pub(crate) fn cmd_snapshot(args: SnapshotArgs, is_async: bool) -> Result<()> {
             args.tab.as_deref(),
             args.browser.as_deref(),
             args.profile.as_deref(),
-            args.timeout,
+            http_budget(args.timeout),
         )?;
     }
     Ok(())
@@ -352,7 +403,7 @@ pub(crate) fn cmd_read(args: ReadArgs, is_async: bool) -> Result<()> {
     let mut payload = json!({
         "selector": args.selector,
         "max_chars": args.max_chars,
-        // 页面侧 page_read.js 的 innerTextLimit（默认 30000），None 不下发。
+        // X-15：页面侧 page_read.js 的 innerTextLimit（默认 30000），None 不下发。
         "inner_text_limit": args.inner_text_limit,
         "links": args.links,
         "forms": !args.no_forms,
@@ -379,7 +430,7 @@ pub(crate) fn cmd_read(args: ReadArgs, is_async: bool) -> Result<()> {
             args.tab.as_deref(),
             args.browser.as_deref(),
             args.profile.as_deref(),
-            args.timeout + 5.0,
+            http_budget(args.timeout),
         )?;
     }
     Ok(())
@@ -411,7 +462,7 @@ pub(crate) fn cmd_find(args: FindArgs, is_async: bool) -> Result<()> {
             args.tab.as_deref(),
             args.browser.as_deref(),
             args.profile.as_deref(),
-            args.timeout + 5.0,
+            http_budget(args.timeout),
         )?;
     }
     Ok(())
@@ -469,7 +520,7 @@ pub(crate) fn cmd_inject(args: InjectArgs, is_async: bool) -> Result<()> {
         args.tab.as_deref(),
         args.browser.as_deref(),
         args.profile.as_deref(),
-        args.timeout + 5.0,
+        http_budget(args.timeout),
     )?;
     Ok(())
 }
@@ -494,7 +545,7 @@ pub(crate) fn cmd_frames(args: FramesArgs, is_async: bool) -> Result<()> {
         args.tab.as_deref(),
         args.browser.as_deref(),
         args.profile.as_deref(),
-        args.timeout,
+        http_budget(args.timeout),
     )?;
     Ok(())
 }

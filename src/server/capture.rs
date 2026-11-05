@@ -46,59 +46,24 @@ pub(crate) async fn screenshot_page(state: &AppState, req: ScreenshotRequest) ->
     // 非接触路径：可见区域截屏用 chrome.tabs.captureVisibleTab，不 attach 调试器。
     // 只有「目标标签页是当前激活页 + 不需要整页/元素裁剪」时才适用，
     // 其余情况回落到 CDP（整页、元素、后台标签页都必须 CDP）。
+    let can_capture_visible = target.is_none() && !req.full_page;
+    let visible_eligible = can_capture_visible && tab_is_active(state, &tab_id).await;
     let mut capture_visible_error: Option<String> = None;
-    if target.is_none() && !req.full_page {
-        let is_active = {
-            let driver = state.driver.read().await;
-            driver
-                .sessions
-                .get(&tab_id)
-                .map(|session| session.info.active)
-                .unwrap_or(false)
-        };
-        if is_active {
-            let payload = json!({ "format": format, "quality": req.quality });
-            // 非调试器通道失败的原因要留下来：页面被别的扩展 iframe 挡住时 CDP
-            // 一定失败，此时「为什么连 captureVisibleTab 也没成」才是真正的线索。
-            match extension_control(state, &tab_id, "captureVisible", payload, timeout).await {
-                Err(err) => {
-                    capture_visible_error = Some(humanize_extension_error(&err.to_string()))
-                }
-                Ok(value) => {
-                    // `extension_control` 已经把扩展回包的 `data` 层剥掉了，这里拿到
-                    // 的就是 `{data_url, format, via}`。旧实现只认 `value.data.data_url`，
-                    // 于是「非调试器截图」永远匹配不上、静默回落到 CDP——页面被别的
-                    // 扩展 iframe 挡住时（chrome.debugger 拒绝 attach）截图就彻底失败。
-                    if let Some(data_url) =
-                        value.get("data_url").and_then(Value::as_str).or_else(|| {
-                            value
-                                .get("data")
-                                .and_then(|data| data.get("data_url"))
-                                .and_then(Value::as_str)
-                        })
-                    {
-                        let base64 = data_url.rsplit(',').next().unwrap_or_default();
-                        if let Ok(bytes) = decode_base64(base64) {
-                            if validate_screenshot_bytes(&bytes, format).is_ok() {
-                                let path = req
-                                    .out
-                                    .clone()
-                                    .unwrap_or_else(|| default_screenshot_path(format));
-                                write_bytes(&path, &bytes)?;
-                                return Ok(json!({
-                                    "status": "success",
-                                    "path": path,
-                                    "format": format,
-                                    "bytes": bytes.len(),
-                                    "target": Value::Null,
-                                    "full_page": false,
-                                    "via": "captureVisibleTab"
-                                }));
-                            }
-                        }
-                    }
-                }
-            }
+    if visible_eligible {
+        // 非调试器通道失败的原因要留下来：页面被别的扩展 iframe 挡住时 CDP
+        // 一定失败，此时「为什么连 captureVisibleTab 也没成」才是真正的线索。
+        match capture_visible_once(
+            state,
+            &tab_id,
+            format,
+            req.quality,
+            req.out.as_deref(),
+            timeout,
+        )
+        .await
+        {
+            Ok(value) => return Ok(value),
+            Err(err) => capture_visible_error = Some(humanize_extension_error(&err.to_string())),
         }
     }
 
@@ -112,6 +77,35 @@ pub(crate) async fn screenshot_page(state: &AppState, req: ScreenshotRequest) ->
     if !is_debugger_blocked(&cdp_error.to_string()) {
         // 参数错 / 超时 / NO_DEBUGGER 之类回落也无意义，保持原文。
         return Err(cdp_error);
+    }
+    // 首次 captureVisibleTab 很可能是撞上了 Chrome 的配额/限流（每秒调用次数
+    // 有限），而 debugger_blocked 恰恰是最需要这条通道的时候。退避后再试一次，
+    // 两次都失败才把两个原因一起交给调用方。
+    if visible_eligible {
+        // 先 clone 出首次原因：接着要整体覆盖 `capture_visible_error`，不能一边借用一边赋值。
+        let first_error = capture_visible_error.clone();
+        if let Some(first) = first_error {
+            tokio::time::sleep(CAPTURE_VISIBLE_RETRY_BACKOFF).await;
+            match capture_visible_once(
+                state,
+                &tab_id,
+                format,
+                req.quality,
+                req.out.as_deref(),
+                timeout,
+            )
+            .await
+            {
+                Ok(value) => return Ok(value),
+                Err(err) => {
+                    capture_visible_error = Some(format!(
+                        "{first}；退避 {}ms 重试仍失败：{}",
+                        CAPTURE_VISIBLE_RETRY_BACKOFF.as_millis(),
+                        humanize_extension_error(&err.to_string())
+                    ));
+                }
+            }
+        }
     }
     let visible_note = match capture_visible_error {
         Some(reason) => format!("；非调试器截图（captureVisibleTab）同样不可用：{reason}"),
@@ -151,6 +145,56 @@ pub(crate) async fn screenshot_page(state: &AppState, req: ScreenshotRequest) ->
     ))
 }
 
+/// 首次 `captureVisibleTab` 失败后的退避时长（落在 150–300ms 区间）。
+const CAPTURE_VISIBLE_RETRY_BACKOFF: Duration = Duration::from_millis(200);
+
+/// 目标标签页是不是浏览器当前激活页（决定能不能走非调试器通道）。
+async fn tab_is_active(state: &AppState, tab_id: &str) -> bool {
+    let driver = state.driver.read().await;
+    driver
+        .sessions
+        .get(tab_id)
+        .map(|session| session.info.active)
+        .unwrap_or(false)
+}
+
+/// 一次 `chrome.tabs.captureVisibleTab` 截图（已解码 + 校验 + 落盘）。
+///
+/// 抽成函数是为了「退避重试」：首次失败与重试必须走完全相同的
+/// 解码/校验/落盘路径，否则重试成功也可能写出一张坏图。
+async fn capture_visible_once(
+    state: &AppState,
+    tab_id: &str,
+    format: &str,
+    quality: Option<u8>,
+    out: Option<&Path>,
+    timeout: Duration,
+) -> Result<Value> {
+    let payload = json!({ "format": format, "quality": quality });
+    let value = extension_control(state, tab_id, "captureVisible", payload, timeout).await?;
+    // `extension_control` 已经把扩展回包的 `data` 层剥掉了，这里拿到的就是
+    // `{data_url, format, via}`；老形状（`data.data_url`）一并兼容。
+    let data_url = data_url_of(&value)
+        .ok_or_else(|| anyhow!("captureVisible 未返回 data_url（扩展版本可能不支持该通道）"))?;
+    let base64 = data_url.rsplit(',').next().unwrap_or_default();
+    guard_encoded_capture_len(base64.len())?;
+    let bytes = decode_base64(base64)?;
+    validate_screenshot_bytes(&bytes, format)?;
+    let path = out
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| default_screenshot_path(format));
+    write_bytes(&path, &bytes)?;
+    Ok(json!({
+        "status": "success",
+        "path": path,
+        "format": format,
+        "bytes": bytes.len(),
+        "target": Value::Null,
+        "full_page": false,
+        "via": "captureVisibleTab"
+    }))
+}
+
 /// CDP 截图路径：构造参数（整页要先量内容尺寸）→ `Page.captureScreenshot` → 校验 → 落盘。
 ///
 /// 失败一律**原样**返回：调用方要拿原始文案判断能不能回落，提示文案统一在外层拼，
@@ -171,6 +215,8 @@ async fn capture_via_cdp(
         }
         params["quality"] = json!(quality);
     }
+    let mut truncated = false;
+    let mut requested_height: Option<u32> = None;
     if let Some(target) = target {
         let rect = target_rect(state, tab_id, target, timeout).await?;
         params["clip"] = json!({
@@ -187,15 +233,32 @@ async fn capture_via_cdp(
                 "screenshot: Page.getLayoutMetrics failed".to_string()
             })));
         }
-        let content_size = metrics
-            .data
-            .and_then(|data| data.get("contentSize").cloned())
+        let metrics_data = metrics.data.unwrap_or(Value::Null);
+        let content_size = metrics_data
+            .get("contentSize")
+            .cloned()
             .ok_or_else(|| anyhow!("screenshot: missing contentSize"))?;
+        // `--max-height` 以前只在扩展拼图通道生效，CDP 主路径直接忽略。
+        // 这里按 `max_height_px / dpr` 截断 clip（clip 单位是 CSS px），并如实标注
+        // `truncated`，否则调用方以为拿到了完整长图。
+        let dpr = metrics_dpr(&metrics_data);
+        let mut clip_height = content_size
+            .get("height")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        if let Some(max_px) = req.max_height_px.filter(|value| *value > 0) {
+            let max_css = f64::from(max_px) / dpr;
+            if clip_height > max_css {
+                clip_height = max_css;
+                truncated = true;
+                requested_height = Some(max_px);
+            }
+        }
         params["clip"] = json!({
             "x": content_size.get("x").and_then(Value::as_f64).unwrap_or(0.0),
             "y": content_size.get("y").and_then(Value::as_f64).unwrap_or(0.0),
             "width": content_size.get("width").and_then(Value::as_f64).unwrap_or(0.0),
-            "height": content_size.get("height").and_then(Value::as_f64).unwrap_or(0.0),
+            "height": clip_height,
             "scale": 1.0
         });
         params["captureBeyondViewport"] = json!(true);
@@ -210,6 +273,7 @@ async fn capture_via_cdp(
         .data
         .and_then(|data| data.get("data").and_then(Value::as_str).map(str::to_string))
         .ok_or_else(|| anyhow!("screenshot: CDP response missing data"))?;
+    guard_encoded_capture_len(data.len())?;
     let bytes = decode_base64(&data)?;
     // 解码成功不代表数据可用：空/截断的 base64 会得到 0 字节或半截文件。
     validate_screenshot_bytes(&bytes, format)?;
@@ -218,7 +282,7 @@ async fn capture_via_cdp(
         .clone()
         .unwrap_or_else(|| default_screenshot_path(format));
     write_bytes(&path, &bytes)?;
-    Ok(json!({
+    let mut body = json!({
         "status": "success",
         "path": path,
         "format": format,
@@ -226,7 +290,39 @@ async fn capture_via_cdp(
         "target": target,
         "full_page": req.full_page,
         "via": "cdp"
-    }))
+    });
+    if req.full_page {
+        body["truncated"] = json!(truncated);
+        if let Some(requested) = requested_height {
+            body["requested_height"] = json!(requested);
+            body["hint"] = json!(format!(
+                "已按 --max-height {requested}px（设备像素）截断，超出部分未包含在截图里"
+            ));
+        }
+    }
+    Ok(body)
+}
+
+/// `Page.getLayoutMetrics` 回包里的设备像素比：用 `contentSize / cssContentSize`
+/// 的宽度比例反推（旧扩展可能不返回 `cssContentSize`，此时按 1.0 处理）。
+fn metrics_dpr(data: &Value) -> f64 {
+    let device_width = data
+        .get("contentSize")
+        .and_then(|size| size.get("width"))
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let css_width = data
+        .get("cssContentSize")
+        .and_then(|size| size.get("width"))
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    if device_width > 0.0 && css_width > 0.0 {
+        let ratio = device_width / css_width;
+        if ratio.is_finite() {
+            return ratio.clamp(0.1, 8.0);
+        }
+    }
+    1.0
 }
 
 /// `captureFullPage` 的产物：拼接后的整页图 + 尺寸/切片信息。
@@ -237,6 +333,10 @@ struct StitchedShot {
     slices: u64,
     truncated: bool,
     dpr: f64,
+    /// 回包尺寸与 JPEG 真实像素不一致、已按图像修正。
+    size_corrected: bool,
+    /// JPEG 尺寸解析失败时的提示（保留回包值，但如实告知无法交叉验证）。
+    size_warning: Option<String>,
 }
 
 /// 走扩展的「整页拼图」通道（captureVisibleTab + OffscreenCanvas，不 attach 调试器）。
@@ -260,17 +360,59 @@ async fn fetch_full_page(
     // `extension_control` 已经剥掉扩展回包的 `data` 层；老形状（`data.data_url`）一并兼容。
     let data_url = data_url_of(&value)
         .ok_or_else(|| anyhow!("captureFullPage 未返回 data_url（扩展版本可能不支持整页拼图）"))?;
-    let bytes = decode_base64(data_url.rsplit(',').next().unwrap_or_default())?;
+    let base64 = data_url.rsplit(',').next().unwrap_or_default();
+    // 整页拼接的 base64 可以到几百 MB，先按字符串长度准入，
+    // 超限直接失败，绝不先解码到内存再判断（那一步已经 OOM 了）。
+    guard_encoded_capture_len(base64.len())?;
+    let bytes = decode_base64(base64)?;
     validate_screenshot_bytes(&bytes, format)?;
+    let mut width = pixel_dim(&value, "width")?;
+    let mut height = pixel_dim(&value, "height")?;
+    // 回包里的 width/height 来自扩展的记账，可能和真正拼出来的位图不一致。
+    // JPEG 的 SOF 段里有权威像素尺寸，以图像为准，并在返回体标注已修正。
+    let mut size_corrected = false;
+    let mut size_warning: Option<String> = None;
+    if format == "jpeg" {
+        match jpeg_dimensions(&bytes) {
+            Some((real_width, real_height)) => {
+                if real_width != width || real_height != height {
+                    width = real_width;
+                    height = real_height;
+                    size_corrected = true;
+                }
+            }
+            // 解析不了就沿用回包值，但要明说「没能交叉验证」，不能装作校验过。
+            None => {
+                size_warning =
+                    Some("无法从 JPEG 的 SOF 段解析真实像素尺寸，已沿用扩展回包值".to_string())
+            }
+        }
+    }
+    // 拼接结果的像素总量也有预算，否则单张图就能吃掉几百 MB。
+    let max_pixels = crate::settings::env_usize_clamped(
+        "ATB_CAPTURE_MAX_PIXELS",
+        80_000_000,
+        1_000_000,
+        500_000_000,
+    ) as u64;
+    let pixels = u64::from(width) * u64::from(height);
+    if pixels > max_pixels {
+        return Err(anyhow!(
+            "capture_too_large: 整页图 {width}x{height}（{pixels} 像素）超过上限 {max_pixels} 像素；\
+             可用 --max-height 限制高度，或调高环境变量 ATB_CAPTURE_MAX_PIXELS"
+        ));
+    }
     Ok(StitchedShot {
-        width: pixel_dim(&value, "width")?,
-        height: pixel_dim(&value, "height")?,
+        width,
+        height,
         slices: value.get("slices").and_then(Value::as_u64).unwrap_or(0),
         truncated: value
             .get("truncated")
             .and_then(Value::as_bool)
             .unwrap_or(false),
         dpr: value.get("dpr").and_then(Value::as_f64).unwrap_or(1.0),
+        size_corrected,
+        size_warning,
         bytes,
     })
 }
@@ -290,7 +432,7 @@ async fn capture_full_page_stitched(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| default_screenshot_path(format));
     write_bytes(&path, &shot.bytes)?;
-    Ok(json!({
+    let mut body = json!({
         "status": "success",
         "path": path,
         "format": format,
@@ -303,8 +445,107 @@ async fn capture_full_page_stitched(
         "truncated": shot.truncated,
         // 吸顶/吸底元素在每条切片里都会出现一次，拼接消不掉，必须如实告知。
         "sticky_artifacts": "possible",
-        "dpr": shot.dpr
-    }))
+        "dpr": shot.dpr,
+        // 回包尺寸与 JPEG 真实像素不一致时以图像为准，这里标注已修正。
+        "size_corrected": shot.size_corrected,
+        "width": shot.width,
+        "height": shot.height
+    });
+    if let Some(warning) = &shot.size_warning {
+        body["size_warning"] = json!(warning);
+    }
+    Ok(body)
+}
+
+/// base64 字符串长度准入。
+///
+/// 解码前先按「base64 长度 ≈ 字节数 × 4/3」估算，超过输出上限就直接失败。
+/// 先解码再判断没有意义：到了那一步内存已经被吃掉。
+fn guard_encoded_capture_len(encoded_len: usize) -> Result<()> {
+    let cap = crate::settings::io_max_output_bytes();
+    let max_encoded = cap.saturating_mul(4) / 3 + 4;
+    if encoded_len > max_encoded {
+        return Err(anyhow!(
+            "capture_too_large: 画面数据 base64 {} 字节（约 {} 字节原始数据）超过输出上限 {} 字节；\
+             可用 --max-height 缩小截图范围，或调高环境变量 ATB_IO_MAX_OUTPUT_MB",
+            encoded_len,
+            encoded_len.saturating_mul(3) / 4,
+            cap
+        ));
+    }
+    Ok(())
+}
+
+/// 手写 JPEG SOF 解析：从 SOF0/SOF2 等帧头读出真实宽高。
+///
+/// 只需要宽度和高度，不引入解码器。解析失败返回 `None`（调用方保留回包值并给 warning）。
+fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 4 || bytes[0] != 0xff || bytes[1] != 0xd8 {
+        return None;
+    }
+    let mut index = 2usize;
+    while index + 1 < bytes.len() {
+        // 段必须以 0xFF 开头；中间夹了填充字节时跳过。
+        if bytes[index] != 0xff {
+            index += 1;
+            continue;
+        }
+        let mut marker_index = index + 1;
+        while marker_index < bytes.len() && bytes[marker_index] == 0xff {
+            marker_index += 1;
+        }
+        if marker_index >= bytes.len() {
+            return None;
+        }
+        let marker = bytes[marker_index];
+        // 独立标记（RST0..RST7 / SOI / EOI / TEM）没有长度字段。
+        if (0xd0..=0xd9).contains(&marker) || marker == 0x01 {
+            index = marker_index + 1;
+            continue;
+        }
+        let length_index = marker_index + 1;
+        if length_index + 1 >= bytes.len() {
+            return None;
+        }
+        let segment_len = usize::from(u16::from_be_bytes([
+            bytes[length_index],
+            bytes[length_index + 1],
+        ]));
+        if segment_len < 2 {
+            return None;
+        }
+        // SOF0..SOF15，排除 DHT(0xC4)、JPG(0xC8)、DAC(0xCC) 这三个非帧头标记。
+        let is_sof = matches!(
+            marker,
+            0xc0 | 0xc1
+                | 0xc2
+                | 0xc3
+                | 0xc5
+                | 0xc6
+                | 0xc7
+                | 0xc9
+                | 0xca
+                | 0xcb
+                | 0xcd
+                | 0xce
+                | 0xcf
+        );
+        if is_sof {
+            // 载荷：precision(1) height(2) width(2) ...
+            let payload = length_index + 2;
+            if payload + 5 > bytes.len() {
+                return None;
+            }
+            let height = u32::from(u16::from_be_bytes([bytes[payload + 1], bytes[payload + 2]]));
+            let width = u32::from(u16::from_be_bytes([bytes[payload + 3], bytes[payload + 4]]));
+            if width == 0 || height == 0 {
+                return None;
+            }
+            return Some((width, height));
+        }
+        index = length_index + segment_len;
+    }
+    None
 }
 
 /// `extension_control` 回包里的 `data_url`（已剥层或老形状）。
@@ -403,9 +644,9 @@ pub(crate) async fn save_pdf_page(state: &AppState, req: SavePdfRequest) -> Resu
     if !(0.1..=2.0).contains(&req.scale) {
         return Err(anyhow!("save-pdf: scale 必须在 0.1..=2.0"));
     }
-    let title = current_title(state, &tab_id, timeout)
-        .await
-        .unwrap_or_else(|_| "page".to_string());
+    // 先用会话缓存里的标题兜底（零往返）。以前是先 `document.title`
+    // 再打印，受限页面会为此白等一个完整的 CDP 往返，最后又把它吞成 "page"。
+    let cached_title = cached_page_title(state, &tab_id).await;
     let printed = cdp_call(
         state,
         &tab_id,
@@ -433,6 +674,21 @@ pub(crate) async fn save_pdf_page(state: &AppState, req: SavePdfRequest) -> Resu
         _ => false,
     };
     if debugger_blocked {
+        // 受限页面：标题只能用缓存值，不再为它等一个注定失败的往返。
+        let title = match cached_title {
+            Some(value) => TitleOutcome {
+                value,
+                fallback: false,
+                error: None,
+            },
+            None => TitleOutcome {
+                value: "page".to_string(),
+                fallback: true,
+                error: Some(
+                    "该页面禁止调试器注入，无法读取 document.title，且会话缓存无标题".to_string(),
+                ),
+            },
+        };
         return save_pdf_stitched(state, &tab_id, &req, &title, timeout).await;
     }
     let result = printed?;
@@ -446,27 +702,87 @@ pub(crate) async fn save_pdf_page(state: &AppState, req: SavePdfRequest) -> Resu
         .data
         .and_then(|data| data.get("data").and_then(Value::as_str).map(str::to_string))
         .ok_or_else(|| anyhow!("save-pdf: CDP response missing data"))?;
+    guard_encoded_capture_len(data.len())?;
     let bytes = decode_base64(&data)?;
-    // 同 screenshot：先校验魔数与长度，再考虑 50MB 上限。
+    // 同 screenshot：先校验魔数与长度，再考虑输出上限。
     validate_pdf_bytes(&bytes)?;
-    const MAX_PDF_BYTES: usize = 50 * 1024 * 1024;
-    if bytes.len() > MAX_PDF_BYTES {
-        return Err(anyhow!("save-pdf: PDF exceeds max size 50MB"));
+    let max_pdf_bytes = crate::settings::io_max_output_bytes();
+    if bytes.len() > max_pdf_bytes {
+        return Err(anyhow!(
+            "save-pdf: PDF {} 字节超过输出上限 {max_pdf_bytes} 字节（ATB_IO_MAX_OUTPUT_MB）",
+            bytes.len()
+        ));
     }
-    let path = req.out.unwrap_or_else(|| default_pdf_path(&title));
+    // 打印成功说明 CDP 通道可用，此时再取实时标题（失败就用缓存值并如实标注）。
+    let title = resolve_page_title(state, &tab_id, timeout, cached_title).await;
+    let path = req
+        .out
+        .clone()
+        .unwrap_or_else(|| default_pdf_path(&title.value));
     write_bytes(&path, &bytes)?;
-    Ok(json!({
+    let mut body = json!({
         "status": "success",
         "path": path,
         "bytes": bytes.len(),
         "paper": req.paper.to_ascii_lowercase(),
         "landscape": req.landscape,
         "scale": req.scale,
-        "print_background": req.print_background
-    }))
+        "print_background": req.print_background,
+        "title": title.value
+    });
+    if title.fallback {
+        body["title_fallback"] = json!(true);
+        if let Some(reason) = title.error {
+            body["title_error"] = json!(reason);
+        }
+    }
+    Ok(body)
 }
 
-/// 图片型 PDF 回落：整页拼图 → JPEG 包成单页 PDF。
+/// `document.title` 的取值结果 + 是否用了兜底。
+struct TitleOutcome {
+    value: String,
+    fallback: bool,
+    error: Option<String>,
+}
+
+/// 会话缓存里的标题（扩展注册时上报），零往返。
+async fn cached_page_title(state: &AppState, tab_id: &str) -> Option<String> {
+    let driver = state.driver.read().await;
+    driver
+        .sessions
+        .get(tab_id)
+        .map(|session| session.info.title.trim().to_string())
+        .filter(|title| !title.is_empty())
+}
+
+/// 取实时标题；失败时退回缓存值，并把原因带出去（不再静默变成 "page"）。
+async fn resolve_page_title(
+    state: &AppState,
+    tab_id: &str,
+    timeout: Duration,
+    cached: Option<String>,
+) -> TitleOutcome {
+    match current_title(state, tab_id, timeout).await {
+        Ok(value) if !value.trim().is_empty() => TitleOutcome {
+            value,
+            fallback: false,
+            error: None,
+        },
+        Ok(_) => TitleOutcome {
+            value: cached.unwrap_or_else(|| "page".to_string()),
+            fallback: true,
+            error: Some("document.title 为空，已回落到会话缓存标题".to_string()),
+        },
+        Err(err) => TitleOutcome {
+            value: cached.unwrap_or_else(|| "page".to_string()),
+            fallback: true,
+            error: Some(err.to_string()),
+        },
+    }
+}
+
+/// 图片型 PDF 回落：整页拼图 → JPEG 包成（可能多页的）PDF。
 ///
 /// 页面禁止调试器注入时 `Page.printToPDF` 不可用，但用户要的是一份**能看的**整页
 /// 文档；文字不可选中这点必须在返回体里说清楚，否则调用方会以为拿到了可检索 PDF。
@@ -474,7 +790,7 @@ async fn save_pdf_stitched(
     state: &AppState,
     tab_id: &str,
     req: &SavePdfRequest,
-    title: &str,
+    title: &TitleOutcome,
     timeout: Duration,
 ) -> Result<Value> {
     // 只用 JPEG：DCTDecode 能直接吃原始字节，省掉一次重编码。
@@ -491,28 +807,80 @@ async fn save_pdf_stitched(
             ));
         }
     };
-    let bytes = pdf::image_pdf(&shot.bytes, shot.width, shot.height)?;
+    // 拼图回包的 width/height 是**设备像素**，PDF 的页面尺寸必须按
+    // CSS px（96dpi）换算。dpr=2 时不归一化会把页面放大一倍。
+    let dpr = if shot.dpr.is_finite() && shot.dpr > 0.0 {
+        shot.dpr
+    } else {
+        1.0
+    };
+    let width_px = normalize_css_dimension(shot.width, dpr);
+    let height_px = normalize_css_dimension(shot.height, dpr);
+    // 超长页面在 image_pdf 内部纵向切片，页高不会超过 PDF 上限。
+    let pdf = pdf::image_pdf(&shot.bytes, width_px, height_px)?;
+    let bytes = pdf.bytes;
     // 自产的 PDF 也过同一套校验：`%PDF-` 头 + `%%EOF` 尾，拼接错位时不会静默成功。
     validate_pdf_bytes(&bytes)?;
-    const MAX_PDF_BYTES: usize = 50 * 1024 * 1024;
-    if bytes.len() > MAX_PDF_BYTES {
-        return Err(anyhow!("save-pdf: PDF exceeds max size 50MB"));
+    let max_pdf_bytes = crate::settings::io_max_output_bytes();
+    if bytes.len() > max_pdf_bytes {
+        return Err(anyhow!(
+            "save-pdf: PDF {} 字节超过输出上限 {max_pdf_bytes} 字节（ATB_IO_MAX_OUTPUT_MB）",
+            bytes.len()
+        ));
     }
-    let path = req.out.clone().unwrap_or_else(|| default_pdf_path(title));
+    let path = req
+        .out
+        .clone()
+        .unwrap_or_else(|| default_pdf_path(&title.value));
     write_bytes(&path, &bytes)?;
-    Ok(json!({
+    // 这是图片型回退，请求里的 paper/landscape/scale **没有生效**。
+    // 回显必须如实：`paper:"image"`、`landscape/scale:null`，并给出实际页面几何。
+    let mut body = json!({
         "status": "success",
         "path": path,
         "bytes": bytes.len(),
-        "paper": req.paper.to_ascii_lowercase(),
-        "landscape": req.landscape,
-        "scale": req.scale,
+        "paper": "image",
+        "landscape": Value::Null,
+        "scale": Value::Null,
+        "paper_applied": false,
+        "requested_paper": req.paper.to_ascii_lowercase(),
+        "requested_landscape": req.landscape,
+        "requested_scale": req.scale,
         "print_background": req.print_background,
         "via": "stitched-image-pdf",
         "text_selectable": false,
         "truncated": shot.truncated,
-        "note": "该页面禁止调试器注入，PDF 为整页截图合成（文字不可选中）"
-    }))
+        "pages": pdf.pages,
+        "width_pt": round2(pdf.width_pt),
+        "height_pt": round2(pdf.height_pt),
+        "page_height_pt": round2(pdf.page_height_pt),
+        "dpr": dpr,
+        "size_corrected": shot.size_corrected,
+        "title": title.value.clone(),
+        "note": "该页面禁止调试器注入，PDF 为整页截图合成（文字不可选中）；\
+                 请求的 paper/landscape/scale 未生效，页面尺寸由截图决定"
+    });
+    if title.fallback {
+        body["title_fallback"] = json!(true);
+        if let Some(reason) = &title.error {
+            body["title_error"] = json!(reason);
+        }
+    }
+    if let Some(warning) = &shot.size_warning {
+        body["size_warning"] = json!(warning);
+    }
+    Ok(body)
+}
+
+/// 设备像素 → CSS px（保留 1px 下限，dpr 非法时按 1.0 处理）。
+fn normalize_css_dimension(device_px: u32, dpr: f64) -> u32 {
+    let value = (f64::from(device_px) / dpr).round();
+    value.clamp(1.0, f64::from(u32::MAX)) as u32
+}
+
+/// 回显用的两位小数（避免 JSON 里出现 960.0000000000001 这类噪声）。
+fn round2(value: f64) -> f64 {
+    (value * 100.0).round() / 100.0
 }
 
 pub(crate) async fn target_rect(
@@ -531,18 +899,20 @@ pub(crate) async fn target_rect(
     Ok(rect)
 }
 
+/// 读取 `document.title`。空值或取值失败一律返回 `Err`，由调用方决定兜底，
+/// 不再静默变成 "page"。
 pub(crate) async fn current_title(
     state: &AppState,
     tab_id: &str,
     timeout: Duration,
 ) -> Result<String> {
     let response = execute_raw_js_on_tab(state, "return document.title", tab_id, timeout).await?;
-    Ok(response
-        .data
-        .unwrap_or(Value::Null)
-        .as_str()
-        .unwrap_or("page")
-        .to_string())
+    let value = response.data.unwrap_or(Value::Null);
+    match value.as_str() {
+        Some(title) if !title.trim().is_empty() => Ok(title.to_string()),
+        Some(_) => Err(anyhow!("document.title 为空")),
+        None => Err(anyhow!("document.title 取值失败（回包不是字符串）")),
+    }
 }
 
 pub(crate) fn normalize_screenshot_format(format: &str) -> Result<&'static str> {
@@ -666,7 +1036,7 @@ pub(crate) fn sanitize_filename(input: &str) -> String {
 }
 
 pub(crate) fn decode_base64(input: &str) -> Result<Vec<u8>> {
-    // 除了「能解出来」，还要能判断「这份数据是不是完整的」：
+    // 除了「能解出来」，还要能判断「这份数据是不是完整的」（D-02）：
     // ① `=` 之后不允许再有数据字符（拼接/截断的典型形态）；
     // ② 带 padding 时总长度必须是 4 的倍数；
     // ③ 最后一组残留 bit 必须为 0（末字节只来了半个字符时不为 0）。
@@ -729,7 +1099,7 @@ pub(crate) const MIN_PDF_BYTES: usize = 200;
 /// 校验 CDP 回传的画面数据：**能解码 ≠ 可用**。
 ///
 /// `decode_base64` 对空串和截断串都会「成功」返回（0 字节或半截文件），
-/// 旧实现照样写盘并返回 `status:success`，退出码 0，调用方拿到坏图却以为成功。
+/// 旧实现照样写盘并返回 `status:success`，退出码 0，调用方拿到坏图却以为成功（C-10）。
 pub(crate) fn validate_screenshot_bytes(bytes: &[u8], format: &str) -> Result<()> {
     let magic_ok = match format {
         "png" => bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]),
@@ -745,7 +1115,7 @@ pub(crate) fn validate_screenshot_bytes(bytes: &[u8], format: &str) -> Result<()
         ));
     }
     // 尾部魔数：只查头部的话，「截掉尾部若干个 4 字符组」的 base64 会被判成合法，
-    // 于是写盘一张打不开的图、却报 status:success（，v7 已实测复现）。
+    // 于是写盘一张打不开的图、却报 status:success（D-02，v7 已实测复现）。
     // 只在最后 16 字节里找，容忍少量尾部填充，但不接受「完全没有结束标记」。
     if !tail_magic_ok(bytes, format) {
         return Err(anyhow!(
@@ -776,7 +1146,7 @@ pub(crate) fn validate_pdf_bytes(bytes: &[u8]) -> Result<()> {
             bytes.len()
         ));
     }
-    // 与截图同理：PDF 必须以 `%%EOF` 收尾，只有 `%PDF-` 头说明文件被截断（同族）。
+    // 与截图同理：PDF 必须以 `%%EOF` 收尾，只有 `%PDF-` 头说明文件被截断（D-02 同族）。
     let tail_start = bytes.len().saturating_sub(64);
     if !bytes[tail_start..]
         .windows(5)

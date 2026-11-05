@@ -116,7 +116,20 @@ impl TargetSpec {
                 example: EXAMPLE,
             });
         }
-        for part in &parts {
+        let mut ids: Vec<String> = Vec::with_capacity(parts.len());
+        for raw_part in &parts {
+            // `id:` 是显式逃生口：`--tab id:url:order` / `id:all` / `id:@1` 强制按
+            // id 解析，不会被前缀选择器或关键字抢走。
+            let part = strip_prefix_ci(raw_part, "id:").unwrap_or(raw_part);
+            let part = part.trim();
+            if part.is_empty() {
+                return Err(SpecError {
+                    code: "invalid_target_spec",
+                    message: "--tab id: 后面必须跟 tab id 或 session_key".to_string(),
+                    hint: "写成 `--tab id:1234567890`；`id:` 只用来强制按 id 解析".to_string(),
+                    example: "atb read --tab id:1234567890",
+                });
+            }
             if part.chars().any(char::is_whitespace) {
                 return Err(SpecError {
                     code: "invalid_target_spec",
@@ -127,24 +140,25 @@ impl TargetSpec {
                     example: "atb tabs --ids",
                 });
             }
-            if !part
-                .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':'))
-            {
+            // 字符集放宽到「可见 ASCII，排除逗号」：session_key / 自定义 id 里可能
+            // 出现 `#`、`@`、`=` 等，旧白名单会把它们误判成非法输入。
+            if !part.chars().all(is_valid_id_char) {
                 return Err(SpecError {
                     code: "invalid_target_spec",
                     message: format!("--tab 里的 {part:?} 不是合法的 tab id / session_key"),
-                    hint: "tab id 是纯数字；session_key 形如 browser-x:profile-y:123。\
-                           要用序号写 `--tab @1`；要按 URL 写 `--tab url:example.com`"
+                    hint: "tab id / session_key 只能包含可见 ASCII（不能有空格或逗号）。\
+                           要用序号写 `--tab @1`；要按 URL 写 `--tab url:example.com`；\
+                           要强制按 id 解析写 `--tab id:<id>`"
                         .to_string(),
                     example: "atb read --tab @1",
                 });
             }
+            ids.push(part.to_string());
         }
         // 去重按原顺序（保留首次出现）：`--tab 5,5` 只该命中一个标签页，否则同一条
         // 命令会对同一个页面执行两遍（点击两次、填两次）。daemon 侧已有去重，这里是
-        // 双保险。
-        Ok(TargetSpec::Ids(dedupe(parts)))
+        // 双保险（D-07）。
+        Ok(TargetSpec::Ids(dedupe(ids)))
     }
 
     /// 是否必须由 daemon 解析目标。
@@ -181,7 +195,8 @@ impl TargetSpec {
 
     /// 单标签路径下真正要发给 daemon 的值（多目标返回 None）。
     ///
-    /// 仅测试使用：单目标捷径。
+    /// 当前调用方都直接 match 目标形态，没有用到这个捷径；保留是为了不让
+    /// 「单目标 / 多目标」的判定散落到各处。
     #[cfg(test)]
     pub fn single_id(&self) -> Option<&str> {
         match self {
@@ -204,16 +219,49 @@ impl TargetSpec {
             TargetSpec::Title(value) => format!("title:{value}"),
             TargetSpec::Group(value) => format!("group:{value}"),
             TargetSpec::Window(value) => format!("window:{value}"),
-            TargetSpec::Ids(ids) => ids.join(","),
+            // 回显时对「会被语法抢走」的 id 加 `id:` 前缀，保证 `describe()` 的输出
+            // 再喂回 `parse` 得到同一个规格。
+            TargetSpec::Ids(ids) => ids
+                .iter()
+                .map(|id| {
+                    if id_needs_forced_prefix(id) {
+                        format!("id:{id}")
+                    } else {
+                        id.clone()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(","),
         }
     }
+}
+
+/// 合法的 id 字符：可见 ASCII，排除逗号（逗号是列表分隔符）。
+fn is_valid_id_char(ch: char) -> bool {
+    ch.is_ascii_graphic() && ch != ','
+}
+
+/// 这个 id 直接写回 `--tab` 时会被别的语法抢走吗？
+///
+/// 会的话 `describe()` 要加 `id:` 前缀，保证「描述 → 再解析」不改变语义。
+fn id_needs_forced_prefix(id: &str) -> bool {
+    let lower = id.to_ascii_lowercase();
+    if matches!(lower.as_str(), "all" | "*" | "current" | "active") {
+        return true;
+    }
+    if id.starts_with('@') || id.starts_with('#') {
+        return true;
+    }
+    ["url:", "title:", "group:", "window:", "id:"]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
 }
 
 fn strip_prefix_ci<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
     // 切片前必须确认落在**字符边界**上。`prefix` 恒为 ASCII（`all` / `url:` / `title:`
     // / `group:` / `window:` / `current`），但 `text` 可能紧接着一个多字节字符：
     // `--tab "all中"` 时 `split_at(4)` 会落在 '中'（3..6 字节）中间，直接 panic 到
-    // exit 101 —— 101 不在对外退出码契约（1/2/3/130）里，Agent 无法机器判读。
+    // exit 101 —— 101 不在对外退出码契约（1/2/3/130）里，Agent 无法机器判读（R-04）。
     // `str::get(..n)` 在越界或非边界时返回 None，正好等价于「前缀不匹配」。
     let head = text.get(..prefix.len())?;
     let rest = text.get(prefix.len()..)?;
@@ -331,7 +379,7 @@ mod tests {
 
     #[test]
     fn duplicate_ids_are_collapsed() {
-        // `--tab 5,5` 只该命中一个标签页；顺序按首次出现保留。
+        // `--tab 5,5` 只该命中一个标签页（D-07）；顺序按首次出现保留。
         assert_eq!(
             TargetSpec::parse("5,5").unwrap(),
             TargetSpec::Ids(vec!["5".into()])
@@ -459,5 +507,52 @@ mod tests {
         let err = TargetSpec::parse("111 222").unwrap_err();
         assert_eq!(err.code, "invalid_target_spec");
         assert!(!err.hint.is_empty());
+    }
+
+    #[test]
+    fn forced_id_prefix_beats_keyword_and_selector_syntax() {
+        // `id:` 是逃生口：即使内容长得像关键字/前缀选择器，也必须按 id 解析。
+        assert_eq!(
+            TargetSpec::parse("id:all").unwrap(),
+            TargetSpec::Ids(vec!["all".into()])
+        );
+        assert_eq!(
+            TargetSpec::parse("id:url:order").unwrap(),
+            TargetSpec::Ids(vec!["url:order".into()])
+        );
+        assert_eq!(
+            TargetSpec::parse("id:@1").unwrap(),
+            TargetSpec::Ids(vec!["@1".into()])
+        );
+        assert_eq!(
+            TargetSpec::parse("id:a,id:b").unwrap(),
+            TargetSpec::Ids(vec!["a".into(), "b".into()])
+        );
+        assert!(TargetSpec::parse("id:").is_err());
+    }
+
+    #[test]
+    fn describe_roundtrips_ambiguous_ids() {
+        for raw in ["id:all", "id:url:order", "id:@1", "id:title:x"] {
+            let spec = TargetSpec::parse(raw).unwrap();
+            let described = spec.describe();
+            assert_eq!(
+                TargetSpec::parse(&described).unwrap(),
+                spec,
+                "raw={raw} described={described}"
+            );
+        }
+        // 普通 id 不需要前缀，保持可读。
+        let plain = TargetSpec::parse("1234567890").unwrap();
+        assert_eq!(plain.describe(), "1234567890");
+    }
+
+    #[test]
+    fn ids_accept_visible_ascii_but_not_spaces_or_commas() {
+        // 字符集放宽到可见 ASCII：`#` / `@` / `=` 等不再被误判。
+        assert!(TargetSpec::parse("browser#a").is_ok());
+        assert!(TargetSpec::parse("a=b").is_ok());
+        assert!(TargetSpec::parse("a\tb").is_err());
+        assert!(TargetSpec::parse("a b").is_err());
     }
 }

@@ -2,12 +2,13 @@
 # 多标签并发端到端验证（需要真实 Chrome + 已连接的扩展）。
 #
 # 用法：
-#   bash tests/live_multi_tabs.sh ./target/release/atb.exe
+#   bash tests/live_multi_tabs.sh ./target/release/atb   # Windows: ./target/release/atb.exe
+#   ATB_BIN=./target/release/atb bash tests/live_multi_tabs.sh
 #
 # 覆盖：并发打开、多标签 exec/read、@N 序号、顺序稳定性、目标不存在的报错与退出码、
 #       --dry-run、预检拦截、输出路径冲突、批量关闭。会自行清理创建的测试标签页。
 set -u
-B="${1:-./target/release/atb.exe}"
+B="${1:-${ATB_BIN:-atb}}"
 pass=0; fail=0
 now() { date +%s%3N; }
 check() { # name expected actual

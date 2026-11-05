@@ -22,6 +22,7 @@ import {
   copyFileSync,
   existsSync,
   mkdirSync,
+  mkdtempSync,
   readdirSync,
   readFileSync,
   renameSync,
@@ -30,6 +31,7 @@ import {
   statSync,
   writeFileSync,
 } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -92,6 +94,93 @@ function atomicCopy(from, to) {
     }
     throw error;
   }
+}
+
+/// 两阶段部署。
+///
+/// 旧实现逐个文件 atomicCopy + 校验，任一失败就 exit 1：已写成功的文件留在新版、
+/// 失败的是旧版，扩展目录变成「新 background.js + 旧 ops/page_*.js」的混合体，
+/// 正是文件头警告的 `Service worker registration failed` 场景，而且部署记录没更新，
+/// 下次也看不出差异。
+///
+/// 现在分两步：
+///   阶段 1（prepare）：全部源文件先复制到系统临时目录并逐字节校验；任何一个失败
+///     就丢弃暂存、目标目录一个字节都不动。
+///   阶段 2（swap）：先备份目标里将被覆盖的文件，再逐个原子替换并校验；任何一个失败
+///     就把已替换的文件按备份写回、删掉本次新建的文件，回到部署前状态。
+/// 只有全部成功才继续 removeStale / writeRecord。
+function prepareStage(source, files) {
+  const staging = mkdtempSync(join(tmpdir(), 'atb-deploy-'));
+  const stagedDir = join(staging, 'staged');
+  const failures = [];
+  for (const rel of files) {
+    const from = join(source, rel);
+    const to = join(stagedDir, rel);
+    try {
+      mkdirSync(dirname(to), { recursive: true });
+      copyFileSync(from, to);
+      if (sha256(from) !== sha256(to)) failures.push(`${rel}: 暂存副本与源文件不一致`);
+    } catch (error) {
+      failures.push(`${rel}: ${error.message}`);
+    }
+  }
+  return { staging, stagedDir, failures };
+}
+
+/// 阶段 2：备份 → 替换 → 校验。失败时按备份回滚，返回 { ok, error, rollbackErrors }。
+function swapStage(target, stagedDir, files, staging) {
+  const backupDir = join(staging, 'backup');
+  const written = [];
+  const restore = () => {
+    const errors = [];
+    for (const rel of written) {
+      const backup = join(backupDir, rel);
+      const to = join(target, rel);
+      try {
+        if (existsSync(backup)) {
+          atomicCopy(backup, to);
+          if (sha256(backup) !== sha256(to)) errors.push(`${rel}: 回滚后内容不一致`);
+        } else {
+          rmSync(to, { force: true });
+        }
+      } catch (error) {
+        errors.push(`${rel}: ${error.message}`);
+      }
+    }
+    // 尽力清掉本次新建、回滚后已空掉的目录，让目标目录更接近部署前状态。
+    for (const rel of written) {
+      let dir = dirname(rel);
+      while (dir && dir !== '.') {
+        try {
+          rmdirSync(join(target, dir));
+        } catch {
+          break;
+        }
+        dir = dirname(dir);
+      }
+    }
+    return errors;
+  };
+
+  for (const rel of files) {
+    const from = join(stagedDir, rel);
+    const to = join(target, rel);
+    try {
+      if (existsSync(to)) {
+        const backup = join(backupDir, rel);
+        mkdirSync(dirname(backup), { recursive: true });
+        copyFileSync(to, backup);
+        if (sha256(to) !== sha256(backup)) throw new Error('备份副本与目标文件不一致');
+      }
+      atomicCopy(from, to);
+      if (sha256(from) !== sha256(to)) throw new Error('写入后逐字节校验不一致');
+      written.push(rel);
+    } catch (error) {
+      const rollbackErrors = restore();
+      return { ok: false, error: `${rel}: ${error.message}`, rollbackErrors, written: written.length };
+    }
+  }
+  return { ok: true, written: written.length, rollbackErrors: [] };
 }
 
 /// 清理上一次部署崩溃留下的临时文件。
@@ -291,26 +380,10 @@ function main() {
   console.log(`文件    ${files.length} 个`);
   if (stale.length) console.log(`待清理  ${stale.length} 个（源目录已删除）`);
 
-  const copied = [];
-  const failed = [];
-  for (const rel of files) {
-    const from = join(source, rel);
-    const to = join(target, rel);
-    if (checkOnly) {
-      console.log(`  计划  ${rel}  (${statSync(from).size} 字节)`);
-      continue;
-    }
-    try {
-      atomicCopy(from, to);
-      const ok = sha256(from) === sha256(to);
-      if (ok) copied.push(rel);
-      else failed.push(`${rel} 校验不一致`);
-    } catch (error) {
-      failed.push(`${rel}: ${error.message}`);
-    }
-  }
-
   if (checkOnly) {
+    for (const rel of files) {
+      console.log(`  计划  ${rel}  (${statSync(join(source, rel)).size} 字节)`);
+    }
     // check 只报告将删除什么，不碰目标目录。
     removeStale(target, stale, true);
     pruneBackups(target, files, true);
@@ -318,11 +391,34 @@ function main() {
     return;
   }
 
-  console.log(`\n已部署 ${copied.length}/${files.length} 个文件（逐字节校验通过）`);
-  if (failed.length) {
-    for (const item of failed) console.error(`  失败 ${item}`);
+  // 阶段 1：全部源文件先进暂存区并逐字节校验。失败时目标目录一个字节都不动。
+  const { staging, stagedDir, failures } = prepareStage(source, files);
+  if (failures.length) {
+    rmSync(staging, { recursive: true, force: true });
+    for (const item of failures) console.error(`  暂存失败 ${item}`);
+    console.error(`部署已中止：${files.length} 个文件里有 ${failures.length} 个无法暂存，目标目录未被修改。`);
     process.exit(1);
   }
+  console.log(`已暂存 ${files.length} 个文件并逐字节校验通过`);
+
+  // 阶段 2：备份 → 原子替换 → 校验；任何失败都回滚到部署前状态。
+  const swapped = swapStage(target, stagedDir, files, staging);
+  if (!swapped.ok) {
+    rmSync(staging, { recursive: true, force: true });
+    console.error(`  替换失败 ${swapped.error}`);
+    if (swapped.rollbackErrors.length === 0) {
+      console.error(`已回滚 ${swapped.written} 个已替换文件，扩展目录保持部署前状态。`);
+      console.error('目标文件可能正被浏览器占用：关掉 Chrome/Edge 后重试，或先在扩展页停用本扩展。');
+    } else {
+      // 回滚也失败：必须把「混合状态」明说出来，否则用户会以为部署是干净的。
+      for (const item of swapped.rollbackErrors) console.error(`  回滚失败 ${item}`);
+      console.error('扩展已处于混合状态（部分文件是新版、部分是旧版），请重新运行 node scripts/deploy-extension.mjs');
+    }
+    process.exit(1);
+  }
+  rmSync(staging, { recursive: true, force: true });
+
+  console.log(`\n已部署 ${files.length}/${files.length} 个文件（逐字节校验通过）`);
 
   const removed = removeStale(target, stale, false);
   if (removed.length) console.log(`已清理 ${removed.length} 个目标目录多余文件: ${removed.join(', ')}`);

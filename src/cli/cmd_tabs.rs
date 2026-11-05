@@ -40,7 +40,7 @@ pub(crate) fn run_profile_label_command(args: ProfileLabelCommand) -> Result<()>
                     "browser": args.browser,
                     "switch_tab_id": args.tab,
                 })),
-                args.timeout,
+                http_budget(args.timeout),
             )?);
         }
         ProfileLabelAction::Clear(args) => {
@@ -53,7 +53,7 @@ pub(crate) fn run_profile_label_command(args: ProfileLabelCommand) -> Result<()>
                     "browser": args.browser,
                     "switch_tab_id": args.tab,
                 })),
-                args.timeout,
+                http_budget(args.timeout),
             )?);
         }
     }
@@ -116,7 +116,8 @@ fn parse_tabs_fields(spec: Option<&str>) -> Result<Option<Vec<String>>> {
 ///
 /// 旧实现 tabs 永远回全部字段全量列表：大浏览器里一次输出几千 token，
 /// 智能体其实只用 tab_id/title/url。这里统一处理 full / --ids 两条路径共用的
-/// `/result/metadata/tabs`，并把 tabs_count 等元数据同步修正。
+/// `/result/metadata/tabs`，并把 tabs_count（原始总数）与 returned_count（本次返回）
+/// 分开记录。
 fn apply_fields_limit(value: &mut Value, fields: Option<&[String]>, limit: Option<usize>) {
     let Some(tabs) = value
         .pointer("/result/metadata/tabs")
@@ -141,14 +142,19 @@ fn apply_fields_limit(value: &mut Value, fields: Option<&[String]>, limit: Optio
             None => tab.clone(),
         })
         .collect();
-    if let Some(limit) = limit {
+    // `--limit 0` 表示「不截断」：schema 里该参数没有默认值，照表显式传 0 时
+    // 不能返回空列表。
+    if let Some(limit) = limit.filter(|value| *value > 0) {
         items.truncate(limit);
     }
     if let Some(metadata) = value
         .pointer_mut("/result/metadata")
         .and_then(Value::as_object_mut)
     {
-        metadata.insert("tabs_count".to_string(), json!(items.len()));
+        // tabs_count 保持**原始总数**，本次实际返回量另用 returned_count。
+        // 旧实现把 tabs_count 改写成本次截断后的数量，调用方会误以为浏览器里只有这么多标签。
+        metadata.insert("tabs_count".to_string(), json!(total));
+        metadata.insert("returned_count".to_string(), json!(items.len()));
         if let Some(fields) = fields {
             metadata.insert("fields".to_string(), json!(fields));
         }
@@ -224,6 +230,8 @@ pub(crate) fn cmd_tabs(args: TabsArgs, is_async: bool) -> Result<()> {
             .map(|field| field.to_string())
             .collect(),
     };
+    // --ids 视图也要能回答「总共多少、limit 前多少」，与 full 视图对齐。
+    let total_before_limit = tabs.len();
     let mut items: Vec<Value> = tabs
         .iter()
         .map(|tab| {
@@ -243,6 +251,9 @@ pub(crate) fn cmd_tabs(args: TabsArgs, is_async: bool) -> Result<()> {
     print_json(json!({
         "ok": value.get("ok").cloned().unwrap_or(json!(false)),
         "count": items.len(),
+        "returned_count": items.len(),
+        "total_before_limit": total_before_limit,
+        "total": total_before_limit,
         "tabs": items,
         "hint": "把某个 tab_id 直接传给 --tab；也可以 --tab @1 按序号、--tab window:<id> 按窗口",
     }));

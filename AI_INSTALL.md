@@ -2,14 +2,14 @@
 
 适用对象：希望由编码 Agent 在本机完成 atb 安装、扩展加载、skill 安装与验证的用户。
 
-当前文档对应 CLI `0.7.1`、扩展文件版本 `5.2.9`、CLI ↔ daemon 协议 `5`。版本号以 `package.json` 与 `assets/atb_bridge/manifest.json` 为准；CLI 与扩展独立发版，不要假设两者同号。用 `@latest` 安装时如果装到更新的版本，以 `atb --version` 与 `atb status` 的输出为准。
+当前文档对应 CLI `0.7.2`、扩展文件版本 `5.3.0`、CLI ↔ daemon 协议 `5`。版本号以 `package.json` 与 `assets/atb_bridge/manifest.json` 为准；CLI 与扩展独立发版，不要假设两者同号。用 `@latest` 安装时如果装到更新的版本，以 `atb --version` 与 `atb status` 的输出为准。
 
 ## 复制给 AI 的一段话
 
 ```text
 请在这台机器上安装或升级 atb（仓库 https://github.com/1728578755/atb-cli，npm 包 @g1728578755/atb）。
 
-目标：安装最新版 atb（本文写作时为 CLI 0.7.1、扩展 5.2.9），最低 Chrome/Edge 120，Node >= 18。若实际版本更新，以命令输出为准。
+目标：安装最新版 atb（本文写作时为 CLI 0.7.2、扩展 5.3.0），最低 Chrome/Edge 120，Node >= 18。若实际版本更新，以命令输出为准。
 
 执行要求：
 1. 先做前置检查并告诉我结果：操作系统与 CPU 架构、node -v、npm -v、Chrome/Edge 版本、PATH 上是否已有 atb 及其版本、~/.atb 是否已存在。
@@ -17,7 +17,7 @@
 3. 安装扩展前先问我：解压目录放在哪里。从 GitHub 最新 Release 下载 chrome-extensions.zip，解压后扩展文件直接位于该目录（manifest.json、background.js、content.js 在同一层，没有再套一层 atb_bridge）。指导我在 chrome://extensions 开启开发者模式、加载已解压的扩展程序，选择这个直接包含 manifest.json 的目录。如果之前装过，必须在扩展卡片上点“重新加载”。
 4. 安装 skill 前先问我是否需要安装、装给哪些 Agent。先运行 atb install-skill --dry-run，把输出原样贴给我，我确认后再执行 atb install-skill；不要用 --yes 跳过确认。
 5. 验证依次运行：atb tabs --pretty、atb status --pretty、atb doctor、atb open https://example.com --pretty、atb read --tab <tabId> --pretty。先跑 tabs 是为了自动拉起 daemon；直接先跑 status 会得到 daemon_not_running，这不是安装失败。把完整 JSON 贴给我。成功判据：tabs 的 count 大于 0；status 的 healthy 为 true 且 summary 为 ready；open 返回 targets[0].tab_id；read 返回非空 title 或 text。
-6. 任何一步失败：先停下，贴出完整命令、退出码、JSON 错误与 daemon 日志末尾，再给出下一步方案，等我确认后再动手。不要反复重试同一条命令，不要自行删除文件、改系统配置或重装浏览器。统一使用 atb，不要与旧命令 agent-browser-cli 混用。
+6. 任何一步失败：先停下，贴出完整命令、退出码、JSON 错误与 daemon 日志末尾，再给出下一步方案，等我确认后再动手。不要反复重试同一条命令，不要自行删除文件、改系统配置或重装浏览器。统一使用 `atb`。
 ```
 
 ## AI 执行流程
@@ -44,7 +44,7 @@ npm install -g @g1728578755/atb@latest
 atb --version
 ```
 
-`atb --version` 应输出 `atb 0.7.1`（或你实际安装的更新版本）。npm 安装会按平台拉取可选依赖子包；平台清单：
+`atb --version` 应输出 `atb 0.7.2`（或你实际安装的更新版本）。npm 安装会按平台拉取可选依赖子包；平台清单：
 
 | 平台 | 预编译 | 说明 |
 | --- | --- | --- |
@@ -99,7 +99,7 @@ ls "$EXT_PARENT/manifest.json" "$EXT_PARENT/background.js" "$EXT_PARENT/content.
 node -p "require('$EXT_PARENT/manifest.json').version"
 ```
 
-第二行应为 `5.2.9`；Windows 用 `Get-Content "$ExtParent\manifest.json"` 查看 `version` 字段。加载时选择 `$EXT_PARENT` 这一层：它必须直接包含 `manifest.json`、`background.js`、`content.js`。解压工具若自动多建了一层子目录，就往下选到直接含 `manifest.json` 的那一层，不要把父目录交给浏览器。
+第二行应为 `5.3.0`；Windows 用 `Get-Content "$ExtParent\manifest.json"` 查看 `version` 字段。加载时选择 `$EXT_PARENT` 这一层：它必须直接包含 `manifest.json`、`background.js`、`content.js`。解压工具若自动多建了一层子目录，就往下选到直接含 `manifest.json` 的那一层，不要把父目录交给浏览器。
 
 在 Chrome 打开 `chrome://extensions`（Edge 为 `edge://extensions`），开启“开发者模式”，点“加载已解压的扩展程序”，选择该目录。已装过旧版的：覆盖目录后回到扩展页点“重新加载”。仅覆盖文件不重载，浏览器仍跑旧 Service Worker。加载完成后至少打开一个 `http://` 或 `https://` 页面；停在 `about:blank`、`chrome://` 页面时扩展不会上报可用标签页。
 
@@ -138,7 +138,7 @@ atb read --tab <tabId> --pretty
 
 | 命令 | 成功判据 |
 | --- | --- |
-| `status` | `ok:true`、`healthy:true`、`summary:"ready"`、`compatibility.ok:true`；扩展版本用 `atb capabilities` 核对为 `5.2.9` |
+| `status` | `ok:true`、`healthy:true`、`summary:"ready"`、`compatibility.ok:true`；扩展版本用 `atb capabilities` 核对为 `5.3.0` |
 | `doctor` | 各检查项无报错；有可修复项时按输出建议处理 |
 | `tabs` | `ok:true`，`count` 大于 0 |
 | `open` | `ok:true`，`targets[0].ok:true` 且有 `tab_id` |
@@ -159,7 +159,7 @@ atb restart
 
 CLI ↔ daemon 协议为 `5`。换二进制后必须 `atb restart`，否则新 CLI 会拒绝连接旧 daemon，`status` 的 `compatibility` 会报不配套。`doctor --fix` 能定位占用 `18767` 的进程，`doctor --fix --force` 才会实际结束它。
 
-扩展：重新下载 `chrome-extensions.zip`，解压到同一目录并覆盖旧文件，回 `chrome://extensions` 点“重新加载”，再对比卡片版本与磁盘 `manifest.json` 的 `5.2.9`，不一致就再重载一次。
+扩展：重新下载 `chrome-extensions.zip`，解压到同一目录并覆盖旧文件，回 `chrome://extensions` 点“重新加载”，再对比卡片版本与磁盘 `manifest.json` 的 `5.3.0`，不一致就再重载一次。
 
 skill：
 
@@ -182,7 +182,7 @@ atb install-skill
 | 端口被占，`status` 连不上或 daemon 起不来 | `18765` 被其它进程占用，或旧 daemon 仍占 `18767` | `atb doctor --fix` 看 PID；`atb set-extension-port <port>` 换端口并在扩展 popup 填同一端口；旧 daemon 用 `atb restart --force` |
 | `status` 的 `compatibility.ok:false`，提示 daemon 协议不配套 | 升级 CLI 后旧 daemon 仍在跑（协议 4 对 5） | `atb stop` 后 `atb restart`；仍失败看 `atb logs --tail 50` |
 | `extension_not_connected` / `count` 为 0 | 没有 http/https 页面、扩展未重载、端口不一致 | 打开一个正常网页；重载扩展；核对 `18765`；daemon 刚重启时等 30-60 秒重连 |
-| WorkBuddy 里 skill 不生效或仍是旧内容 | `atb install-skill` 不写 `~/.workbuddy/skills` | 按第 3 节手动复制，重启 WorkBuddy 会话，检查 `SKILL.md` 中的扩展版本为 `5.2.9` |
+| WorkBuddy 里 skill 不生效或仍是旧内容 | `atb install-skill` 不写 `~/.workbuddy/skills` | 按第 3 节手动复制，重启 WorkBuddy 会话，检查 `SKILL.md` 中的扩展版本为 `5.3.0` |
 
 失败时先收集这些信息再改配置：`atb status --pretty`、`atb doctor`、`atb logs --tail 50`、扩展页错误详情全文、`chrome://version` 第一行。
 
@@ -191,7 +191,7 @@ atb install-skill
 不经过 AI 的最短路径：
 
 1. 安装 Node 18+ 和 Chrome 120+。
-2. 执行 `npm install -g @g1728578755/atb@latest`，确认 `atb --version` 为 `0.7.1` 或更新版本。
+2. 执行 `npm install -g @g1728578755/atb@latest`，确认 `atb --version` 为 `0.7.2` 或更新版本。
 3. 到 https://github.com/1728578755/atb-cli/releases/latest 下载 `chrome-extensions.zip`，解压到固定目录。
 4. 打开 `chrome://extensions`，开开发者模式，加载解压后的目录（该目录直接含 `manifest.json`），再打开任意一个网页。
 5. 执行 `atb install-skill --dry-run` 确认计划后执行 `atb install-skill`，最后用 `atb tabs`、`atb status`、`atb doctor` 验证（先 `tabs` 拉起 daemon）。
@@ -201,8 +201,8 @@ atb install-skill
 ## 安装清单
 
 - [ ] Node `>=18`、Chrome / Edge `>=120`
-- [ ] `atb --version` 输出 `0.7.1` 或更新版本
-- [ ] `chrome-extensions.zip` 已解压，解压目录下的 `manifest.json` 版本为 `5.2.9`，且与 `background.js` 同层
+- [ ] `atb --version` 输出 `0.7.2` 或更新版本
+- [ ] `chrome-extensions.zip` 已解压，解压目录下的 `manifest.json` 版本为 `5.3.0`，且与 `background.js` 同层
 - [ ] 扩展已加载，卡片版本与磁盘一致
 - [ ] 至少一个 http/https 页面处于打开状态
 - [ ] `atb tabs` 的 `count` 大于 0（同时拉起 daemon），`atb open` 返回 `tab_id`，`atb read` 返回非空标题或正文
@@ -235,6 +235,6 @@ rm -f ~/.codex/skills/atb ~/.claude/skills/atb ~/.config/agents/skills/atb ~/.cu
 rm -rf ~/.workbuddy/skills/atb
 ```
 
-回滚：在 `0.7.x` 内回退只需 `npm install -g @g1728578755/atb@<version>` 后 `atb restart`，同一 `5.2.x` 扩展通常可继续使用；若 `atb status` 报协议或扩展不配套，再换回该版本配套的扩展目录与 skill。跨到 `0.6.0` 之前的大版本回滚，必须同时换回该版本配套的扩展目录与 skill。
+回滚：在 `0.7.x` 内回退只需 `npm install -g @g1728578755/atb@<version>` 后 `atb restart`，同一 `5.3.x` 扩展通常可继续使用；若 `atb status` 报协议或扩展不配套，再换回该版本配套的扩展目录与 skill。跨到 `0.6.0` 之前的大版本回滚，必须同时换回该版本配套的扩展目录与 skill。
 
 相关文档：[README.md](README.md)、[CHANGELOG.md](CHANGELOG.md)、[skills/atb/SKILL.md](skills/atb/SKILL.md)、[SECURITY.md](SECURITY.md)、[docs/EDGE_TROUBLESHOOTING.md](docs/EDGE_TROUBLESHOOTING.md)、[docs/BEST_PRACTICES.md](docs/BEST_PRACTICES.md)。

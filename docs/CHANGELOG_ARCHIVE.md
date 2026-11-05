@@ -40,10 +40,6 @@
 
 ## [Unreleased] - 2026-11-03 / 11-04
 
-> 本节记录 2026-11-03 至 11-04 的修复与结构整理，CLI 版本保持 0.7.1。
-> 内容覆盖错误码细分、restart 自愈、架构拆分，以及 schema / capabilities /
-> doctor --fix / scrape 四个新命令；**扩展文件版本当时为 5.2.3**。
-
 ### Added
 
 - **`atb schema --json`**：输出全部命令的机器可读 schema（参数名/类型/默认值/可选值 +
@@ -89,7 +85,7 @@
   `set-extension-port` 现在只输出计划；计划统一包进 `result`，与真实执行同一套
   `jq .result` 解析；`--out` 占位符只在真多目标时校验。
 
-- **`atb restart` 自愈（实测反馈）**：daemon 在跑但 API token 不匹配时，旧实现只提示
+- **`atb restart` 自愈**：daemon 在跑但 API token 不匹配时，旧实现只提示
   「结束占用 18767 的进程后重试」然后退出，而 restart 本身就是干这件事的，形成自锁。
   现在默认输出结构化 `daemon_token_mismatch` 错误（退出码 2，附将执行的命令）；
   新增 `atb restart --force`：自动定位 LISTENING 在 18767 的 PID（Windows `netstat -ano` /
@@ -121,7 +117,7 @@
   error:「该页面禁止调试器注入（页面内嵌了其他扩展的 iframe 或站点 CSP/扩展隔离）」、
   hint:「改用 read / scan / snapshot（走无 eval 通道），或 mouse-click 直接坐标点击」，
   并保留 `raw_error`。
-- **快照与相关开关的存量修正**：
+- **快照与 CDP 细节修复**：
   - `collect_dom_details` 只在 `--details` 时执行；旧实现不带 `--details`
     也无条件发起最多 25 批 CDP 往返，结果写进从未被读取的缓存字段。
   - CDP 快照的可操作角色集并入 JS 快照的 `file`（并集策略，AX 树特有角色
@@ -131,10 +127,6 @@
   - `snapshot --js` 的 `next_offset` 加边界保护——页面回包未显式带
     `offset`/`has_more`/`next_offset`（旧版脚本）时不再给出 `next_offset`，
     避免调用方跟进后必然报「不支持 offset 分页」。
-  - `stalledMs` 已由 challenge 侧接通（核验通过）；`skipGeneric` 接通
-    daemon 侧（`SnapshotRequest.skip_generic` → 页面脚本），CLI flag 待 cmd 侧补充；
-    `confirmMs` / `credentials` / `parseJson` / `innerTextLimit` 所需改动在
-    challenge.rs / net.rs / read.rs，不在本次修改文件范围，维持现状。
 - **退出码兜底**：`job_evicted` 归入参数类错误白名单（退出码 2）；错误文本的中文
   子串兜底（「未连接」等）只在 JSON 没有结构化 `error_code` 时才生效，daemon 补上
   typed error_code 后退出码不再漂移。
@@ -181,7 +173,7 @@
 
 ## [扩展 5.2.x] - 2026-11-03
 
-> 本节记录 **Chrome 扩展文件**（`assets/atb_bridge/manifest.json`）的版本，当前为 **5.2.3**。
+> **Chrome 扩展文件**（`assets/atb_bridge/manifest.json`）的版本为 **5.2.3**。
 > CLI 版本（0.7.x）与扩展版本独立演进；扩展↔daemon 的消息协议未变（仍为 **4**）。
 
 ### Changed
@@ -191,7 +183,7 @@
   （alarms 只做长期兜底），调试器 attach 后 1.2s 内 detach。
 - **5.2.1 与 CLI 0.7.1 同步发布**：扩展侧的维护性修复（挑战探测、页面脚本与网络拦截相关），
   不新增/删除消息字段；`ops/page_*.js` 与 `assets/page_*.js` 继续保持逐字节一致。
-- **5.2.3（2026-11-04）**：扩展侧修复，协议仍为 **4**。
+- **5.2.3（跟随下一版 CLI）**：缺陷修复，协议仍为 **4**。
   - `background.js`：`detachAllDebugSessions` 不再对 `ws-close` / `keepalive-lost` 清空
     持久化拦截快照 —— 旧实现会在每次 daemon 重启时把 `net route --persist` 的规则永久抹掉，
     导致重启后拦截不自愈。
@@ -218,8 +210,8 @@
 
 ### 说明
 
-- 仓库内没有 5.1.x 的独立发布记录：版本从 5.0.3 直接到 5.2.0，5.2.1 为配套修复。
-- 本节只覆盖扩展文件；命令行为变化见下方 0.7.x 各节。扩展侧逐条改动以当次提交记录为准。
+- 仓库内没有 5.1.x 的独立发布记录：版本从 5.0.3 直接到 5.2.0，5.2.1 为同一批次的收尾。
+- 本节只覆盖扩展文件；命令行为变化见下方 0.7.x 各节。
 
 ## [Unreleased]
 
@@ -249,7 +241,7 @@
 
 ### Fixed
 
-- **挑战页不再被注入任何脚本（关键修复）**。识别逻辑原先走 `eval` 进了页面的
+- **挑战页不再被注入任何脚本（最关键的一条）**。识别逻辑原先走 `eval` 进了页面的
   MAIN world，脚本里的 `window.__abcChlSeenAt` 就成了站方可读的自动化指纹：
   点击照样被接收（页面会显示「正在验证您是否是真人」），但 Turnstile 永远不给 token。
   现在 `challenge` 的页面侧调用一律走扩展的 ISOLATED world，脚本里也不再写任何
@@ -379,8 +371,8 @@
 
 ## [Unreleased]
 
-> 主题：`assets/page_*.js` 的一批修复 —— 这批全是
-> 「跑起来不报错、行为和文档不一致」的静默失效，要么让命令假成功，要么让调用方拿到错的数据。
+> 主题：修复 `assets/page_*.js` 的静默失效 —— 跑起来不报错、行为和文档不一致，
+> 要么让命令假成功，要么让调用方拿到错的数据。
 
 ### Fixed
 
@@ -567,7 +559,7 @@
 
 ## [Unreleased]
 
-> 2026-11-01 修复：退出码契约统一、`--monitor` 输出结构化、若干长跑/持久化缺陷。下方条目为同一时期更早的累积记录。
+> 2026-11-01 修复批次：退出码契约统一、`--monitor` 输出结构化、若干长跑/持久化缺陷。下方「未发布」为同批次更早的累积条目，两者都尚未发版。
 
 ### Fixed
 
@@ -631,7 +623,7 @@
 - `trust-extension` 与 `ws-trust.json` 都是可选的，不配置不影响任何现有用法。
 - 改过 `assets/page_*.js` 后必须 `npm run sync:extension`，否则 `ops/` 里的副本与扩展不同源（`npm run check:extension` 可在提交前自查）。
 
-### 同日补充修复
+### 补充修复（同日）
 
 #### Fixed
 
@@ -655,7 +647,7 @@
 - **`ws-trust.json` 解析失败不再降级为「任意扩展可连」**：以前写坏一个尾逗号，整套白名单与 token 校验立刻失效，而 daemon 在后台看不见 stderr。现在配置损坏即拒绝所有握手（503），`/health` 的 `ws_security.trust_config_error` 给出具体解析错误——与「从没配过」可以区分了。
 - **信任变更即时生效**：`trust-extension` 之后调用 `/reload-trust`，此前已连上的不可信扩展会被真正踢掉，不用等它自己断开或重启 daemon。
 
-### 同日继续修复
+### 信任与工具链修复（同日）
 
 #### Fixed
 
@@ -667,18 +659,16 @@
 
 - **`cargo clippy` 从"只告警"变成"卡 CI"**：补上 `-- -D warnings`，并把仓库里遗留的 8 条告警清零（多余 cast、可折叠 `if`、`format!` 嵌套、`clamp` 写法、测试里的 `get().is_none()` 等）。同时全量跑了 `cargo fmt`——此前的 `cargo fmt --check` 步骤对每次推送都是红的。
 
-### 全量修复（2026-11-02，覆盖扩展与构建链）
-
-> 本次把修复范围从 `src/` 扩到 Chrome 扩展、`scripts/`、`npm/` 与 CI，共处理 62 项中的 55 项（余下见文末「已知未修」）。
+### 2026-11-02（首次覆盖扩展与构建链）
 
 #### Fixed（严重）
 
 - **扩展 service worker 被回收后页面请求永久挂死**：`debugSessions` 只在内存，SW 被杀即空；但 CDP 侧的请求已暂停。新 SW 被 `Fetch.requestPaused` 唤醒时找不到 session 就直接 `return`，**没有任何 continue/fulfill/fail**，页面一直转圈。现在：该分支按阶段强制放行；并把每标签的规则落 `chrome.storage.session`，冷启动时对已 attach 的标签重建会话并重新 `Fetch.enable`。`ext_ready` 新增 `restartSeq`，daemon 能识别扩展重启。
-- **`--frame` 在 CSP 回退路径上系统性丢失**（5 处）：`net`/`read`/`find`/`challenge`/`wait` 的回退调用全部硬编码 `frame_id=None`，CSP 页面上带 `--frame` 会**静默落到主框架**——读到错误框架的内容且无任何提示；`net route` 更会把规则装到主框架。这是早期同类问题的延续，当时只修了正常路径。
+- **`--frame` 在 CSP 回退路径上系统性丢失**（5 处）：`net`/`read`/`find`/`challenge`/`wait` 的回退调用全部硬编码 `frame_id=None`，CSP 页面上带 `--frame` 会**静默落到主框架**——读到错误框架的内容且无任何提示；`net route` 更会把规则装到主框架。
 - **`net` 字符串 rule 解析失败后校验被绕过**：解析得 `null` 仍写入 `opts["rule"]`，而校验用 `is_none()`——键存在即通过，于是错误归因成「需要 rule」（用户明明传了）。
 - **`net` 的 host 解析会把持久化注入注册到所有网站**：`https://x.com?q=1` 的 host 被切成 `x.com?q=1`（pattern 非法），且 `starts_with("chrom")` 误杀 `chromium.org`，最终兜底成 `<all_urls>`——与「收窄注入范围」的目标相反。现在按 scheme 判定，且 merged 为空时**不注册**并告警，不再兜底全站。
 - **持久化注入名未按 profile 隔离**：扩展侧 `persistInjections` 的键就是 name（全局），profile B 的 `net hook --persist` 会覆盖 A 的条目，A 的 `net reset` 又删掉共享条目 → daemon 配置、磁盘、扩展三方失同步。注入名改为带 profile 摘要，并 best-effort 清理旧名 `__net_hook`。
-- **`ws-trust.json` 写入非原子**：Windows 分支是先删后改名，中途失败/断电则文件消失 → daemon 把 `NotFound` 判为「从没配过」→ **回到任意扩展可连**（此前修的是「解析失败」，这是同一 fail-open 的另一个入口）。现在复用 `config::replace_file_atomically`（backup → rename → 失败回滚），读取侧也走 `read_with_backup`。
+- **`ws-trust.json` 写入非原子**：Windows 分支是先删后改名，中途失败/断电则文件消失 → daemon 把 `NotFound` 判为「从没配过」→ **回到任意扩展可连**（这是与「解析失败」同一 fail-open 的另一个入口）。现在复用 `config::replace_file_atomically`（backup → rename → 失败回滚），读取侧也走 `read_with_backup`。
 - **popup 一打开就把当前页全部 cookie 静默写进系统剪贴板**（含 httpOnly 会话 cookie）。改为显式「复制 cookies」按钮，默认排除 httpOnly/secure，复制后给出提示。
 
 #### Fixed（假成功族）
@@ -737,11 +727,11 @@
 
 #### 已知未修
 
-- 扩展 `alarms` 最小 30s 与 SW 30s 回收的根本矛盾：正解是用 offscreen document 持有 WebSocket，改动面大，本批未做（已记录为下一步）。
-- `job wait` / `wait` 的内层 `ok` 是否统一（同类问题）：会改变「匹配超时算不算失败」的语义，需产品决策。
-- `ext_ready` 无条件信任扩展上报的 browser/profile（兼容模式下任意扩展可冒充）：与扩展身份校验问题同源，待双向握手方案落地后一并解决。
+- 扩展 `alarms` 最小 30s 与 SW 30s 回收的根本矛盾：正解是用 offscreen document 持有 WebSocket，改动面大，当前未实现。
+- `job wait` / `wait` 的内层 `ok` 是否统一：会改变「匹配超时算不算失败」的语义，需产品决策。
+- `ext_ready` 无条件信任扩展上报的 browser/profile（兼容模式下任意扩展可冒充）：待双向握手方案落地后一并解决。
 
-## 未标版本的历史记录
+## 未发布
 
 ### 新增
 

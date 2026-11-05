@@ -15,7 +15,7 @@
 
 | 命令 | 关键参数 | 返回要点 |
 | --- | --- | --- |
-| `tabs` | `--ids` / `--fields tab_id,title,url` / `--limit N` / `--mine` / `--full` | 标签清单，含 browser_id / profile_id / tab_id |
+| `tabs` | `--ids` / `--fields tab_id,title,url` / `--limit N` / `--mine` / `--full` | 标签清单，含 browser_id / profile_id / tab_id；`--limit 0` = 不截断，`tabs_count` 始终是原始总数，另给 `returned_count` |
 | `tabtree` | `--full` | 按 browser → profile → 标签页树形展示归属 |
 | `lookup tab` / `lookup browser` / `lookup profile` | 位置参数为 id 或名称 | 反查归属，确认打的是哪个浏览器、哪个 Profile |
 | `browsers` | 无 | 已连接的浏览器实例列表 |
@@ -42,10 +42,10 @@ atb click --tab all '#load-more' --dry-run
 
 | 命令 | 关键参数 | 返回要点 |
 | --- | --- | --- |
-| `read` | `--selector` / `--max-chars`（默认 20000） / `--links` / `--no-forms` / `--include-hidden` / `--frame` | 标题、正文、表单结构、计数 |
+| `read` | `--selector` / `--max-chars`（默认 20000） / `--links` / `--no-forms` / `--include-hidden` / `--frame` | 标题、正文、表单结构、计数；open shadow DOM 结果带 `scope:"shadow"` |
 | `scan` | `--text-only` / `--tabs-only` / `--fast` / `--max-nodes` | 内容感知结果；`--fast` 走紧凑抽取 |
-| `snapshot` | `--interactive-only` / `--limit`（默认 200） / `--offset` / `--details` / `--js` / `--max-nodes` | 带 `@eN` 引用的可操作树 |
-| `find` | `<selector>` / `--text` / `--xpath` / `--limit`（默认 50） / `--exact` / `--include-hidden` / `--frame` | 命中的元素、位置与可用于后续动作的 selector |
+| `snapshot` | `--interactive-only` / `--limit`（默认 200） / `--offset` / `--details` / `--js` / `--max-nodes` | 带 `@eN` 引用的可操作树；JS 快照透传 `scope` / `frame_count` / `shadow_*` / `coverage_complete` / `coverage_hint` |
+| `find` | `<selector>` / `--text` / `--xpath` / `--limit`（默认 50） / `--exact` / `--include-hidden` / `--frame` | 命中的元素、位置与可用于后续动作的 selector；shadow 内路径写作 `宿主 >>> 相对路径` |
 | `frames` | 无 | 页面内 iframe 列表与 frame_id |
 | `cookies` | `--url` / `--clear` / `--domain` | Cookie 列表（含 httpOnly），仅本地返回 |
 
@@ -85,7 +85,7 @@ atb click --tab all '#load-more' --dry-run
 | `exec <script>` | `--file` / `--world main\|isolated` / `--frame` / `--all-frames` / `--wait-js` / `--max-bytes` | `js_return`；超长会截断预览 |
 | `run <steps.json>` | `--continue-on-error` | 串行执行多步，遇错即停 |
 | `batch <steps.json>` | `--concurrency`（默认 4，1-32） | 并发执行多步，步骤需显式给 `switch_tab_id` |
-| `scrape` | `--urls` / `--out` / `--js-file` / `--concurrency`（4） / `--batch`（4） / `--retry`（3） / `--timeout`（30） / `--group-title` | JSONL：每行 `{url, tab_id, ok, data, error, elapsed_ms}` |
+| `scrape` | `--urls` / `--out` / `--js-file` / `--concurrency`（4，1..=32） / `--batch`（4，1..=32） / `--retry`（3） / `--timeout`（30） / `--group-title` / `--record-attempts` | JSONL：每行 `{url, tab_id, ok, data, error, elapsed_ms, attempts, outcome_unknown}`；越界退出 2，`outcome_unknown` 不重试且最终退出 4 |
 | `job list` | `--limit`（默认 20） | 最近的后台任务 |
 | `job get <jobId>` | 无 | 任务状态与结果 |
 | `job wait <jobId>` | `--timeout`（默认 300） / `--interval` | 阻塞到结束；超时不丢任务 |
@@ -128,8 +128,8 @@ atb click --tab all '#load-more' --dry-run
 | `console list` | `--level` / `--limit`（默认 100） | console 条目 |
 | `console clear` / `console stop` | 无 | 清空 / 结束 |
 | `downloads` | `--state in_progress\|complete\|interrupted` / `--id` / `--limit` | 下载列表 |
-| `download <url>` | `--filename` / `--dir` | 发起下载；`--dir` 是 Chrome 默认下载目录下的子目录 |
-| `download-wait` | `--id` / `--timeout`（默认 120） / `--interval` | 省略 `--id` 时等最近一条 |
+| `download <url>` | `--filename` / `--dir` | 发起下载；`--filename` 会被净化（basename、拒绝 `..`/保留名/分隔符），回包 `filename_sanitized`；`--dir` 是 Chrome 默认下载目录下的子目录，含 `..` 会被拒 |
+| `download-wait` | `--id` / `--timeout`（默认 120） / `--interval` | 省略 `--id` 时自动认领本 agent 最近一条；`ATB_DOWNLOAD_AUTO_CLAIM=false` 时必须显式给 `--id`（否则 `download_id_required`） |
 
 `net mock --engine cdp` 走扩展侧 Fetch 域，能改写 `responseType=blob` 的二进制响应，也能拦 `img` / `script` 这类静态请求；代价是会 attach 调试器。
 
@@ -166,7 +166,7 @@ atb net reset
 | 命令 | 关键参数 | 返回要点 |
 | --- | --- | --- |
 | `browsers` | 无 | 浏览器实例、Profile、连接状态 |
-| `broadcast <op>` | `--script` / `--file` / `--args '{"max_chars":2000}'` / `--browser` / `--profile` / `--concurrency` / `--timeout` | 对所有或指定 browser/profile 并发执行同一操作 |
+| `broadcast <op>` | `--script` / `--file` / `--args '{"max_chars":2000}'` / `--browser` / `--profile` / `--concurrency` / `--timeout` | 对所有或指定 browser/profile 并发执行同一操作；`--args` 里的输出路径按当前工作目录绝对化，`--dry-run` 在本地出计划（不拉 daemon） |
 | `lookup tab` | `<tabId>` | 该标签属于哪个浏览器 / Profile |
 | `profile-label set <label>` | `--profile` / `--browser` / `--tab` | 给 Profile 起可读别名，之后可用 `--profile <label>` |
 | `profile-label clear` | `--profile` / `--browser` / `--tab` | 清除别名 |
@@ -178,10 +178,10 @@ atb net reset
 | 命令 | 关键参数 | 返回要点 |
 | --- | --- | --- |
 | `status` | 无 | daemon、扩展连接、可用标签页、`compatibility`；`ok` 跟随 `healthy` |
-| `doctor` | `--fix` / `--force` | 安装位置、端口、扩展逐项诊断；`--fix` 尝试自动修复 |
-| `capabilities` | 无 | daemon/扩展版本与能力门禁 |
+| `doctor` | `--fix` / `--force` | 安装位置、端口、扩展逐项诊断；`--fix` 尝试自动修复（旧 daemon 占端口、token 失配、扩展过旧），`--force` 才结束进程 |
+| `capabilities` | 无 | daemon/扩展版本与能力门禁（`core` / `open_session` / `group` / `window` / `current` / `challenge`）及阈值 |
 | `schema --json` | 无（缺省就是 JSON） | 顶层命令的参数、类型、默认值、error_code；子命令用 `--help` |
-| `logs` | `--tail N`（默认 100） | 纯文本日志，不支持 `--follow` |
+| `logs` | `--tail N`（默认 100） | JSON：`{ok, lines[], path, truncated}`；按行消费读 `.lines[]`，不支持 `--follow` |
 | `stop` | 无 | 停止 daemon |
 | `restart` | `--force` | 重启 daemon；`--force` 强杀占用 18767 的进程 |
 | `daemon` | 无 | 前台运行 daemon，日志打到 stdout（调试用，平时自动拉起） |
@@ -219,6 +219,31 @@ attach（CDP / `chrome.debugger`）：
 判断依据看 `via` / `synthetic` 字段，不要只看 `ok:true`：合成事件不被部分站点信任，图片型 PDF 的文字不可检索。需要真实输入或可检索 PDF 时，让用户临时禁用注入 iframe 的扩展（错误文案会给出扩展名）。
 
 `broadcast`、`run`、`batch`、`scrape` 的 attach 取决于它们执行的具体操作。`ATB_NO_DEBUGGER=1` 会禁止 attach；依赖 CDP 的命令返回替代方案或失败。
+
+## 环境变量逃生口
+
+部分新增行为以 `ATB_*` 环境变量暴露，命令行没有同名 flag（`atb schema` 的 description 里会注明）：
+
+| 变量 | 默认 | 影响 |
+| --- | --- | --- |
+| `ATB_RESULT_STRICT` | `warn` | 组合命令严格度：`off` / `warn` / `strict` |
+| `ATB_REQUIRE_TAB` | 关 | 写类命令缺 `--tab` 时直接退出 2，不落到默认标签 |
+| `ATB_IO_OVERWRITE` | `backup` | `--out` 已存在时：`backup`（留 `.bak`）/ `force` / `ask`（退出 2）/ `append` |
+| `ATB_IO_SANITIZE_FILENAME` | `strict` | 下载名净化；`compat` 只告警不改名 |
+| `ATB_IO_MAX_OUTPUT_MB` | 50 | 单文件/缓冲字节上限，超限 `capture_too_large` |
+| `ATB_CAPTURE_MAX_PIXELS` | 8000 万 | 拼接截图/图片 PDF 的像素总量上限 |
+| `ATB_ALLOW_RELATIVE_OUT` | 关 | `broadcast` 的 `out` 保留旧的相对路径行为 |
+| `ATB_FORCE_ASSUME_ATB` | `strict` | `restart --force` / `doctor --fix` 的身份判据；`loose` 放宽 |
+| `ATB_MULTI_SCOPE` | `agent` | `--tab all` 的默认归属范围；`all` 才跨 agent |
+| `ATB_SESSION_ISOLATION` | `legacy` | `strict` 时具名 agent 无默认目标直接 `target_lost` |
+| `ATB_DOWNLOAD_AUTO_CLAIM` | `true` | `download-wait` 无 `--id` 时是否自动认领 |
+| `ATB_DOWNLOAD_CLAIM_TTL_SEC` | 600 | 自动认领窗口 |
+| `ATB_DOWNLOAD_CANCEL_ON_TIMEOUT` | 关 | 超时是否取消下载 |
+| `ATB_DOWNLOAD_CANCEL_ERASE` | 关 | 取消后是否擦除下载记录 |
+| `ATB_WS_TRUST_MODE` | `compat` | WS 信任档位：`compat` / `whitelist` / `token` / `both` |
+| `ATB_HTML_KEEP_SCRIPTS` | 关 | `scan`/`read` 的 HTML 优化保留 `<script>`（调试用） |
+| `ATB_CHALLENGE_FOCUS_ON_NEED_HUMAN` | `true` | `challenge` 需要人工时是否自动切前台 |
+| `ATB_EXTENSION_ID` | 自动探测 | 覆盖扩展 ID（多份扩展共存时用于识别自身 iframe） |
 
 ## 完整清单
 

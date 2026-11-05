@@ -125,16 +125,35 @@ pub(crate) fn sort_tabs_canonical(tabs: &mut [TabInfo]) {
     });
 }
 
+/// 目标解析结果：解析出的目标 + 被范围过滤掉的「跨 agent」目标数。
+pub(crate) struct ResolvedTargets {
+    pub(crate) targets: Vec<ResolvedTarget>,
+    /// 因为属于**其它智能体**而被跳过的目标数；`scope:"all"` 时恒为 0。
+    pub(crate) skipped_foreign: usize,
+}
+
+/// 这个标签是否属于当前 agent 打开的范围（`owned` 为 `None` 表示不限制）。
+fn owned_by_agent(owned: &Option<HashSet<String>>, tab: &TabInfo) -> bool {
+    owned
+        .as_ref()
+        .map(|keys| keys.contains(&tab.session_key))
+        .unwrap_or(true)
+}
+
 /// 把 `--tab` 规格解析成具体的会话列表。
 ///
 /// 这里是所有多目标命令的唯一入口：解析失败会给出候选标签页，
 /// 成功则在执行任何页面操作之前就把目标固定下来（不会出现「执行了一半才发现目标不存在」）。
+///
+/// `agent_scope`：`All` / `Ids` 是否按 `current_agent` 的 `agent_opened` 过滤。
+/// 默认 `true`（`/multi` 不给 scope 时由 `ATB_MULTI_SCOPE` 决定，默认 `agent`）。
 pub(crate) async fn resolve_targets(
     state: &AppState,
     spec: &TargetSpec,
     browser: Option<&str>,
     profile: Option<&str>,
-) -> std::result::Result<Vec<ResolvedTarget>, TargetResolveError> {
+    agent_scope: bool,
+) -> std::result::Result<ResolvedTargets, TargetResolveError> {
     wait_for_sessions(state, WAIT_SESSIONS_ACTION).await;
     let mut tabs = active_tabs_filtered(state, false, browser, profile)
         .await
@@ -181,6 +200,22 @@ pub(crate) async fn resolve_targets(
     }
 
     let mut resolved: Vec<ResolvedTarget> = Vec::new();
+    // 默认范围是「本 agent 通过 open 登记过的标签」。旧实现不做归属过滤，
+    // `--tab all` 会把别人的标签一起操作（多智能体/多用户共用同一浏览器时串线）。
+    let owned: Option<HashSet<String>> = if agent_scope {
+        let opened = state.agent_opened.lock().await;
+        Some(
+            opened
+                .get(&current_agent())
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+        )
+    } else {
+        None
+    };
+    let mut skipped_foreign = 0usize;
     match spec {
         TargetSpec::Default => {
             // 真实执行路径（`select_tab`）优先用「本智能体的默认目标」，dry-run 也必须
@@ -207,11 +242,13 @@ pub(crate) async fn resolve_targets(
             }
         }
         TargetSpec::All => {
-            resolved = tabs
-                .iter()
-                .enumerate()
-                .map(|(index, tab)| resolved_from_tab(index, tab))
-                .collect();
+            for tab in tabs.iter() {
+                if !owned_by_agent(&owned, tab) {
+                    skipped_foreign += 1;
+                    continue;
+                }
+                resolved.push(resolved_from_tab(resolved.len(), tab));
+            }
         }
         TargetSpec::Current => {
             if let Some(tab) = tabs.iter().find(|tab| tab.active) {
@@ -229,10 +266,24 @@ pub(crate) async fn resolve_targets(
             let mut missing: Vec<String> = Vec::new();
             let mut ambiguous: Vec<String> = Vec::new();
             for id in ids {
-                let matches: Vec<&TabInfo> = tabs
+                let all_matches: Vec<&TabInfo> = tabs
                     .iter()
                     .filter(|tab| tab.tab_id == *id || tab.session_key == *id)
                     .collect();
+                // 先按归属过滤，再判 0/1/多。这样「同一个 tab_id 在别的
+                // profile 里也有一份」不会被误报成歧义——不属于本 agent 的那份
+                // 本来就不该被看见。
+                let matches: Vec<&TabInfo> = all_matches
+                    .iter()
+                    .copied()
+                    .filter(|tab| owned_by_agent(&owned, tab))
+                    .collect();
+                if matches.is_empty() && !all_matches.is_empty() {
+                    // 显式点名的标签存在，但属于别的智能体：计数后跳过，
+                    // 不当作「id 写错」（那会把跨 agent 访问说成参数错误）。
+                    skipped_foreign += 1;
+                    continue;
+                }
                 match matches.len() {
                     0 => missing.push(id.clone()),
                     // 同一个 tab_id 可能同时属于多个 profile；单目标端点会报歧义，
@@ -418,6 +469,18 @@ pub(crate) async fn resolve_targets(
     }
 
     if resolved.is_empty() {
+        if skipped_foreign > 0 {
+            // 全部目标都被归属过滤掉了——这是「范围」问题，不是「没有标签」，
+            // 直接说清楚并给出逃生口，否则调用方只会反复重试或以为浏览器空了。
+            return Err(TargetResolveError::new(
+                "target_scope_empty",
+                format!(
+                    "目标都属于其它智能体（按 agent 范围过滤掉 {skipped_foreign} 个），当前没有可操作目标"
+                ),
+                "确认要跨智能体操作时显式传 scope:\"all\"（或设 ATB_MULTI_SCOPE=all）；否则先用 atb open 打开自己的标签",
+            )
+            .with_candidates(candidates()));
+        }
         return Err(TargetResolveError::new(
             // 旧码 no_targets 病因不明；统一为 no_target_tabs（桥/会话没问题，
             // 只是过滤或解析后没有目标），与 select_tab 路径共用同一语义。
@@ -435,7 +498,10 @@ pub(crate) async fn resolve_targets(
     for (index, target) in resolved.iter_mut().enumerate() {
         target.index = index;
     }
-    Ok(resolved)
+    Ok(ResolvedTargets {
+        targets: resolved,
+        skipped_foreign,
+    })
 }
 
 /// 这批选择器分别依赖扩展上报哪些字段。返回 (人读特性名, 最低协议版本)。

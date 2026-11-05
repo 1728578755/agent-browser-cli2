@@ -113,7 +113,7 @@ pub(crate) async fn cdp_call(
             })
         }
         None => {
-            // C1-05：缺 `ok` 的回包以前一律当成功。对象载荷（旧扩展就是这样回包的）
+            // 缺 `ok` 的回包以前一律当成功。对象载荷（旧扩展就是这样回包的）
             // 照旧兼容；标量 / 数组 / null 说明这条回包根本没法判成败
             // （典型：只剩一句 "response missing" 文本），把它当 data 继续解析
             // 只会退化成难以归因的空结果 —— 这里直接报 invalid_response。
@@ -188,7 +188,7 @@ pub(crate) async fn batch_cdp_call(
             .unwrap_or("batch cdp failed")
             .to_string())));
     }
-    // C1-05：缺 `ok` 的 batch 回包同样不能默认成功（只有 `Some(false)` 才判失败的
+    // 缺 `ok` 的 batch 回包同样不能默认成功（只有 `Some(false)` 才判失败的
     // 写法会把标量垃圾载荷当成成功）。对象载荷（带 results）兼容旧扩展，
     // 非对象一律报 invalid_response 并带截断原文。
     if ok_flag != Some(true) && !value.is_object() {
@@ -462,6 +462,18 @@ pub(crate) fn write_back_relocated_selector(
     expected_url: &str,
     selector: &str,
 ) -> bool {
+    // 快照缓存里的 url 是「拍快照那一刻」的值，重定位是一次跨进程往返，
+    // 期间页面完全可能已经导航。只比缓存自身的字段等于「自己跟自己比」，
+    // 挡不住写回过期 selector。这里先读实时 URL（clone 出来，避免和下面的可变借用冲突）。
+    let live_url = driver
+        .sessions
+        .get(session_key)
+        .map(|session| session.info.url.clone());
+    if let Some(live_url) = live_url {
+        if !live_url.is_empty() && !expected_url.is_empty() && live_url != expected_url {
+            return false;
+        }
+    }
     let Some(cache) = driver.snapshots.get_mut(session_key) else {
         return false;
     };
@@ -784,7 +796,7 @@ pub(crate) async fn dom_fill(
         return {{ success: true, tag: el.tagName, mode: 'value', value_length: __value.length }};
       }}
       // role=textbox / role=searchbox 的自定义组件（div + 自管 caret）：只能靠 insertText。
-      // 旧实现无论成功与否都 return success:true，内容没写进去调用方也无从得知（C1-03）。
+      // 旧实现无论成功与否都 return success:true，内容没写进去调用方也无从得知。
       let inserted = false;
       let insert_error = null;
       try {{ inserted = document.execCommand('insertText', false, __value); }}
@@ -815,7 +827,7 @@ pub(crate) async fn dom_fill(
     let value = call_function_resolved(state, tab_id, object_id, &script, timeout).await?;
     if let Some(error) = value.get("error").and_then(Value::as_str) {
         // 读回不一致时把长度差一起带出来：「写失败」和「只写进去一半」是两种
-        // 完全不同的排障方向，只回一个 error 码看不出区别（C1-03）。
+        // 完全不同的排障方向，只回一个 error 码看不出区别。
         let lengths = (
             value.get("expected_length").and_then(Value::as_u64),
             value.get("actual_length").and_then(Value::as_u64),
@@ -894,7 +906,7 @@ async fn dom_mouse_click_cdp(
         )
         .await?
     } else {
-        // C1-09（残留）：旧实现是 focus_scroll（一次 WS 往返 + 一次页面执行）
+        //  （C-05 残留）：旧实现是 focus_scroll（一次 WS 往返 + 一次页面执行）
         // 再 DOM.getBoxModel（第二次往返）。两次之间页面可能重排（惰性图片撑开、
         // 吸顶条出现），量到的坐标与滚动落定后的真实位置对不上，真实鼠标就点到
         // 旁边去了。这里把 scrollIntoView + getBoundingClientRect 合并成**单个**
@@ -977,7 +989,7 @@ async fn dom_mouse_click_cdp(
             None,
         )
     };
-    // C1-09 之后的往返结构（三条路径一致）：
+    // 之后的往返结构（三条路径一致）：
     //   第 1 批 = 定位 + scrollIntoView + 量 rect（一条 batch，页面侧一次执行完成）
     //   第 2 批 = Input.dispatchMouseEvent × 3（移动 / 按下 / 抬起）
     // 为什么不是一次往返：扩展的 batch 协议只支持把上一步的 objectId / nodeId
@@ -989,7 +1001,12 @@ async fn dom_mouse_click_cdp(
     // 真遇到该场景应在扩展批协议里加「等滚动稳定」的原语，而不是再拆往返。
     // 三次事件合并成一条 batch：原来每次一个 WS 往返（还各带一次 alarm 抖动）。
     // 同时补 pointerType，避免部分站点依赖 pointer 事件判定真实用户操作。
+    // 两批之间可能被别的标签抢走前台（用户切换、扩展自身切页、站点
+    // window.focus()），第二批必须再抢一次前台 —— 否则 Input.* 会打到后台标签，
+    // 扩展侧标成 skipped 而命令仍可能被当成成功。该批只判成败、不按 index 取值，
+    // 在最前面插入 bringToFront 不影响后续逻辑。
     let commands = vec![
+        json!({ "cmd": "cdp", "method": "Page.bringToFront", "allowFocus": true }),
         json!({ "cmd": "cdp", "method": "Input.dispatchMouseEvent", "params": { "type": "mouseMoved", "x": x, "y": y, "button": "none", "buttons": 0, "pointerType": "mouse" } }),
         json!({ "cmd": "cdp", "method": "Input.dispatchMouseEvent", "params": { "type": "mousePressed", "x": x, "y": y, "button": "left", "buttons": 1, "clickCount": 1, "pointerType": "mouse" } }),
         json!({ "cmd": "cdp", "method": "Input.dispatchMouseEvent", "params": { "type": "mouseReleased", "x": x, "y": y, "button": "left", "buttons": 0, "clickCount": 1, "pointerType": "mouse" } }),
@@ -1076,7 +1093,7 @@ pub(crate) async fn focus_object(
     timeout: Duration,
 ) -> Result<()> {
     // 老脚本恒 `return true`，返回值被直接丢弃：对不可聚焦元素 `focus()` 是 no-op，
-    // 调用方却以为焦点已经进去了，随后 `dispatch_keys` 把按键打进 body。
+    // 调用方却以为焦点已经进去了，随后 `dispatch_keys` 把按键打进 body（C-01）。
     // 这里把落点算出来带回去，由调用方决定失败。
     // `getRootNode()` 兼顾 shadow DOM：document.activeElement 在那种情况下是宿主元素。
     let script = "function() { \
@@ -1144,7 +1161,7 @@ pub(crate) async fn dispatch_keys(
     }
     // 先**整体**解析、再逐个发送。`parse_key_segment` 是纯函数，没有副作用：
     // 旧实现边发边解析，靠后的键名写错时前几个键已经打出去了，既不能回滚、
-    // 错误里也不说「已经发了几段」，调用方重试就变成双打。
+    // 错误里也不说「已经发了几段」，调用方重试就变成双打（C-03）。
     let parsed: Vec<KeySegment> = segments
         .iter()
         .map(|segment| parse_key_segment(segment, platform))
@@ -1299,7 +1316,7 @@ pub(crate) async fn dispatch_key_segment(
         key,
     } = segment;
     // 修饰键的 keyUp 必须无条件执行：CDP 的按键状态是浏览器级的，漏抬一次
-    // Ctrl/Shift/Meta，此后该标签的所有操作都等同按住修饰键。
+    // Ctrl/Shift/Meta，此后该标签的所有操作都等同按住修饰键（C-03）。
     // 所以「按下」逐条记录，「抬起」统一收尾，中间任何一步失败都不跳过释放。
     let mut active_bits = 0;
     let mut pressed: Vec<KeySpec> = Vec::with_capacity(modifiers.len());
@@ -1443,7 +1460,7 @@ pub(crate) fn truncate_text(value: &str, max: usize) -> String {
     }
 }
 
-/// CDP 快照（AX 树）侧的「可操作角色」判定集。
+/// CDP 快照（AX 树）侧的「可操作角色」判定集（C-04）。
 ///
 /// 与 JS 快照（`assets/page_snapshot.js` 的 `OPERABLE` 集合）必须对齐，否则同一
 /// 页面两种模式下 `@e` 集合与编号不同。这里取**并集**：JS 侧的 `file` 已并入，
@@ -1472,7 +1489,7 @@ pub(crate) fn is_operable_role(role: &str) -> bool {
             | "switch"
             | "tab"
             | "treeitem"
-            // JS 快照 OPERABLE 里有 file（`<input type=file>`），CDP 侧补齐，
+            // C-04：JS 快照 OPERABLE 里有 file（`<input type=file>`），CDP 侧补齐，
             // 保证同一文件上传控件在两种模式下都能拿到 @e 引用。
             | "file"
     )

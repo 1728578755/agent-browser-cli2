@@ -26,19 +26,14 @@ fn configured_extension_port() -> (u16, Option<String>) {
 /// 杀进程。放宽到 3s：既覆盖排队，又不至于让 status 自己变成慢命令。
 const HEALTH_PROBE_TIMEOUT: f64 = 3.0;
 
-/// 探测失败是否属于「客户端超时」而不是「给了 HTTP 响应但被拒」。
+/// 探测失败的分类**只看结构化证据**。
 ///
-/// reqwest 的超时链路最终是 io::ErrorKind::TimedOut，Display 里带 "timed out"；
-/// 中文分支兜住我们自己拼的文案。
-fn health_error_is_timeout(err: &anyhow::Error) -> bool {
-    let text = err.to_string().to_lowercase();
-    text.contains("timed out") || text.contains("timeout") || text.contains("超时")
-}
-
-/// 探测失败是否属于 token 不匹配（daemon 活着，但拒绝当前 token → HTTP 401/403）。
-fn health_error_is_token_mismatch(err: &anyhow::Error) -> bool {
-    let text = err.to_string();
-    text.contains("token") || text.contains("Token")
+/// 以前用「中英文子串」判 timeout/token，而且 timeout 判定写在 token 前面：daemon
+/// 回 401 时错误文本里若恰好带 "timeout"（例如上游代理）就会被误判成「daemon 忙」。
+/// 现在 `request()` 的失败带 [`HttpFailure`]（稳定 code + status），reqwest 自身的
+/// `is_timeout()` 也已映射成 `health_timeout`，这里直接读码。
+fn health_failure_code(err: &anyhow::Error) -> Option<&'static str> {
+    http_failure_code(err)
 }
 
 /// 「端口在监听但 /health 拿不到」的统一输出骨架。
@@ -55,6 +50,8 @@ fn unhealthy_value(
     let mut value = json!({
         "ok": false,
         "healthy": false,
+        // ok:false 必须带稳定 error_code，调用方才能直接分支，不用解析中文。
+        "error_code": summary,
         "summary": summary,
         "message": message,
         "hint": hint,
@@ -87,38 +84,37 @@ pub(crate) fn status_value() -> Result<Value> {
         Ok(value) => enrich_status(value),
         Err(err) if is_server_alive() => {
             // 端口在监听却拿不到 /health：三种成因的下一步完全不同，不能一律归因 token
-            // （token 归因对「401/403」成立，对「没答完」是误诊）。
-            if health_error_is_timeout(&err) {
-                unhealthy_value(
+            // （的 token 归因对「401/403」成立，对「没答完」是误诊）。
+            match health_failure_code(&err) {
+                Some("health_timeout") => unhealthy_value(
                     "health_timeout",
                     format!(
-                        "18767 端口在监听，但 /health 在 {HEALTH_PROBE_TIMEOUT}s 内没有返回：{err}"
+                        "{PORT} 端口在监听，但 /health 在 {HEALTH_PROBE_TIMEOUT}s 内没有返回：{err}"
                     ),
                     "daemon 可能正忙（大页面快照 / 长管道 / 批量抓取）或已卡住：稍后重试 atb status；持续如此用 atb doctor 看逐项诊断与日志，必要时 atb restart",
                     Some(err.to_string()),
                     configured,
                     configured_error,
-                )
-            } else if health_error_is_token_mismatch(&err) {
-                // TCP 通但 HTTP 401/403：最常见的成因是残留的旧 daemon 用了另一份 token。
-                unhealthy_value(
-                    "daemon_token_mismatch",
-                    "18767 端口上有一个 daemon 在监听，但 API token 不匹配（通常是残留的旧实例）"
-                        .to_string(),
-                    "先结束占用 18767 的进程（Windows: netstat -ano | findstr 18767 后 taskkill /PID <pid> /F；macOS/Linux: lsof -i:18767），再重试——新 daemon 启动时会刷新 token",
-                    Some(err.to_string()),
-                    configured,
-                    configured_error,
-                )
-            } else {
-                unhealthy_value(
+                ),
+                Some("invalid_api_token") => {
+                    // TCP 通但 HTTP 401/403：最常见的成因是残留的旧 daemon 用了另一份 token。
+                    unhealthy_value(
+                        "daemon_token_mismatch",
+                        format!("{PORT} 端口上有一个 daemon 在监听，但 API token 不匹配（通常是残留的旧实例）"),
+                        &format!("先结束占用 {PORT} 的进程（Windows: netstat -ano | findstr {PORT} 后 taskkill /PID <pid> /F；macOS/Linux: lsof -i:{PORT}），再重试——新 daemon 启动时会刷新 token"),
+                        Some(err.to_string()),
+                        configured,
+                        configured_error,
+                    )
+                }
+                _ => unhealthy_value(
                     "health_failed",
-                    format!("18767 端口在监听，但 /health 请求失败：{err}"),
+                    format!("{PORT} 端口在监听，但 /health 请求失败：{err}"),
                     "先运行 atb doctor 看逐项诊断（它不会自动启动 daemon）；若怀疑是残留旧 daemon，用 atb restart --force",
                     Some(err.to_string()),
                     configured,
                     configured_error,
-                )
+                ),
             }
         }
         Err(_) => unhealthy_value(
@@ -173,9 +169,10 @@ pub(crate) fn enrich_status(mut value: Value) -> Value {
         (
             false,
             "daemon_not_running",
-            "daemon 未运行；执行 tabs/open/exec/scan 会自动启动，或运行 atb restart 手动启动。\
-             若 18767 已被别的进程/残留 daemon 占用，先结束它再启动"
-                .to_string(),
+            format!(
+                "daemon 未运行；执行 tabs/open/exec/scan 会自动启动，或运行 atb restart 手动启动。\
+                 若 {PORT} 已被别的进程/残留 daemon 占用，先结束它再启动"
+            ),
         )
     } else if let Some(err) = bind_error {
         (
@@ -220,6 +217,11 @@ pub(crate) fn enrich_status(mut value: Value) -> Value {
     value["ok"] = json!(healthy);
     value["healthy"] = json!(healthy);
     value["summary"] = json!(summary);
+    // 失败时 `summary` 本身就是稳定分类（daemon_not_running /
+    // extension_not_connected / port_mismatch…），直接复用为 error_code。
+    if !healthy {
+        value["error_code"] = json!(summary);
+    }
     value["message"] = json!(message);
     value["compatibility"] = compatibility;
     if !compat_ok {
@@ -258,28 +260,42 @@ pub(crate) fn print_logs(tail: usize) -> Result<()> {
             path.display()
         ));
     }
+    // `logs` 以前把裸文本逐行写 stdout，与「所有命令输出结构化 JSON」的
+    // 契约冲突：Agent 的 JSON 解析器会直接报错。现在统一成
+    // `{"ok":true,"lines":[...],"path":...,"truncated":bool}`。
     if tail == 0 {
+        print_json(json!({
+            "ok": true,
+            "path": path.display().to_string(),
+            "lines": Vec::<String>::new(),
+            "truncated": false,
+        }));
         return Ok(());
     }
-    let lines =
+    let (lines, truncated) =
         tail_lines(&path, tail).with_context(|| format!("读取日志文件失败: {}", path.display()))?;
-    // 裸 println! 在 `atb logs | head -20` 里会因为 EPIPE **panic**（退出码 101，不在
-    // 对外契约里）。write_stdout 自带换行并忽略 EPIPE，逐行写即可。
-    for line in &lines {
-        write_stdout(line);
-    }
+    // EPIPE：write_stdout 自带忽略「下游已关闭管道」的处理，不会 panic。
+    print_json(json!({
+        "ok": true,
+        "path": path.display().to_string(),
+        "lines": lines,
+        "truncated": truncated,
+    }));
     Ok(())
 }
 
 /// 只从文件尾部按块倒读，凑够 `tail` 行就停：日志涨到几百 MB 时不必整份读进内存。
-pub(crate) fn tail_lines(path: &Path, tail: usize) -> Result<Vec<String>> {
+///
+/// 返回 `(lines, truncated)`：`truncated=true` 表示文件里还有更早的内容没返回
+/// （把它写进 JSON，调用方不用靠「行数 == tail」猜）。
+pub(crate) fn tail_lines(path: &Path, tail: usize) -> Result<(Vec<String>, bool)> {
     use std::io::{Seek, SeekFrom};
 
     const CHUNK: u64 = 64 * 1024;
     let mut file = fs::File::open(path)?;
     let mut end = file.metadata()?.len();
     if end == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), false));
     }
     // 多要一个换行：文件末尾没有换行时，最后一行也要算一行。
     let mut newlines = 0usize;
@@ -304,7 +320,11 @@ pub(crate) fn tail_lines(path: &Path, tail: usize) -> Result<Vec<String>> {
     let skip = usize::from(end > 0 && !all.is_empty());
     let lines = &all[skip..];
     let from = lines.len().saturating_sub(tail);
-    Ok(lines[from..].iter().map(|line| line.to_string()).collect())
+    let truncated = end > 0 || from > 0;
+    Ok((
+        lines[from..].iter().map(|line| line.to_string()).collect(),
+        truncated,
+    ))
 }
 
 pub(crate) fn doctor_value() -> Result<Value> {
@@ -314,7 +334,15 @@ pub(crate) fn doctor_value() -> Result<Value> {
     let config_result = config::load_existing();
     let (configured_port, config_ok, config_hint) = match config_result {
         Ok(cfg) => (Some(cfg.extension_port), true, Value::Null),
-        Err(err) => (None, false, json!(err.to_string())),
+        // 配置读/解析失败时给出可执行修复建议（不再只是把错误原样贴出来）。
+        Err(err) => (
+            None,
+            false,
+            json!(format!(
+                "{err}；检查 {} 的内容，或删除该文件后重跑（会自动重建默认配置）",
+                config_path.display()
+            )),
+        ),
     };
     let api_reachable = tcp_listening(PORT);
     // 与 status 同口径：1s 会把「daemon 正忙」判成「health 不通」。
@@ -447,12 +475,21 @@ pub(crate) fn doctor_value() -> Result<Value> {
         c.get("optional").and_then(Value::as_bool).unwrap_or(false)
             || c.get("ok").and_then(Value::as_bool).unwrap_or(false)
     });
-    Ok(json!({
+    // doctor 的 ok:false 也带 error_code；具体哪一项失败看 `checks[]`。
+    let mut report = json!({
         "ok": ok,
         "checks": checks,
         "log_path": log_path,
         "log_exists": log_path.exists()
-    }))
+    });
+    if !ok {
+        report["error_code"] = json!("doctor_checks_failed");
+        report["hint"] = json!(
+            "逐项看 checks[] 里 ok:false 的项；常见处置：atb restart 拉起 daemon、\
+             打开 chrome://extensions 重新加载扩展、确认扩展端口与 CLI 配置一致"
+        );
+    }
+    Ok(report)
 }
 
 pub(crate) fn extension_port_hint(
@@ -462,7 +499,9 @@ pub(crate) fn extension_port_hint(
     port_conflict: bool,
 ) -> Value {
     if port_conflict {
-        json!("插件端口不能和 API 端口 18767 相同；运行 atb set-extension-port <port> 修改")
+        json!(format!(
+            "插件端口不能和 API 端口 {PORT} 相同；运行 atb set-extension-port <port> 修改"
+        ))
     } else if configured.is_some() && listening.is_some() && configured != listening {
         json!("CLI 配置和 daemon 实际监听端口不一致；运行 atb restart 让配置生效")
     } else if !extension_port_ok {
@@ -602,7 +641,7 @@ fn run_doctor_fixes(report: &Value, force: bool, dry_run: bool) -> Vec<Value> {
                 "result": {
                     "port": PORT,
                     "pids": [],
-                    "hint": "未从 netstat/lsof 解析到 PID；请手动执行 netstat -ano | findstr 18767 查看占用进程"
+                    "hint": format!("未从 netstat/lsof 解析到 PID；请手动执行 netstat -ano | findstr {PORT} 查看占用进程")
                 }
             }));
         } else {
@@ -631,6 +670,7 @@ fn run_doctor_fixes(report: &Value, force: bool, dry_run: bool) -> Vec<Value> {
                     .map(KillOutcome::to_json)
                     .collect();
                 let killed_any = !killed.is_empty();
+                let killed_count = killed.len();
                 results.push(json!({
                     "fix": "stale_daemon_on_port",
                     "executed": killed_any,
@@ -640,10 +680,15 @@ fn run_doctor_fixes(report: &Value, force: bool, dry_run: bool) -> Vec<Value> {
                         "attempts": attempts.iter().map(KillOutcome::to_json).collect::<Vec<_>>(),
                         "skipped": skipped,
                         "identity_checked": true,
+                        // 两段文案以前是反的（killed_any=true 却说
+                        // 「未强杀」），与 executed 字段自相矛盾。这里按 killed_any 正向
+                        // 生成，并把实际结束的进程数写进文案。
                         "hint": if killed_any {
-                            json!("占用端口的进程没有通过身份核对，未强杀；请人工核查占用者")
+                            json!(format!(
+                                "已结束 {killed_count} 个占用 {PORT} 的进程；执行 atb restart 拉起新 daemon，再 atb status 确认"
+                            ))
                         } else {
-                            json!("进程已结束；执行 atb restart 拉起新 daemon，再 atb status 确认")
+                            json!("占用端口的进程没有通过身份核对，未强杀；请人工核查占用者")
                         }
                     }
                 }));
@@ -824,21 +869,32 @@ fn version_at_least(installed: &str, minimum: &str) -> bool {
 pub(crate) fn cmd_capabilities(is_async: bool) -> Result<()> {
     reject_async_if_set("capabilities", is_async)?;
     // daemon 不在时给明确错误：这不是「features 全 false」，是压根没得探测。
+    //
+    // 环境故障不是「命令写错了」。以前走 `usage_failure` → 退出码 2，与
+    // `error_code=daemon_not_running`（不在 is_usage_error_code 白名单）语义矛盾。
+    // 现在走 `print_json(ok:false)`，退出码由 print_json 判为 1（可重启/可重试）。
     if !is_server_alive() {
-        return Err(usage_failure(
-            "daemon_not_running",
-            "daemon 未运行，无法探测能力",
-            "执行 atb restart 或任意页面命令（tabs/open/exec）自动拉起，再运行 atb capabilities",
-        ));
+        print_json(json!({
+            "ok": false,
+            "error_code": "daemon_not_running",
+            "error": "daemon 未运行，无法探测能力",
+            "hint": "执行 atb restart 或任意页面命令（tabs/open/exec）自动拉起，再运行 atb capabilities",
+        }));
+        return Ok(());
     }
     let health = match request("GET", "/health", None, 5.0) {
         Ok(value) => value,
         Err(err) => {
-            return Err(usage_failure(
-                "daemon_token_mismatch",
-                format!("18767 有进程在监听，但 /health 不可达：{err}"),
-                "通常是残留的旧 daemon：netstat -ano | findstr 18767 找 PID 后 taskkill /PID <pid> /F，或运行 atb doctor --fix",
-            ));
+            let code = health_failure_code(&err).unwrap_or("daemon_token_mismatch");
+            print_json(json!({
+                "ok": false,
+                "error_code": code,
+                "error": format!("{PORT} 有进程在监听，但 /health 不可达：{err}"),
+                "hint": format!(
+                    "通常是残留的旧 daemon：netstat -ano | findstr {PORT} 找 PID 后 taskkill /PID <pid> /F，或运行 atb doctor --fix"
+                ),
+            }));
+            return Ok(());
         }
     };
     let daemon_version = health
@@ -890,11 +946,38 @@ pub(crate) fn cmd_capabilities(is_async: bool) -> Result<()> {
         "thresholds": thresholds,
     });
     if !compat_ok {
+        value["error_code"] = json!("extension_outdated");
         value["hint"] =
             json!("扩展协议版本低于 daemon 期望：按 atb status 的 next_steps 更新扩展后重新探测");
     } else if !extension_connected {
+        // ok:false 统一带稳定 error_code。
+        value["error_code"] = json!("extension_not_connected");
         value["hint"] = json!("扩展未连接：确认浏览器已打开且扩展已启用，再运行 atb capabilities");
     }
     print_json(value);
     Ok(())
+}
+
+#[cfg(test)]
+mod log_tail_tests {
+    use super::*;
+
+    #[test]
+    fn tail_lines_reports_truncation() {
+        // `truncated` 必须真实反映「还有更早的行没返回」。
+        let path = std::env::temp_dir().join(format!("atb-log-tail-{}.log", std::process::id()));
+        let content: String = (0..50).map(|index| format!("line{index}\n")).collect();
+        fs::write(&path, content).expect("写临时日志");
+
+        let (lines, truncated) = tail_lines(&path, 10).expect("读取尾部");
+        assert_eq!(lines.len(), 10, "应只返回最后 10 行");
+        assert_eq!(lines.last().map(String::as_str), Some("line49"));
+        assert!(truncated, "文件还有更早内容时应标 truncated");
+
+        let (all, not_truncated) = tail_lines(&path, 1000).expect("读取全部");
+        assert_eq!(all.len(), 50);
+        assert!(!not_truncated, "读完整个文件时不应标 truncated");
+
+        let _ = fs::remove_file(&path);
+    }
 }

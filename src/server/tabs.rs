@@ -79,7 +79,7 @@ pub(crate) async fn cleanup(
         let permits = permits.clone();
         // 身份要跟着任务走：`current_agent()` 不会随 spawn 继承。
         set.spawn(with_agent(current_agent(), async move {
-            // S1-05 同类：拿不到许可就明确失败，不要「无许可继续跑」。
+            // 同类：拿不到许可就明确失败，不要「无许可继续跑」。
             let _permit = match permits.acquire_owned().await {
                 Ok(permit) => permit,
                 Err(err) => {
@@ -161,14 +161,59 @@ async fn record_cleanup_closed(state: &AppState, session_key: &str) {
             list.retain(|item| item != session_key);
         }
     }
-    let mut defaults = state.agent_defaults.lock().await;
-    for target in defaults.values_mut() {
-        if target.session_key.as_deref() == Some(session_key) {
-            target.session_key = None;
+    clear_agent_defaults_for(state, session_key).await;
+}
+
+/// 记账前置：在**发出 closeTab 之前**就把这条会话从
+/// 「本工具打开过」和各 agent 的默认目标里摘掉。
+///
+/// `cleanup` 有整体预算，到点 `drop(set)` 会 abort 在途任务：关闭指令可能已经发出，
+/// 而 `forget_session` / `record_cleanup_closed` 还没执行。旧实现把记账全放在成功
+/// 回包之后，于是 abort 之后账上还留着「已关闭的标签」——下一次 cleanup 会重复关它，
+/// 默认目标也继续指着它。
+///
+/// 现在提前记账的代价是：closeTab 失败时这条会话暂时从账上消失。它仍在快照里，
+/// 下一次 `tabs_update` 会按原 key 重新登记（并把默认目标还给本 agent），
+/// 也就是「最多留一个由快照收敛的会话」，不会永久丢账。
+///
+/// 注：`Session` 没有 `closing` 字段（`state.rs` 不在本域白名单），所以这里只做
+/// 记账前置，不把会话标成 `disconnected`——那会让紧随其后的 closeTab 因为
+/// `select_tab` 只认 active 会话而根本发不出去。
+///
+/// 返回「原先登记过这条会话的 agent 列表」，供关闭失败时精确回滚。
+async fn mark_session_closing(state: &AppState, session_key: &str) -> Vec<String> {
+    let mut owners: Vec<String> = Vec::new();
+    {
+        let mut opened = state.agent_opened.lock().await;
+        for (agent, list) in opened.iter_mut() {
+            if list.iter().any(|item| item == session_key) {
+                owners.push(agent.clone());
+                list.retain(|item| item != session_key);
+            }
         }
-        if target.preferred_key.as_deref() == Some(session_key) {
-            target.preferred_key = None;
-            target.preferred_owner = None;
+    }
+    clear_agent_defaults_for(state, session_key).await;
+    // 全局默认 / latest 同样要摘掉，否则 /health 会指着一条正在关闭的会话。
+    let mut driver = state.driver.write().await;
+    if driver.default_session_key.as_deref() == Some(session_key) {
+        driver.default_session_key = None;
+    }
+    if driver.latest_session_key.as_deref() == Some(session_key) {
+        driver.latest_session_key = None;
+    }
+    owners
+}
+
+/// closeTab 明确失败时把归属还回去（记账前置的可回滚面）。
+///
+/// 不回滚会让「标签还在、但账上已经没有」——下一次 cleanup 再也清不掉它。
+/// 任务被 abort 走不到这里，那正是 允许的残留（由快照收敛）。
+async fn restore_session_ownership(state: &AppState, session_key: &str, owners: &[String]) {
+    let mut opened = state.agent_opened.lock().await;
+    for agent in owners {
+        let list = opened.entry(agent.clone()).or_default();
+        if !list.iter().any(|item| item == session_key) {
+            list.push(session_key.to_string());
         }
     }
 }
@@ -177,15 +222,21 @@ async fn record_cleanup_closed(state: &AppState, session_key: &str) {
 pub(crate) async fn close_session_by_key(state: &AppState, session_key: &str) -> Result<()> {
     let physical_tab_id = session_tab_id(state, session_key).await?;
     let physical_tab_number = require_tab_id(&physical_tab_id)?;
+    // 先把记账落下，再发关闭指令。
+    let previous_owners = mark_session_closing(state, session_key).await;
     let payload = json!({ "cmd": "closeTab", "tabId": physical_tab_number }).to_string();
-    execute_page_js(
+    if let Err(err) = execute_page_js(
         state,
         &payload,
         SessionSelector::new(Some(session_key.to_string()), None, None),
         true,
         Duration::from_secs(15),
     )
-    .await?;
+    .await
+    {
+        restore_session_ownership(state, session_key, &previous_owners).await;
+        return Err(err);
+    }
     {
         let mut execs = state.execs.lock().await;
         for pending in execs.take_session(session_key) {
@@ -254,18 +305,31 @@ pub(crate) async fn health(State(state): State<AppState>) -> Json<Value> {
     // 信任配置只做「报告」，损坏也不能让 /health 自己失败：
     // 否则用户失去唯一能看到「为什么连不上」的入口。
     let compatibility = compatibility_value(&state).await;
+    // 联动：除了「白名单几条 / 要不要 token」，还必须如实报告**当前档位**
+    // 与「兼容档的风险」。`atb status` 把这段原样透出，是用户唯一能看见
+    // 「任何本机进程都能接管浏览器」的地方；只报数字等于默认放行但不说。
+    let ws_trust_mode = crate::settings::ws_trust_mode();
     let ws_security = match load_ws_trust() {
         WsTrustState::Ok(ws_trust) => json!({
+            "mode": ws_trust_mode,
             "trusted_ids": ws_trust.extension_ids.len(),
             "token_required": ws_trust.token_value().is_some(),
             "trust_config_error": Value::Null,
+            "warning": if ws_trust_mode == "compat" {
+                json!("当前为兼容档：任何本机进程都可能连入扩展端口并接管本浏览器；建议用 atb trust-extension --token 切到 token 档")
+            } else {
+                Value::Null
+            },
         }),
         // 数字不伪造：此时白名单根本没读出来，0/false 只是「未知」的占位，
         // 真实原因看 `trust_config_error`（非 null 即代表握手正在被拒绝）。
+        // 配置损坏时警告优先于档位风险：此时连「兼容档放行」都不是主要问题。
         WsTrustState::Corrupt(detail) => json!({
+            "mode": ws_trust_mode,
             "trusted_ids": 0,
             "token_required": false,
             "trust_config_error": detail,
+            "warning": format!("信任配置损坏，握手正在被拒绝：{detail}"),
         }),
     };
     let configured_extension_port = config::load_existing()
@@ -294,7 +358,7 @@ pub(crate) async fn health(State(state): State<AppState>) -> Json<Value> {
             "profiles": profile_capabilities
         },
         "extension": extension_freshness,
-        // 扩展自检报错：非空就说明它那边已经有功能降级了，
+        // 扩展自检报错（R-19）：非空就说明它那边已经有功能降级了，
         // 比让用户盯着「没有可用标签页」猜要直接得多。
         "extension_warnings": state.ext_warnings.lock().await.clone(),
         "compatibility": compatibility,
@@ -527,6 +591,10 @@ pub(crate) async fn tabtree(
     touch(&state).await;
     // 只读命令：浏览器没开时用短等待，别再白等 5 秒。
     wait_for_sessions(&state, WAIT_SESSIONS_READ).await;
+    // 与 `tabs` 一样先对齐一次快照。旧实现直接读内存表，扩展推送延迟
+    // （SW 被节流时可达十几秒）会让 tabtree 显示一棵过期的树；刷新失败就用现有
+    // 快照（不阻塞、不报错）。
+    let _ = refresh_tabs_via_extension(&state, None, Duration::from_millis(1500)).await;
     // 与 `tabs` / 选择路径保持同一判据：`--browser Edge` 同时命中
     // `Edge` 与 `Edge-Beta` 时报歧义，而不是把两个浏览器并成一棵树。
     if let Some(browser) = query.browser.as_deref() {
@@ -614,7 +682,14 @@ pub(crate) async fn tabtree(
             let mut profile_nodes: Vec<Value> = profiles
                 .into_iter()
                 .map(|(profile_id, mut sessions)| {
-                    sessions.sort_by(|a, b| a.tab_id.cmp(&b.tab_id));
+                    // 与 `tabs` / `--tab @N` 共用同一判据（数值序，tab id 是
+                    // Chrome 递增整数）。旧实现按字符串排序，`10` 会排在 `9` 前面，
+                    // 于是 tabtree 的序号和 tabs 的序号指向不同标签。
+                    sessions.sort_by(|a, b| {
+                        tab_numeric_order(&a.tab_id)
+                            .cmp(&tab_numeric_order(&b.tab_id))
+                            .then_with(|| a.tab_id.cmp(&b.tab_id))
+                    });
                     let profile_label = sessions.iter().find_map(|s| s.profile_label.clone());
                     let tabs: Vec<Value> = sessions
                         .iter()
@@ -934,10 +1009,11 @@ pub(crate) async fn set_profile_label(
 
 /// cleanup / close 这类"必须落到具体标签"的路径不允许空 tab_id。
 ///
-/// `parse_tab_id("")` 返回 `Ok(0)`——那是"这条命令不需要 tabId"的历史语义（`exec`
-/// 等路径还在依赖它），但关闭标签时必须落到具体 tabId。空串落到 0 之后，扩展回
-/// "tabId is required"，用户看到的归因变成了扩展的问题（P3，条目的病根在
-/// `snapshot.rs::parse_tab_id`，那里被多条路径共用，先在需要强制 tabId 的入口拦住）。
+/// **`parse_tab_id("")` 返回 `Err`（`session_gone` 语义），不再返回 `Ok(0)`**：
+/// 只有「这条命令根本不需要 tabId」的路径（`exec` 等）才在更上层跳过调用，
+/// 一旦走到这里，空串就说明会话记录已经坏了。旧注释写成「空串返回 Ok(0)」，
+/// 与实现相反，照着注释改代码会把 `tabId:0` 发给扩展，错误归因也被带偏。
+/// 关闭标签时必须落到具体 tabId，所以在入口再拦一次并给 typed `session_gone`。
 pub(crate) fn require_tab_id(raw: &str) -> Result<i64> {
     if raw.trim().is_empty() {
         // 旧实现裸 anyhow：这是「会话记录已失效」（tabId 丢了）而非参数写错，
@@ -1122,5 +1198,27 @@ async fn send_profile_label_to_extension(
             state.execs.lock().await.take(&exec_id);
             Err(anyhow!("设置 profile label 超时"))
         }
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    /// `parse_tab_id("")` 的契约是「空串 = 会话已失效」，返回 `Err`。
+    /// 这条断言把历史上「注释说 Ok(0)、实现返回 Err」的分歧固化下来：
+    /// 只允许在更上层（`exec` 等不需要 tabId 的路径）跳过调用，不允许返回值骗人。
+    #[test]
+    fn empty_tab_id_is_an_error_not_zero() {
+        assert!(parse_tab_id("").is_err());
+        assert!(parse_tab_id("   ").is_err());
+        assert_eq!(parse_tab_id("12").expect("12"), 12);
+        assert!(parse_tab_id("abc").is_err());
+        // 关闭类入口必须给出 typed 的 session_gone。
+        let err = require_tab_id("").expect_err("empty tab id must fail");
+        let typed = err
+            .downcast_ref::<SessionSelectError>()
+            .expect("require_tab_id 应给 typed 错误");
+        assert_eq!(typed.code, "session_gone");
     }
 }

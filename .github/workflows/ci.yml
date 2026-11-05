@@ -25,6 +25,11 @@ jobs:
       # check/test 会先于 release 构建失败，不用等到发版才炸。
       - run: cargo check --all-targets --locked
       - run: cargo test --all-targets --all-features --locked
+      # ：`npm run build` 等价于 check-lock + `cargo build --release --locked`，
+      # 而这条命令以前从未在 CI 执行过 —— 编译通过但 release profile 链接失败
+      # （LTO/panic=abort 等差异）会一直留到发版才暴露。
+      - name: Release build（与 npm run build 的 cargo 部分一致）
+        run: cargo build --release --locked
 
   extension:
     name: Chrome extension syntax
@@ -48,51 +53,53 @@ jobs:
           node-version: 24
 
       # package.json 与 package-lock.json 必须同步：lock 版本漂移、平台条目缺 version
-      # 都会让下游的 `npm ci` 直接 EUSAGE 失败。用本地脚本校验，不依赖 registry
-      # （平台子包在首次发布前并不存在，走 npm ci 会因 404 假红）。
-      # 版本号以 package.json 为真相源：Cargo.toml / Cargo.lock / 两个 README /
-      # package-lock.json 的键与值都必须一致（漏 Cargo.lock 会让 --locked 构建失败）。
+      # 都会让下游的 `npm ci` 直接 EUSAGE 失败（v5）。这里只 dry-run，不装依赖。
+      - name: lock 与 package.json 一致性（npm ci --dry-run）
+        run: npm ci --dry-run
+
+      # 版本号以 package.json（CLI）与 assets/atb_bridge/manifest.json（扩展）为真相源：
+      # Cargo.toml / Cargo.lock / package-lock.json / 两份 README / AI_INSTALL / SECURITY /
+      # PRIVACY / FEATURE_STATUS / BEST_PRACTICES / skills/** 都要一致。
       - name: 版本一致性（sync-version --check）
         run: node scripts/sync-version.mjs --check
 
-      # 锁文件门禁：Cargo.lock / package-lock.json 的版本与依赖集合必须和清单一致。
+      # 锁文件门禁：Cargo.lock / package-lock.json 的版本、依赖集合与依赖版本、
+      # 平台包条目的 os/cpu/resolved/integrity 必须和清单一致。
       # 这一步与 `npm run build` 里的前置检查同一份脚本，本地能过、CI 也能过。
       - name: 锁文件一致性（check-lock）
-        run: node scripts/check-lock.mjs
+        run: npm run check:lock
 
       # 扩展里内联的页面脚本是字符串，语法错误只有 eval 时才炸 → 单独校验。
       - name: 页面脚本可解析且入口齐全
         run: node tests/check_page_script.mjs
 
-      # 一次性跑 tests/ 下**全部** `*.test.mjs`。以前是手写枚举测试命令，
-      # 新增的测试文件永远不会自动生效。排除项靠文件名表达：`live_*`（要真浏览器）、
-      # `*_bench`（压测）、`mock_extension`（在 e2e job 里跑自检）都不是
-      # `*.test.mjs`，天然不会进来。
+      # 一次性跑 tests/ 下**全部** `*.test.mjs`。以前是手写枚举 12 条命令，
+      # 新增的测试文件永远不会自动生效 —— `challenge_detect.test.mjs` 与
+      # `stealth_audit.test.mjs` 就这样漏了两轮（改了 challenge / stealth 也没有回归守卫）。
+      # 排除项靠文件名表达：`live_*`（要真浏览器）、`*_bench`（压测）、`mock_extension`
+      # （在 e2e job 里跑自检）都不是 `*.test.mjs`，天然不会进来。
       #
+      # 用 `npm test` 而不是内联命令：本地 `npm test` 与 CI 必须是同一条。
       # 各文件守的是什么（改对应模块时请先看这一行）：
-      #   asset_parity             assets/page_*.js 与 ops/ 副本逐字节一致 + README 里的扩展版本 = manifest
+      #   asset_parity             assets/page_*.js 与 ops/ 副本逐字节一致 + 文档里的扩展版本 = manifest
       #   npm_wrapper              npm/bin/atb.js 的兜底错误分支不抛 ReferenceError
-      #   page_net_contract        hook 的 routes 是计数、routes_list 才是数组（上游契约）
+      # page_net_contract hook 的 routes 是计数、routes_list 才是数组（上游契约）
       #   page_net_fixes           URL 解析、字面量匹配、规则优先级、旁路捕获、net fetch 不自我欺骗
-      #   net_response_rewrite     读不到原始响应体时不得用空 body 顶替（数据丢失型假成功）
-      #   net_routes_idempotent    net routes 是只读命令，不得把整份 config 当 cdp 规则下发
+      # net_response_rewrite 读不到原始响应体时不得用空 body 顶替（数据丢失型假成功）
+      # net_routes_idempotent net routes 是只读命令，不得把整份 config 当 cdp 规则下发
       #   extension_net_intercept  网络拦截（CDP Fetch 域）
       #   extension_csp_policy     CSP 策略 + 可选 API 加载
-      #   fetch_pause_invariant    Fetch 暂停后必须续传，否则页面请求永久挂起
-      #   cli_contract             退出码是唯一的机器可读信号
+      # fetch_pause_invariant Fetch 暂停后必须续传，否则页面请求永久挂起
+      # cli_contract 退出码是唯一的机器可读信号
       #   challenge_detect         挑战识别判据（TOKEN_SELECTORS / detect 分支）
       #   stealth_audit            反检测审计的评分与 scope 归属
-      - name: 页面脚本与接口契约回归（tests/*.test.mjs 全量）
-        run: node --test tests/*.test.mjs
+      - name: 页面脚本与接口契约回归（npm test）
+        run: npm test
 
-      # 依赖 scripts/sync-extension-assets.mjs（不存在时先跳过，脚本落地后自动生效）。
-      - name: 扩展资源同步校验（依赖 scripts/sync-extension-assets.mjs）
-        run: |
-          if [ -f scripts/sync-extension-assets.mjs ]; then
-            node scripts/sync-extension-assets.mjs --check
-          else
-            echo "::notice::scripts/sync-extension-assets.mjs 尚未落地，跳过"
-          fi
+      # ：以前写成「脚本存在才跑」，脚本改名/被删就静默放行 —— 门禁失效没人知道。
+      # 现在无条件执行；脚本缺失本身就是错误。
+      - name: 扩展资源同步校验（主副本 vs ops）
+        run: npm run check:extension
 
   # E2E 自检：起真 daemon + 假扩展，占 18766/18767 端口。
   # 必须是**单 job 单步骤串行**跑——并行会互相抢端口，产生假红/假绿
@@ -109,3 +116,96 @@ jobs:
       - run: cargo build
       - name: 自检（内部串行，脚本自带端口体检与 finally 清理）
         run: node tests/mock_extension.mjs --self-test
+
+  # 真链路 E2E：scripts/e2e.mjs 的六个场景此前从未在 CI 执行，
+  # 只有本地手跑。这里在 Linux 上用 xvfb 起真 Chrome + 真扩展，跑 smoke（3 个核心场景）。
+  # 不在 Windows/macOS 上跑：Windows 没有 xvfb 等价物，macOS runner 装 unpacked 扩展同样不可靠。
+  e2e-live:
+    name: E2E live（真 Chrome + 真扩展）
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Install xvfb
+        run: sudo apt-get update && sudo apt-get install -y xvfb
+
+      - name: Setup Chrome for Testing
+        id: chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      # e2e 的本地静态页面：Chrome 需要一个普通 http 标签页，扩展才会报 active_tabs>0。
+      - name: Serve e2e pages
+        run: |
+          set -euo pipefail
+          python3 -m http.server 8123 --bind 127.0.0.1 --directory tests/e2e/pages \
+            > "$RUNNER_TEMP/pages.log" 2>&1 &
+          for _ in $(seq 1 10); do
+            curl -fsS http://127.0.0.1:8123/basic.html >/dev/null && exit 0
+            sleep 1
+          done
+          echo "静态页面服务没有起来"; cat "$RUNNER_TEMP/pages.log"; exit 1
+
+      - name: Launch Chrome with the extension
+        run: |
+          set -euo pipefail
+          EXT="$PWD/assets/atb_bridge"
+          xvfb-run -a --server-args="-screen 0 1280x1024x24" \
+            "${{ steps.chrome.outputs.chrome-path }}" \
+            --no-sandbox --disable-gpu --no-first-run --no-default-browser-check \
+            --user-data-dir="$RUNNER_TEMP/atb-e2e-profile" \
+            --disable-extensions-except="$EXT" --load-extension="$EXT" \
+            "http://127.0.0.1:8123/basic.html" > "$RUNNER_TEMP/chrome.log" 2>&1 &
+          echo "chrome 已启动（pid=$!）"
+
+      - name: Wait for the extension to connect
+        run: |
+          set -euo pipefail
+          BIN="./target/release/atb"
+          "$BIN" restart >/dev/null 2>&1 || true
+          for attempt in $(seq 1 30); do
+            if "$BIN" status 2>/dev/null | node -e "
+              let raw = '';
+              process.stdin.on('data', (chunk) => { raw += chunk; });
+              process.stdin.on('end', () => {
+                try {
+                  const json = JSON.parse(raw);
+                  process.exit(json.connection && json.connection.extension_connected ? 0 : 1);
+                } catch { process.exit(1); }
+              });
+            "; then
+              echo "扩展已连接（第 ${attempt} 次探测）"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::扩展 60s 内没有连上 daemon"
+          "$BIN" status || true
+          tail -n 80 "$RUNNER_TEMP/chrome.log" || true
+          exit 1
+
+      # ATB_E2E=smoke 只跑 3 个核心场景（basic-flow / screenshot / spa-wait），
+      # 全量场景留给本地与发布前手动跑，避免把 CI 时间花在 download 这类环境相关的用例上。
+      - name: Run smoke e2e
+        env:
+          ATB_E2E: smoke
+          ATB_E2E_BIN: ./target/release/atb
+        run: node scripts/e2e.mjs
+
+      - name: Diagnostics
+        if: ${{ always() }}
+        run: |
+          ./target/release/atb status || true
+          ./target/release/atb doctor || true
+          echo "--- chrome.log ---"
+          tail -n 80 "$RUNNER_TEMP/chrome.log" || true
+          pkill -f "chrome.*atb-e2e-profile" || true

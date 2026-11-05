@@ -472,7 +472,7 @@ pub(crate) struct NetHookArgs {
     ///
     /// `Option<bool>` 而不是 `bool`：不带这个 flag 时**不下发**该字段，服务端才会沿用
     /// 已持久化的值。旧写法默认 false 且每次下发，第二次 `net hook --persist` 会把
-    /// 之前存的 captureBodies 静默压回 false（CLI 侧另一半）。
+    /// 之前存的 captureBodies 静默压回 false（B-17 的 CLI 侧另一半）。
     #[arg(long = "capture-bodies", num_args = 0..=1, default_missing_value = "true")]
     pub(crate) capture_bodies: Option<bool>,
     /// 持久化：页面导航后自动重装 hook（可配合 --match 限定 URL）

@@ -74,40 +74,47 @@ pub(crate) fn install_skill(args: InstallSkillArgs) -> Result<()> {
         }
     }
 
-    print_skill_plan(&plan, dry);
-    if dry {
-        // 既有文本计划保留（人读），另外补一份机器可读结果：只增字段。
-        let items: Vec<Value> = plan
-            .iter()
-            .map(|item| {
-                json!({
-                    "action": item.action,
-                    "path": item.path.display().to_string(),
-                    "will_write": item.will_write,
-                    "note": item.note,
-                })
+    // `install-skill` 以前把「安装计划 / 安装完成」当裸文本写 stdout，
+    // 破坏「所有命令输出统一结构化 JSON」的契约。现在计划与结果都进 JSON，
+    // 人读提示不再污染 stdout（交互确认提示仍走 stderr 之外的提示行）。
+    let plan_items: Vec<Value> = plan
+        .iter()
+        .map(|item| {
+            json!({
+                "action": item.action,
+                "path": item.path.display().to_string(),
+                "will_write": item.will_write,
+                "note": item.note,
             })
-            .collect();
-        let would_write = plan.iter().filter(|item| item.will_write).count();
+        })
+        .collect();
+    let would_write = plan.iter().filter(|item| item.will_write).count();
+    if dry {
         print_json(json!({
             "ok": true,
-            "result": {
-                "dry_run": true,
-                "command": "install-skill",
-                "source": source.display().to_string(),
-                "target": main_target.display().to_string(),
-                "would_write": would_write,
-                "plan": items,
-            },
+            "installed": Vec::<String>::new(),
+            "dry_run": true,
+            "source": source.display().to_string(),
+            "target": main_target.display().to_string(),
+            "would_write": would_write,
+            "plan": plan_items,
         }));
         return Ok(());
     }
     if !args.yes && !confirm_install()? {
-        write_stdout("已取消安装");
+        print_json(json!({
+            "ok": true,
+            "installed": Vec::<String>::new(),
+            "dry_run": false,
+            "cancelled": true,
+            "plan": plan_items,
+            "hint": "未写入任何文件；确认后加 --yes 或重新执行并输入 yes",
+        }));
         return Ok(());
     }
 
     copy_dir_clean(&source, &main_target)?;
+    let mut installed: Vec<String> = vec![main_target.display().to_string()];
     for item in plan
         .iter()
         .filter(|item| item.action.ends_with("symlink") && item.will_write)
@@ -122,28 +129,16 @@ pub(crate) fn install_skill(args: InstallSkillArgs) -> Result<()> {
             remove_path(&item.path)?;
         }
         create_symlink_dir(&main_target, &item.path)?;
+        installed.push(item.path.display().to_string());
     }
-    write_stdout(&format!(
-        "安装完成: {}",
-        main_target.join("SKILL.md").display()
-    ));
+    print_json(json!({
+        "ok": true,
+        "installed": installed,
+        "dry_run": false,
+        "script": main_target.join("SKILL.md").display().to_string(),
+        "plan": plan_items,
+    }));
     Ok(())
-}
-
-pub(crate) fn print_skill_plan(plan: &[SkillPlanItem], dry_run: bool) {
-    write_stdout("atb skill 安装计划");
-    if dry_run {
-        write_stdout("模式: dry-run，不写文件、不创建软链接");
-    }
-    for item in plan {
-        write_stdout(&format!(
-            "- [{}] {} -> {} ({})",
-            if item.will_write { "write" } else { "skip" },
-            item.action,
-            item.path.display(),
-            item.note
-        ));
-    }
 }
 
 pub(crate) fn confirm_install() -> Result<bool> {
@@ -298,12 +293,20 @@ pub(crate) fn create_symlink_dir(source: &Path, target: &Path) -> Result<()> {
         .with_context(|| format!("创建软链接失败: {}", target.display()))
 }
 
+/// `ATB_ALLOW_RELATIVE_OUT=1`：广播时保留相对输出路径（旧行为）。
+///
+/// 默认 false：与 open/screenshot 的同步/异步路径一致，先把 `out`/`files`/`dir`
+/// 等路径绝对化再下发。对应 CLI flag `--allow-relative-out` 由 args 侧补。
+fn allow_relative_out() -> bool {
+    crate::settings::env_bool("ATB_ALLOW_RELATIVE_OUT", false)
+}
+
 pub(crate) fn run_broadcast(args: BroadcastArgs) -> Result<()> {
     let mut payload_args = match args.args_json.as_deref() {
         Some(text) => match serde_json::from_str::<Value>(text) {
             Ok(value) => value,
             // 与 net --body 同一口径：非法 JSON 是用法错（退出码 2），
-            // 以前是 anyhow → 退出码 1，调用方会当成可重试。
+            // 以前是 anyhow → 退出码 1，调用方会当成可重试（/ X-04）。
             Err(err) => {
                 return Err(usage_failure(
                     "invalid_json",
@@ -339,10 +342,21 @@ pub(crate) fn run_broadcast(args: BroadcastArgs) -> Result<()> {
     if args.op == "exec" && payload_args.get("script").is_none() {
         return Err(usage_err!("broadcast exec: 需要脚本（--script 或 --file）"));
     }
-    // 下发给所有浏览器/Profile 之前先在本地把参数查一遍：以前一个
-    // `--script ''` 会被广播到全部目标，每个都失败一次才回来。
-    // preflight_payload 对不支持的动作直接放行（只查通用数值字段），keep daemon 兜底。
-    if let Err(problem) = preflight::preflight_payload(&args.op, &payload_args) {
+    // broadcast 是唯一绕过 `finalize_page_payload` 的页面端点——
+    // `--op screenshot --args '{"out":"shots/a.png"}'` 会被 daemon 按 home 解析，
+    // `switch_tab_id:"@1"` 这类非法目标语法也不会在本地被拦。默认走同一份收尾
+    // （路径绝对化 + 参数预检 + 目标语法解析）；`ATB_ALLOW_RELATIVE_OUT=1` 可关掉
+    // 绝对化以保持旧行为。
+    if allow_relative_out() {
+        if let Err(problem) = preflight::preflight_payload(&args.op, &payload_args) {
+            return usage_error(&problem);
+        }
+        if let Some(tab) = payload_args.get("switch_tab_id").and_then(Value::as_str) {
+            if let Err(err) = TargetSpec::parse(tab) {
+                return usage_error(&spec_problem(err));
+            }
+        }
+    } else if let Err(problem) = finalize_page_payload(&args.op, &mut payload_args) {
         return usage_error(&problem);
     }
     let payload = json!({
@@ -352,8 +366,32 @@ pub(crate) fn run_broadcast(args: BroadcastArgs) -> Result<()> {
         "profiles": args.profiles,
         "concurrency": args.concurrency,
     });
+    // dry-run 必须在本地短路：广播是跨浏览器副作用最大的命令，不能先拉 daemon
+    // 再指望它「什么都不做」。当前分发层会先拒绝 broadcast --dry-run；
+    // 这里仍保留本地短路，供后续放开该 flag 时直接生效。
+    if DRY_RUN.load(Ordering::Relaxed) {
+        print_json(json!({
+            "ok": true,
+            "result": {
+                "dry_run": true,
+                "command": "broadcast",
+                "op": payload["op"],
+                "args": payload["args"],
+                "browsers": payload["browsers"],
+                "profiles": payload["profiles"],
+                "concurrency": payload["concurrency"],
+                "note": "去掉 --dry-run 才会广播到各浏览器/profile；参数已通过本地预检与目标语法解析",
+            },
+        }));
+        return Ok(());
+    }
     ensure_server()?;
-    let value = request("POST", "/broadcast", Some(payload), args.timeout)?;
+    let value = request(
+        "POST",
+        "/broadcast",
+        Some(payload),
+        http_budget(args.timeout),
+    )?;
     print_json(value);
     Ok(())
 }
@@ -375,7 +413,12 @@ pub(crate) fn run_downloads(args: DownloadsArgs) -> Result<()> {
     if let Some(id) = args.id {
         payload["id"] = json!(id);
     }
-    print_json(request("POST", "/downloads", Some(payload), args.timeout)?);
+    print_json(request(
+        "POST",
+        "/downloads",
+        Some(payload),
+        http_budget(args.timeout),
+    )?);
     Ok(())
 }
 
@@ -398,6 +441,63 @@ fn download_suggestion(target: &str) -> Option<&'static str> {
         "wait" => Some("atb download-wait"),
         "list" | "get" | "cancel" | "cancel-all" => Some("atb downloads"),
         _ => None,
+    }
+}
+
+/// 下载文件名净化（与 同因）。
+///
+/// 文件名会被扩展拼进 `${dir}/${fileName}`，不净化等于把路径穿越能力交给调用方。
+/// strict（默认）：只接受 basename，拒绝分隔符 / 绝对路径 / `..` / Windows 保留名；
+/// compat：只告警并继续用 basename（旧行为逃生口）。
+fn sanitize_download_filename(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(usage_failure(
+            "invalid_argument",
+            "download --filename 不能为空",
+            "例如 --filename report.pdf；目录请用 --dir",
+        ));
+    }
+    let path = Path::new(trimmed);
+    let base = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(trimmed)
+        .trim()
+        .to_string();
+    let stem = base.split('.').next().unwrap_or(&base).to_ascii_uppercase();
+    const RESERVED: [&str; 22] = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    let mut problem: Option<&str> = None;
+    if path.is_absolute()
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.split(['/', '\\']).any(|segment| segment == "..")
+    {
+        problem = Some("文件名不能是绝对路径，也不能包含 `/`、`\\` 或 `..`");
+    }
+    if base.is_empty() || base == "." || base == ".." {
+        problem = Some("文件名不能为空或 `.`/`..`");
+    } else if RESERVED.contains(&stem.as_str()) || base.ends_with('.') || base.ends_with(' ') {
+        problem = Some("文件名是 Windows 保留名或带尾部点/空格，浏览器落盘可能失败");
+    }
+    match problem {
+        None => Ok(base),
+        Some(reason) if crate::settings::io_sanitize_filename() == "strict" => Err(usage_failure(
+            "invalid_argument",
+            format!("download --filename {trimmed:?} 不合法：{reason}"),
+            "只传文件名（例如 report.pdf），目录用 --dir；需要兼容旧行为可设 ATB_IO_SANITIZE_FILENAME=compat",
+        )),
+        Some(reason) => {
+            // 兼容档只告警：仍按 basename 下发，避免路径穿越。
+            let _ = writeln!(
+                io::stderr(),
+                "download --filename 告警：{reason}；已按 basename {base:?} 下发"
+            );
+            Ok(base)
+        }
     }
 }
 
@@ -427,13 +527,18 @@ pub(crate) fn run_download(args: DownloadArgs) -> Result<()> {
         "profile": args.profile,
     });
     if let Some(filename) = args.filename {
-        payload["filename"] = json!(filename);
+        payload["filename"] = json!(sanitize_download_filename(&filename)?);
     }
     if let Some(dir) = args.dir {
         // 相对目录以当前 shell 的 cwd 为基准（daemon 的 cwd 是 home，会把文件下到别处）。
         payload["dir"] = json!(absolutize_path(&dir));
     }
-    print_json(request("POST", "/downloads", Some(payload), args.timeout)?);
+    print_json(request(
+        "POST",
+        "/downloads",
+        Some(payload),
+        http_budget(args.timeout),
+    )?);
     Ok(())
 }
 
@@ -469,7 +574,7 @@ pub(crate) fn run_download_wait(args: DownloadWaitArgs) -> Result<()> {
         "POST",
         "/downloads",
         Some(payload),
-        args.wait_timeout + 15.0,
+        http_budget(args.wait_timeout + 5.0),
     )?;
     let ok = value
         .get("result")
@@ -526,7 +631,7 @@ pub(crate) fn run_target_command(
             args.tab.as_deref(),
             args.browser.as_deref(),
             args.profile.as_deref(),
-            args.timeout + args.wait_timeout + 5.0,
+            http_budget(args.timeout + args.wait_timeout),
         )?;
     }
     Ok(())
@@ -562,7 +667,7 @@ pub(crate) fn run_fill_command(args: FillCommandArgs, is_async: bool) -> Result<
             args.tab.as_deref(),
             args.browser.as_deref(),
             args.profile.as_deref(),
-            args.timeout + args.wait_timeout + 5.0,
+            http_budget(args.timeout + args.wait_timeout),
         )?;
     }
     Ok(())
@@ -593,7 +698,7 @@ pub(crate) fn run_send_keys_command(args: SendKeysCommandArgs, is_async: bool) -
             args.tab.as_deref(),
             args.browser.as_deref(),
             args.profile.as_deref(),
-            args.timeout + args.wait_timeout + 5.0,
+            http_budget(args.timeout + args.wait_timeout),
         )?;
     }
     Ok(())
@@ -624,7 +729,7 @@ pub(crate) fn run_screenshot_command(args: ScreenshotArgs, is_async: bool) -> Re
             args.tab.as_deref(),
             args.browser.as_deref(),
             args.profile.as_deref(),
-            args.timeout + 5.0,
+            http_budget(args.timeout),
         )?;
     }
     Ok(())
@@ -654,7 +759,7 @@ pub(crate) fn run_save_pdf_command(args: SavePdfArgs, is_async: bool) -> Result<
             args.tab.as_deref(),
             args.browser.as_deref(),
             args.profile.as_deref(),
-            args.timeout + 5.0,
+            http_budget(args.timeout),
         )?;
     }
     Ok(())

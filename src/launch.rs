@@ -14,6 +14,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use std::env;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -21,8 +22,40 @@ use std::time::{Duration, Instant};
 /// 外部命令（tasklist / powershell / ps / which）的最长等待时间。
 ///
 /// 这些命令都在「动手杀进程 / 确认进程是否还在」的关键路径上：一旦卡住（WMI 卡死、
-/// 杀软拦截），调用方会无限期挂着。统一 5s 上限，超时就当查询失败处理（R1-06）。
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+/// 杀软拦截），调用方会无限期挂着。默认 5s 上限，超时就当查询失败处理。
+/// 可用 `ATB_PROC_CMD_TIMEOUT_MS` 调整（100..=60000）。
+fn command_timeout() -> Duration {
+    let millis = crate::settings::env_u64_clamped("ATB_PROC_CMD_TIMEOUT_MS", 5_000, 100, 60_000);
+    Duration::from_millis(millis)
+}
+
+/// 启动后等待「新进程是否还活着」的时间。
+///
+/// 旧实现硬编码 900ms：慢机 / 冷启动下浏览器还没完成初始化就被判定为「参数没生效」，
+/// 或者反之太快把转发误判成失败。默认 800ms，可用 `ATB_LAUNCH_SETTLE_MS` 调整
+/// （0..=10000）。
+fn launch_settle() -> Duration {
+    let millis = crate::settings::env_u64_clamped("ATB_LAUNCH_SETTLE_MS", 800, 0, 10_000);
+    Duration::from_millis(millis)
+}
+
+/// 温和关闭后等待进程退出的时间（默认 3s）。
+fn close_wait_budget() -> Duration {
+    let millis = crate::settings::env_u64_clamped("ATB_LAUNCH_CLOSE_WAIT_MS", 3_000, 100, 60_000);
+    Duration::from_millis(millis)
+}
+
+/// 强杀后等待进程退出的时间（默认 8s）。
+fn kill_wait_budget() -> Duration {
+    let millis = crate::settings::env_u64_clamped("ATB_LAUNCH_KILL_WAIT_MS", 8_000, 100, 120_000);
+    Duration::from_millis(millis)
+}
+
+/// 关闭实例时轮询 `instances()` 的间隔（默认 500ms）。
+fn close_poll_interval() -> Duration {
+    let millis = crate::settings::env_u64_clamped("ATB_LAUNCH_POLL_MS", 500, 20, 5_000);
+    Duration::from_millis(millis)
+}
 
 /// 带超时地跑一个外部命令。
 ///
@@ -229,22 +262,82 @@ pub struct Executed {
     pub skipped_pids: Vec<u32>,
 }
 
+/// 启动失败的类别。
+///
+/// `run` 过去对所有 `execute` 失败都套同一句「确认装了扩展」的 hint，
+/// 但真正的原因可能是枚举进程失败、新进程立刻退出、或关闭旧实例失败。按类别给
+/// 「下一步做什么」的提示，才不会再把人往错方向带。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchFailKind {
+    /// 关闭旧实例失败（窗口不退出 / 强杀后仍在）。
+    CloseFailed,
+    /// 启动子进程本身失败（exe 不存在、权限、spawn 报错）。
+    SpawnFailed,
+    /// 枚举浏览器进程失败或超时，无法确认是否已有实例。
+    EnumFailed,
+    /// 新进程立刻退出（URL 被旧实例接走），命令行参数没有生效。
+    ParamsNotEffective,
+}
+
+impl LaunchFailKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LaunchFailKind::CloseFailed => "close_failed",
+            LaunchFailKind::SpawnFailed => "spawn_failed",
+            LaunchFailKind::EnumFailed => "enum_failed",
+            LaunchFailKind::ParamsNotEffective => "params_not_effective",
+        }
+    }
+}
+
+/// 带类别的启动失败。
+#[derive(Debug)]
+pub struct LaunchFail {
+    pub kind: LaunchFailKind,
+    pub error: anyhow::Error,
+}
+
+impl LaunchFail {
+    fn new(kind: LaunchFailKind, error: impl Into<anyhow::Error>) -> Self {
+        Self {
+            kind,
+            error: error.into(),
+        }
+    }
+}
+
+impl fmt::Display for LaunchFail {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.error, f)
+    }
+}
+
+impl std::error::Error for LaunchFail {}
+
 /// 执行计划：温和关闭旧实例（如有）→ 启动 → 确认新进程活着。
 ///
 /// `restart` 由调用方显式传入：不传就绝不关窗口（用户可能正在填表单）。
-pub fn execute(plan: &Plan, restart: bool, force: bool, urls_requested: bool) -> Result<Executed> {
+pub fn execute(
+    plan: &Plan,
+    restart: bool,
+    force: bool,
+    urls_requested: bool,
+) -> Result<Executed, LaunchFail> {
     let mut skipped_pids = Vec::new();
     if restart && !plan.running.is_empty() {
-        skipped_pids = close_instances(plan.kind, &plan.running, force)?;
+        skipped_pids = close_instances(plan.kind, &plan.running, force)
+            .map_err(|err| LaunchFail::new(LaunchFailKind::CloseFailed, err))?;
     }
-    let child = spawn_detached(plan)?;
+    let child =
+        spawn_detached(plan).map_err(|err| LaunchFail::new(LaunchFailKind::SpawnFailed, err))?;
     let pid = child.id();
 
     // 已有一个同 profile 的实例在跑时，新进程会立刻退出（把 URL 转发过去），
     // 命令行参数**静默失效** —— 这正是最容易被误判成「已经加上了开关」的情况。
-    std::thread::sleep(Duration::from_millis(900));
-    let running =
-        instances(plan.kind).context("启动后无法确认浏览器进程状态（枚举失败，不能假装成功）")?;
+    std::thread::sleep(launch_settle());
+    let running = instances(plan.kind)
+        .context("启动后无法确认浏览器进程状态（枚举失败，不能假装成功）")
+        .map_err(|err| LaunchFail::new(LaunchFailKind::EnumFailed, err))?;
     let alive = running.iter().any(|item| item.pid == pid);
     if !alive {
         // 旧实例本来就带静默开关：新进程把 URL 转过去后退出，这是成功的转发，
@@ -262,8 +355,11 @@ pub fn execute(plan: &Plan, restart: bool, force: bool, urls_requested: bool) ->
         } else {
             "新进程立刻退出：同一 profile 已经有一个实例在跑，启动参数没有生效"
         };
-        return Err(anyhow!(
-            "{hint}。Chrome 只在进程启动时读命令行参数，要生效必须先退出已有窗口（或加 --restart）"
+        return Err(LaunchFail::new(
+            LaunchFailKind::ParamsNotEffective,
+            anyhow!(
+                "{hint}。Chrome 只在进程启动时读命令行参数，要生效必须先退出已有窗口（或加 --restart）"
+            ),
         ));
     }
     Ok(Executed {
@@ -406,12 +502,38 @@ pub fn run(req: &Request) -> serde_json::Value {
                 "elapsed_ms": started.elapsed().as_millis() as u64,
             }
         }),
-        Err(err) => json!({
-            "ok": false,
-            "error": err.to_string(),
-            "error_code": "launch_failed",
-            "hint": "确认这个 profile 里装了 ATB 扩展；只想看计划可以加 --dry-run",
-        }),
+        Err(fail) => {
+            // 按失败类别给「下一步做什么」。三种失败都可能发生在浏览器
+            // 已经启动之后：枚举超时/新进程秒退时旧实例往往还在跑，所以提示里必须
+            // 包含「先 stop / 检查实例」，否则用户会反复重试并把同一 profile 越搞越乱。
+            let hint = match fail.kind {
+                LaunchFailKind::CloseFailed => {
+                    "旧实例没有退出，启动参数没有生效。先 `atb stop` 停掉 daemon，检查任务管理器里是否还有该 profile 的浏览器；必要时加 --force 或手动关闭窗口后再试"
+                }
+                LaunchFailKind::SpawnFailed => {
+                    "浏览器进程没有成功启动。先 `atb stop` 或检查任务管理器，确认没有残留的同 profile 实例；再核对 exe 路径（ATB_BROWSER_EXE）与执行权限"
+                }
+                LaunchFailKind::EnumFailed => {
+                    "无法确认浏览器进程状态（枚举命令失败或超时）。浏览器可能已经启动：先 `atb stop` 或检查任务管理器，排除残留实例后再重试"
+                }
+                LaunchFailKind::ParamsNotEffective => {
+                    "浏览器可能已经在运行（新进程把请求转发给旧实例后退出）。先 `atb stop` 或关闭该 profile 的窗口，再用 --restart；并确认这个 profile 里装了 ATB 扩展"
+                }
+            };
+            json!({
+                "ok": false,
+                "error": fail.to_string(),
+                "error_code": "launch_failed",
+                "reason": fail.kind.as_str(),
+                "hint": hint,
+                "result": {
+                    "browser": plan.kind.name(),
+                    "exe": plan.exe.display().to_string(),
+                    "user_data_dir": plan.user_data_dir.display().to_string(),
+                    "running_pids": running_pids,
+                }
+            })
+        }
     }
 }
 
@@ -516,9 +638,21 @@ fn validate_browser_exe(path: &Path) -> Result<()> {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        // metadata() 会跟随符号链接，所以这里看到的是真实文件的权限。
-        if metadata.permissions().mode() & 0o111 == 0 {
+        use std::os::unix::ffi::OsStrExt;
+        // `access(X_OK)` 用**当前进程的真实 uid/gid** 判断，比「任意一个执行位」准确：
+        // 0644 root 文件、或 ACL 允许但 mode 位不匹配的文件，旧判定会给出相反结论
+        // 。拿不到 C 字符串时退回 mode 位近似。
+        let executable = match std::ffi::CString::new(path.as_os_str().as_bytes()) {
+            Ok(value) => {
+                // SAFETY: `value` 以 NUL 结尾且在调用期间存活。
+                unsafe { libc::access(value.as_ptr(), libc::X_OK) == 0 }
+            }
+            Err(_) => {
+                use std::os::unix::fs::PermissionsExt;
+                metadata.permissions().mode() & 0o111 != 0
+            }
+        };
+        if !executable {
             return Err(anyhow!(
                 "ATB_BROWSER_EXE 没有可执行权限（not_executable）: {}；先 chmod +x 再试",
                 path.display()
@@ -578,6 +712,16 @@ pub fn resolve_exe(kind: Kind) -> Result<PathBuf> {
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
+        // WSL 下 `which` 找到的是 Linux 侧浏览器（通常没装），用户真正想用的是
+        // Windows 侧那个（`/mnt/c/...`）。先探测挂载点，再退回 which。
+        if is_wsl() {
+            for candidate in wsl_browser_candidates(kind) {
+                tried.push(candidate.display().to_string());
+                if candidate.is_file() {
+                    return Ok(candidate);
+                }
+            }
+        }
         let names: &[&str] = match kind {
             Kind::Chrome => &["google-chrome", "google-chrome-stable"],
             Kind::Edge => &["microsoft-edge", "microsoft-edge-stable"],
@@ -587,11 +731,12 @@ pub fn resolve_exe(kind: Kind) -> Result<PathBuf> {
             tried.push((*name).to_string());
             let mut command = Command::new("which");
             command.arg(name);
-            if let Some(output) = run_with_timeout(&mut command, COMMAND_TIMEOUT) {
+            if let Some(output) = run_with_timeout(&mut command, command_timeout()) {
                 if output.status.success() {
-                    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                    if !path.is_empty() {
-                        return Ok(PathBuf::from(path));
+                    // 不再 `from_utf8_lossy`：非 UTF-8 路径会被替换成 U+FFFD，随后
+                    // spawn 必然报「文件不存在」，错误位置远离真实原因。
+                    if let Some(path) = path_from_which_output(&output.stdout) {
+                        return Ok(path);
                     }
                 }
             }
@@ -606,6 +751,80 @@ pub fn resolve_exe(kind: Kind) -> Result<PathBuf> {
             tried.join(" / ")
         }
     ))
+}
+
+/// 是否运行在 WSL 里（`/proc/version` 含有 microsoft 标记）。
+#[cfg(all(unix, not(target_os = "macos")))]
+fn is_wsl() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/version")
+            .map(|text| text.to_ascii_lowercase().contains("microsoft"))
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// WSL 里 Windows 浏览器的常见安装位置（`/mnt/c/...`）。
+///
+/// 顺序：Program Files → Program Files (x86) → 当前用户/其它用户的
+/// `AppData\Local`。WSL 的 `$USER` 与 Windows 用户名经常不同，所以除了按环境变量
+/// 猜一次，还会枚举 `/mnt/c/Users/*`（只读目录，失败就跳过）。
+#[cfg(all(unix, not(target_os = "macos")))]
+fn wsl_browser_candidates(kind: Kind) -> Vec<PathBuf> {
+    let relative = match kind {
+        Kind::Chrome => "Google/Chrome/Application/chrome.exe",
+        Kind::Edge => "Microsoft/Edge/Application/msedge.exe",
+        Kind::Chromium => "Chromium/Application/chrome.exe",
+    };
+    let mut bases = vec![
+        PathBuf::from("/mnt/c/Program Files"),
+        PathBuf::from("/mnt/c/Program Files (x86)"),
+    ];
+    let mut users: Vec<PathBuf> = Vec::new();
+    if let Some(name) = env::var_os("USER").or_else(|| env::var_os("USERNAME")) {
+        users.push(Path::new("/mnt/c/Users").join(name));
+    }
+    if let Ok(entries) = std::fs::read_dir("/mnt/c/Users") {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !users.contains(&path) {
+                users.push(path);
+            }
+        }
+    }
+    for user in users {
+        bases.push(user.join("AppData/Local"));
+    }
+    bases.into_iter().map(|base| base.join(relative)).collect()
+}
+
+/// 把 `which` 的原始 stdout 转成 PathBuf，全程不经过 UTF-8。
+///
+/// 旧实现 `String::from_utf8_lossy` 会把非 UTF-8 字节替换成 U+FFFD，得到的路径
+/// 一定不存在。这里只取第一行并裁掉首尾 ASCII 空白。
+#[cfg(all(unix, not(target_os = "macos")))]
+fn path_from_which_output(stdout: &[u8]) -> Option<PathBuf> {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let line_end = stdout
+        .iter()
+        .position(|byte| *byte == b'\n' || *byte == b'\r')
+        .unwrap_or(stdout.len());
+    let line = &stdout[..line_end];
+    let start = line.iter().position(|byte| !byte.is_ascii_whitespace())?;
+    let end = line
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map(|index| index + 1)?;
+    if start >= end {
+        return None;
+    }
+    Some(PathBuf::from(OsStr::from_bytes(&line[start..end])))
 }
 
 /// 该浏览器的默认用户数据目录（Profile 的上一层）。
@@ -660,7 +879,7 @@ fn absolutize(path: &Path) -> Result<PathBuf> {
 /// 去掉尾部分隔符、`.` / `..`，方便做路径比较（Windows 上还要忽略大小写）。
 ///
 /// 栈空时遇到 `..` **必须保留**：`..\profile` 与 `profile` 是两个不同目录，旧实现
-/// 直接 `pop()` 会把前者悄悄变成后者（R1-05）。
+/// 直接 `pop` 会把前者悄悄变成后者。
 fn normalize(path: &Path) -> PathBuf {
     use std::path::Component;
     let mut out = PathBuf::new();
@@ -693,12 +912,15 @@ fn normalize(path: &Path) -> PathBuf {
 fn same_dir(a: &str, b: &Path) -> bool {
     let left = normalize(Path::new(a));
     let right = normalize(b);
-    #[cfg(target_os = "windows")]
+    // Windows 与 macOS 的默认文件系统都大小写不敏感（NTFS / APFS），只按字节比较会
+    // 把 `C:/Prof` 与 `C:/prof` 当成两个目录 → 漏判实例冲突。Linux 保留
+    // 精确比较（ext4 默认大小写敏感）。
+    #[cfg(any(windows, target_os = "macos"))]
     {
         left.to_string_lossy()
             .eq_ignore_ascii_case(&right.to_string_lossy())
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         left == right
     }
@@ -801,11 +1023,11 @@ fn instances_windows(kind: Kind) -> Result<Vec<Instance>> {
     command
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .creation_flags_no_window();
-    // 5s 超时：WMI 卡住时宁可如实报「查不到」，也不能让启动流程无限期挂着（R1-06）。
-    let Some(output) = run_with_timeout(&mut command, COMMAND_TIMEOUT) else {
+    // 超时：WMI 卡住时宁可如实报「查不到」，也不能让启动流程无限期挂着。
+    let Some(output) = run_with_timeout(&mut command, command_timeout()) else {
         return Err(anyhow!(
-            "枚举浏览器进程超时（powershell 超过 {}s 没有返回）。无法确认是否已有实例在跑，不能盲目启动",
-            COMMAND_TIMEOUT.as_secs()
+            "枚举浏览器进程超时（powershell 超过 {:?} 没有返回，ATB_PROC_CMD_TIMEOUT_MS 可调）。无法确认是否已有实例在跑，不能盲目启动",
+            command_timeout()
         ));
     };
     // PowerShell 失败时 stdout 一般是空的。旧实现只读 stdout，于是把「查询失败」
@@ -839,10 +1061,10 @@ fn instances_windows(kind: Kind) -> Result<Vec<Instance>> {
 fn instances_unix(kind: Kind) -> Result<Vec<Instance>> {
     let mut command = Command::new("ps");
     command.args(["-ax", "-o", "pid=,command="]);
-    let Some(output) = run_with_timeout(&mut command, COMMAND_TIMEOUT) else {
+    let Some(output) = run_with_timeout(&mut command, command_timeout()) else {
         return Err(anyhow!(
-            "枚举浏览器进程超时（ps 超过 {}s 没有返回）。无法确认是否已有实例在跑，不能盲目启动",
-            COMMAND_TIMEOUT.as_secs()
+            "枚举浏览器进程超时（ps 超过 {:?} 没有返回，ATB_PROC_CMD_TIMEOUT_MS 可调）。无法确认是否已有实例在跑，不能盲目启动",
+            command_timeout()
         ));
     };
     let text = String::from_utf8_lossy(&output.stdout);
@@ -1003,7 +1225,7 @@ fn close_instances(kind: Kind, targets: &[Instance], force: bool) -> Result<Vec<
     let _ = signal_close(kind, &live, false);
     // Chrome 在 Windows 上会忽略 WM_CLOSE（实测：`taskkill /PID` 报「已发送终止信号」，
     // 进程照样活着）。所以先给 3s 的温和窗口，再按调用方是否给了 --force 决定下一步。
-    if wait_gone(kind, &live, Duration::from_secs(3))? {
+    if wait_gone(kind, &live, close_wait_budget())? {
         return Ok(skipped);
     }
     if !force {
@@ -1016,9 +1238,9 @@ fn close_instances(kind: Kind, targets: &[Instance], force: bool) -> Result<Vec<
         ));
     }
     // 强杀：从上面那次核对到这里已经过去几秒，PID 更可能被复用。`signal_close` 会在
-    // 每个 `/F` 之前**再核一次**身份，临杀前发现不是那个浏览器的直接跳过（R1-03）。
+    // 每个 `/F` 之前**再核一次**身份，临杀前发现不是那个浏览器的直接跳过。
     skipped.extend(signal_close(kind, &live, true));
-    if wait_gone(kind, &live, Duration::from_secs(8))? {
+    if wait_gone(kind, &live, kill_wait_budget())? {
         return Ok(skipped);
     }
     let alive = count_alive(kind, &live)?;
@@ -1047,7 +1269,7 @@ fn reused_hint(skipped: &[u32]) -> String {
 /// 按「这个 PID 现在还是不是那个浏览器实例」把目标分成可操作 / 需跳过两组。
 ///
 /// 一次枚举就够了：`instances()` 已经按映像名筛过，再比对命令行里的
-/// `--user-data-dir`，不必每个 PID 起一个 tasklist/powershell（R1-06）。
+/// `--user-data-dir`，不必每个 PID 起一个 tasklist/powershell。
 /// 枚举失败时按「全都不是它」处理：宁可跳过、不杀，也不能误杀。
 fn split_by_identity(kind: Kind, targets: &[Instance]) -> (Vec<Instance>, Vec<u32>) {
     let running = instances(kind).unwrap_or_default();
@@ -1069,7 +1291,7 @@ fn split_by_identity(kind: Kind, targets: &[Instance]) -> (Vec<Instance>, Vec<u3
 /// 同一个实例的判定：PID 相同只是必要条件，命令行里的 `--user-data-dir` 也必须一致。
 ///
 /// 原实例带 profile 参数、现在这个 PID 的命令行却没有（或指向别的目录），说明 PID
-/// 已经被系统回收给别的进程，应当当作「已经退出」（R1-04）。
+/// 已经被系统回收给别的进程，应当当作「已经退出」。
 fn same_instance_command(expected: &str, actual: &str) -> bool {
     let Some(expected_dir) = flag_value(expected, "--user-data-dir") else {
         // 原实例本来就用默认目录，命令行里没有可比对的锚点，只能按 PID 认。
@@ -1097,7 +1319,7 @@ fn process_command_line(pid: u32) -> Option<String> {
     command
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .creation_flags_no_window();
-    let output = run_with_timeout(&mut command, COMMAND_TIMEOUT)?;
+    let output = run_with_timeout(&mut command, command_timeout())?;
     if !output.status.success() {
         return None;
     }
@@ -1117,7 +1339,7 @@ fn process_image_is_browser(kind: Kind, pid: u32) -> bool {
     command
         .args(["/FI", &filter, "/FO", "CSV", "/NH"])
         .creation_flags_no_window();
-    let Some(output) = run_with_timeout(&mut command, COMMAND_TIMEOUT) else {
+    let Some(output) = run_with_timeout(&mut command, command_timeout()) else {
         return false;
     };
     if !output.status.success() {
@@ -1131,7 +1353,7 @@ fn process_image_is_browser(kind: Kind, pid: u32) -> bool {
 /// 发信号前的身份核对：PID 可能已经被别的进程复用。
 ///
 /// 除了映像名，还要比对命令行里的 `--user-data-dir`：同机可能同时开着 Chrome 与
-/// Edge、或同一个浏览器的两个 profile，只看进程名不足以确认「还是不是它」（R1-03）。
+/// Edge、或同一个浏览器的两个 profile，只看进程名不足以确认「还是不是它」。
 #[cfg(target_os = "windows")]
 fn process_is_browser(kind: Kind, instance: &Instance) -> bool {
     match process_command_line(instance.pid) {
@@ -1166,7 +1388,7 @@ fn process_is_browser(kind: Kind, instance: &Instance) -> bool {
 fn process_is_browser(kind: Kind, instance: &Instance) -> bool {
     let mut command = Command::new("ps");
     command.args(["-o", "args=", "-p", &instance.pid.to_string()]);
-    let Some(output) = run_with_timeout(&mut command, COMMAND_TIMEOUT) else {
+    let Some(output) = run_with_timeout(&mut command, command_timeout()) else {
         return false;
     };
     if !output.status.success() {
@@ -1183,7 +1405,7 @@ fn process_is_browser(kind: Kind, instance: &Instance) -> bool {
 ///
 /// 强杀（`/F` 或 SIGKILL）不可撤销，所以每个 PID 在动手前都**再核一次身份**：从
 /// `close_instances` 最初那次核对到这一刻可能已经过去好几秒，PID 完全可能被回收。
-/// 返回临杀前发现「已经不是这个浏览器」而跳过的 PID（R1-03）。
+/// 返回临杀前发现「已经不是这个浏览器」而跳过的 PID。
 fn signal_close(kind: Kind, targets: &[Instance], force: bool) -> Vec<u32> {
     let mut skipped = Vec::new();
     for item in targets {
@@ -1201,14 +1423,14 @@ fn signal_close(kind: Kind, targets: &[Instance], force: bool) -> Vec<u32> {
             } else {
                 command.args(["/PID", &pid]);
             }
-            let _ = run_with_timeout(&mut command, COMMAND_TIMEOUT);
+            let _ = run_with_timeout(&mut command, command_timeout());
         }
         #[cfg(not(target_os = "windows"))]
         {
             let signal = if force { "-KILL" } else { "-TERM" };
             let mut command = Command::new("kill");
             command.args([signal, &item.pid.to_string()]);
-            let _ = run_with_timeout(&mut command, COMMAND_TIMEOUT);
+            let _ = run_with_timeout(&mut command, command_timeout());
         }
     }
     skipped
@@ -1219,7 +1441,7 @@ fn count_alive(kind: Kind, targets: &[Instance]) -> Result<usize> {
     Ok(count_alive_in(&instances(kind)?, targets))
 }
 
-/// 在一份已有的枚举结果里比对，避免为每个目标重复启动枚举进程（R1-06）。
+/// 在一份已有的枚举结果里比对，避免为每个目标重复启动枚举进程。
 fn count_alive_in(running: &[Instance], targets: &[Instance]) -> usize {
     running
         .iter()
@@ -1236,7 +1458,7 @@ fn wait_gone(kind: Kind, targets: &[Instance], budget: Duration) -> Result<bool>
     let deadline = Instant::now() + budget;
     loop {
         // 一轮只枚举一次：PowerShell 冷启动本身就要几百毫秒，之前每 200ms 全量枚举
-        // 一次既拖慢关闭，也让轮询频率形同虚设（R1-06）。
+        // 一次既拖慢关闭，也让轮询频率形同虚设。
         let running = instances(kind)?;
         if count_alive_in(&running, targets) == 0 {
             return Ok(true);
@@ -1244,7 +1466,7 @@ fn wait_gone(kind: Kind, targets: &[Instance], budget: Duration) -> Result<bool>
         if Instant::now() >= deadline {
             return Ok(false);
         }
-        std::thread::sleep(Duration::from_millis(500));
+        std::thread::sleep(close_poll_interval());
     }
 }
 
@@ -1267,7 +1489,7 @@ mod tests {
 
     #[test]
     fn normalize_keeps_leading_parent_dir() {
-        // `..\x` 与 `x` 是两个不同目录，不能被折叠成同一个（R1-05）。
+        // `..\x` 与 `x` 是两个不同目录，不能被折叠成同一个。
         let normalized = normalize(Path::new("../x"));
         assert!(
             normalized.to_string_lossy().starts_with(".."),
@@ -1292,7 +1514,7 @@ mod tests {
         let original = r#""chrome.exe" --user-data-dir=C:/prof/a --no-first-run"#;
         let same = r#""chrome.exe" --user-data-dir=C:/prof/a --restore-last-session"#;
         let other = r#""chrome.exe" --user-data-dir=C:/prof/b --no-first-run"#;
-        // PID 被复用给「同一个 exe、但没有 profile 参数」的进程：视为已退出（R1-04）。
+        // PID 被复用给「同一个 exe、但没有 profile 参数」的进程：视为已退出。
         let without_profile = r#""chrome.exe" --no-first-run"#;
         assert!(same_instance_command(original, same));
         assert!(!same_instance_command(original, other));
@@ -1355,8 +1577,8 @@ mod tests {
 
     #[test]
     fn uses_dir_honors_explicit_flag() {
-        let dir = Path::new("E://workbuddyspace//lprof");
-        let command = r#""chrome.exe" --user-data-dir=E:/workbuddyspace/lprof --no-first-run"#;
+        let dir = Path::new("C://Profiles//lprof");
+        let command = r#""chrome.exe" --user-data-dir=C:/Profiles/lprof --no-first-run"#;
         assert!(uses_dir(command, dir, Some(Path::new("C://default"))));
         let other = r#""chrome.exe" --user-data-dir=E:/another --no-first-run"#;
         assert!(!uses_dir(other, dir, None));
@@ -1433,6 +1655,30 @@ mod tests {
         // resolve_exe 打开的是 `Chromium\Application\chrome.exe`，进程名必须一致，
         // 否则 instances() 永远为空（P3）。
         assert_eq!(Kind::Chromium.process_name(), "chrome.exe");
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn same_dir_is_case_insensitive_on_default_filesystems() {
+        // NTFS / 默认 APFS 都大小写不敏感：`C:/Prof` 与 `C:/prof` 是同一个目录，
+        // 漏判会导致实例冲突检测失败。
+        assert!(same_dir(
+            "C:/Prof/User Data",
+            Path::new("c:/prof/user data")
+        ));
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn which_output_keeps_non_utf8_paths() {
+        // 非 UTF-8 字节不能被替换成 U+FFFD，否则返回的路径一定不存在。
+        let mut raw = b"/opt/chr".to_vec();
+        raw.push(0xFF);
+        raw.extend_from_slice(b"ome\n");
+        let path = path_from_which_output(&raw).expect("path");
+        use std::os::unix::ffi::OsStrExt;
+        assert_eq!(path.as_os_str().as_bytes(), b"/opt/chr\xFFome");
+        assert!(path_from_which_output(b"  \n").is_none());
     }
 
     #[test]

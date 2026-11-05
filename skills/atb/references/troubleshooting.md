@@ -15,6 +15,7 @@
 | 下载停在 `interrupted` | 磁盘与浏览器下载设置 | 9 |
 | 两个智能体互相看到对方页面 | 身份与 `--tab` | 10 |
 | 其它 | 日志 | 11 |
+| `wait_js_failed` / `outcome_unknown` / `ws_backpressure` 等新码 | 错误码含义与处置 | 12 |
 
 ## 1. daemon 没起来
 
@@ -36,7 +37,7 @@
 
 ## 4. 协议或版本不配套
 
-**症状**：`CLI 与 daemon 版本不配套`、`extension_outdated`、`upgrade_recommended:true`、`stealth` 返回 `extension_ok:false`。**判断**：三方须配套：API 协议 `5`、扩展消息协议 `4`、扩展文件版本 `5.2.9`。不配套时命令明确报错，不会静默跑错。
+**症状**：`CLI 与 daemon 版本不配套`、`extension_outdated`、`upgrade_recommended:true`、`stealth` 返回 `extension_ok:false`。**判断**：三方须配套：API 协议 `5`、扩展消息协议 `4`、扩展文件版本 `5.3.0`。不配套时命令明确报错，不会静默跑错。
 
 | 现象 | 原因 | 处理 |
 | --- | --- | --- |
@@ -151,11 +152,13 @@ ATB_AGENT=reviewer atb cleanup --dry-run
 日志固定在 `~/.atb/logs/daemon.log`：
 
 ```bash
-atb logs              # 最近 100 行纯文本
+atb logs              # JSON：{ok, lines[], path, truncated}
 atb logs --tail 300
+atb logs --tail 300 | jq -r '.lines[]'        # 纯行文本
+atb logs --tail 300 | jq '.lines[] | select(test("attach|handshake"))'
 ```
 
-`logs` 不支持 `--follow`，也不返回 JSON。重点找 attach/detach 失败、端口监听、扩展握手与版本拒绝。
+`logs` 现在返回结构化 JSON，不再逐行裸写 stdout；`--follow` 仍不支持。拿行用 `.lines[]`，`truncated:true` 表示 tail 到上限被截断。重点找 attach/detach 失败、端口监听、扩展握手与版本拒绝。
 
 Chrome 顶部出现「正在控制你的浏览器」通常正常：执行 CDP 命令时 attach，命令结束或 daemon 退出时 detach。只有命令同时失败或日志报错时才继续排查。
 
@@ -187,3 +190,14 @@ atb install-skill
 cp -r skills/atb/. ~/.workbuddy/skills/atb/
 atb schema --json
 ```
+
+## 12. 新增错误码（0.7.2）
+
+| 错误码 | 症状 | 判断 | 处理 |
+| --- | --- | --- | --- |
+| `wait_js_failed` | `exec --wait-js` 返回 `ok:false`，但脚本已经执行 | 等待条件没满足；`js_return` 里可能已有结果，`wait.ok=false` / `matched=false` | 按失败处理，不要当成功继续；加 `--wait-timeout`、改谓词（保持轻量），或先 `wait` 再取结果 |
+| `challenge_probe_failed` | `challenge status/detect` 返回 `probed:false`、`status_usable:false` | 挑战探测拿不到可用载荷：扩展断连、注入被拒、或页面已导航 | 重试一次；持续失败看 `diag.errors`、`atb doctor`，**不要**当成「没有挑战」继续操作 |
+| `host_not_allowed` | CLI 连 daemon 返回 403 | 请求的 `Host` 不是 `127.0.0.1` / `localhost` / `[::1]` | 用回环地址访问；不要用局域网 IP、自定义域名或反代主机名 |
+| `ws_backpressure` | 命令偶发失败，扩展侧卡顿 | 目前只把 pong 控制通道改成有界（`ATB_WS_OUTBOUND_MAX`），命令通道仍是 `unbounded`，所以该错误码目前是**预留**，正常不会出现 | 偶发卡顿等几秒重试；持续出现重载扩展或 `atb restart`；大量并发改用 `batch` 控制并发 |
+| `outcome_unknown` | 退出码 4，`outcome_unknown:true` | 请求已发出但响应丢失（超时/断连），动作**可能已执行** | 带同一个 `--idempotency-key` 重发；不要换 key 重试副作用命令；先 `status` 看会话是否还活着 |
+| `agent_no_default` | `target_lost`，`reason:"agent_no_default"` | `ATB_SESSION_ISOLATION=strict`，具名 agent 没有自己的默认目标 | 先 `atb open <url>` 建默认；或临时改回 `legacy`（`ATB_SESSION_ISOLATION=legacy`） |

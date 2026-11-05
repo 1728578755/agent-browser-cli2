@@ -24,7 +24,9 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 const HOST: &str = "127.0.0.1";
-const PORT: u16 = 18767;
+/// API 端口只有一个真相：`config::CLI_API_PORT`。
+/// 以前这里的字面量与 config 各自维护，改端口时容易只改一处。
+pub(crate) const PORT: u16 = config::CLI_API_PORT;
 
 /// 默认 compact 输出（省 token），`--pretty` 时才缩进。
 static PRETTY_OUTPUT: AtomicBool = AtomicBool::new(false);
@@ -230,7 +232,9 @@ fn reject_dry_run_if_unsupported(command: &CommandKind) -> Result<()> {
             _ => return Ok(()),
         },
         CommandKind::Download(_) => "download",
-        CommandKind::Broadcast(_) => "broadcast",
+        // `broadcast --dry-run` 已由 `cmd_io::run_broadcast` 实现本地计划
+        // （只解析 op/args 并输出将要广播的内容，不拉 daemon、不碰页面），
+        // 不能再在这里 exit 2 把它的 dry-run 挡掉。
         CommandKind::ProfileLabel(_) => "profile-label",
         // `launch` 会真正启动/重启浏览器（`--restart` 还会关掉现有实例），
         // 与 `--dry-run` 的「不做动作」承诺直接冲突，一并拒绝。
@@ -265,6 +269,10 @@ fn reject_async_if_unsupported(command: &CommandKind, is_async: bool) -> Result<
         CommandKind::Logs(_) => "logs",
         // net 各子动作都没有 job 实现，统一在分发层拒绝。
         CommandKind::Net(_) => "net",
+        // 这两条命令既不接收也不实现 --async。以前落到 `_ => Ok()`，
+        // 全局 flag 被静默吞掉：调用方以为拿到了 job_id，实际拿到的是同步结果。
+        CommandKind::InstallSkill(_) => "install-skill",
+        CommandKind::TrustExtension(_) => "trust-extension",
         _ => return Ok(()),
     };
     reject_async_if_set(name, is_async)

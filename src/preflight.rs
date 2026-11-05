@@ -342,7 +342,7 @@ pub fn validate_js(code: &str) -> Result<(), Problem> {
     let mut regex_start = 0usize;
     // 前一个有效 token 是不是闭合括号（`}` / `]` / `)`）。闭合括号之后的 `/` 既可能
     // 是除号（`(a+b)/2`），也可能是「语句块结束后新起的正则」（`{a:1}\n/[)]/`），
-    // 需要向前看才能分清（R1-09）。
+    // 需要向前看才能分清。
     let mut last_closed_bracket = false;
 
     while index < chars.len() {
@@ -454,7 +454,7 @@ pub fn validate_js(code: &str) -> Result<(), Problem> {
                     } else if just_closed && regex_has_terminator(&chars, index + 1) {
                         // `}` / `]` / `)` 之后紧跟 `/`：同一行后面还有未转义的 `/` 时
                         // 按正则处理（`{a:1}\n/[)]/.test(x)`），否则按除号处理
-                        // （`(a+b) / 2`）——两者在浏览器里都合法，必须靠向前看区分（R1-09）。
+                        // （`(a+b) / 2`）——两者在浏览器里都合法，必须靠向前看区分。
                         mode = Mode::Regex;
                         regex_in_class = false;
                         regex_start = index;
@@ -634,14 +634,20 @@ pub fn validate_js(code: &str) -> Result<(), Problem> {
     Ok(())
 }
 
-/// `start` 之后（同一行内）是否存在未转义的 `/`，也就是「这里能不能是一个完整的
-/// 正则字面量」。
+/// `start` 之后（同一行内）是否存在未转义的 `/`，并且这个 `/` 之前没有未闭合的
+/// `(` / `{`。也就是「这里能不能是一个完整的正则字面量」。
 ///
 /// 正则字面量不能跨行，所以「同一行没有结尾 `/`」就说明这里更可能是除号
-/// （`(a+b) / 2`）。扫描时跳过字符类 `[...]` 和转义字符（R1-09）。
+/// （`(a+b) / 2`）。扫描时跳过字符类 `[...]` 和转义字符。
+///
+/// 括号深度是收紧：`count(a) / (total / 100)` 里，`)` 后第一个 `/`
+/// 后面紧跟着未闭合的 `(`，里面的 `/` 不是正则的结尾而是除号；旧实现把它当正则
+/// 起始，最终报「多了一个 `)`」。`{` 同理（`{a:1} / {b:2}`）。字符类里的括号
+/// 不参与深度（`/[(]/` 仍然能正确识别为正则）。
 fn regex_has_terminator(chars: &[char], start: usize) -> bool {
     let mut escaped = false;
     let mut in_class = false;
+    let mut depth = 0usize;
     for &ch in chars.get(start..).unwrap_or(&[]) {
         if escaped {
             escaped = false;
@@ -652,7 +658,9 @@ fn regex_has_terminator(chars: &[char], start: usize) -> bool {
             '\n' | '\r' => return false,
             '[' if !in_class => in_class = true,
             ']' if in_class => in_class = false,
-            '/' if !in_class => return true,
+            '(' | '{' if !in_class => depth += 1,
+            ')' | '}' if !in_class => depth = depth.saturating_sub(1),
+            '/' if !in_class => return depth == 0,
             _ => {}
         }
     }
@@ -733,7 +741,7 @@ pub const TIMEOUT_MAX_SECONDS: f64 = 3600.0;
 ///
 /// 非有限值（NaN/Inf）按最小值处理：宁可立刻超时并报错，也不要让命令静默挂一小时。
 // 旧注释声称 daemon 侧尚未接入，实际 server/state.rs 的 secs() 与 cli/http.rs 的 secs()
-// 都已走本函数，过期的 allow(dead_code) 已删除。
+// 都已走本函数（v8 修复），过期的 allow(dead_code) 连同该注释一并删除。
 pub fn clamp_timeout_seconds(value: f64) -> f64 {
     if !value.is_finite() {
         return TIMEOUT_MIN_SECONDS;
@@ -743,7 +751,7 @@ pub fn clamp_timeout_seconds(value: f64) -> f64 {
 
 /// 这个超时值是否会被 `clamp_timeout_seconds` 改动（调用方可在结果里带
 /// `timeout_clamped: true`）。
-/// 仅测试使用：判断超时值是否会被 `clamp_timeout_seconds` 改动。
+// 目前仅单元测试使用（生产路径尚未回报「参数被收敛过」），因此只在 test 编译下存在。
 #[cfg(test)]
 pub fn timeout_clamped(value: f64) -> bool {
     clamp_timeout_seconds(value).to_bits() != value.to_bits()
@@ -878,7 +886,7 @@ mod tests {
     #[test]
     fn js_regex_after_closing_bracket_is_not_division() {
         // 语句块 / 数组下标结束后新起正则：旧状态机把 `/` 一律当除号，字符类里的
-        // `)` / `}` 于是被当成多余括号，报 invalid_js（R1-09）。
+        // `)` / `}` 于是被当成多余括号，报 invalid_js。
         for code in [
             "{a:1}\n/[)]/.test(x)",
             "if (a) { b(); }\n/[}]/.test(s)",
@@ -890,6 +898,12 @@ mod tests {
         assert!(validate_js("return (a + b) / 2").is_ok());
         assert!(validate_js("const x = (a) / 2; return x;").is_ok());
         assert!(validate_js("x = a / b; /re/.test(s)").is_ok());
+        // 除号后面是括号表达式时，括号里的 `/` 不是正则终止符。
+        assert!(validate_js("return count(a) / (total / 100)").is_ok());
+        assert!(validate_js("const ratio = (a + b) / (c / d); return ratio;").is_ok());
+        assert!(validate_js("return (a) / ({x: 1}.x / 2)").is_ok());
+        // 但 `x = /re/.test(s)` 仍然是正则字面量，不能被当成除号。
+        assert!(validate_js("x = /re/.test(s)").is_ok());
     }
 
     #[test]
@@ -992,7 +1006,7 @@ const NUMERIC_FIELDS: &[(&str, f64, f64)] = &[
     ("x", 0.0, 100_000.0),
     ("y", 0.0, 100_000.0),
     // 计数 / 字节类的 usize 参数：JSON 里是整数，但同样可能被写成 1e300 / NaN。
-    // 上限取「正常用得到、又不会把内存吃光」的数量级，不要压过合法取值（R1-10）。
+    // 上限取「正常用得到、又不会把内存吃光」的数量级，不要压过合法取值。
     ("limit", 0.0, 1_000_000.0),
     ("max_nodes", 0.0, 1_000_000.0),
     ("max_chars", 0.0, 10_000_000.0),
@@ -1002,7 +1016,7 @@ const NUMERIC_FIELDS: &[(&str, f64, f64)] = &[
 /// 顶层、`params` / `args` 以及 `steps[*]` 里的数值字段都要查。
 ///
 /// 动作类命令把坐标/滚动量放在 `params` 里；batch / run 把每一步的参数放在
-/// `steps[*].args`，只查顶层会漏掉整条管道里的非法超时（R1-10）。
+/// `steps[*].args`，只查顶层会漏掉整条管道里的非法超时。
 fn check_numeric_fields(payload: &Value) -> Result<(), Problem> {
     let mut sources: Vec<&Value> = vec![payload];
     for key in ["params", "args"] {
@@ -1056,6 +1070,31 @@ fn check_numeric_fields(payload: &Value) -> Result<(), Problem> {
     Ok(())
 }
 
+/// `exec` 的 script 看起来像扩展控制帧（JSON 对象 + 字符串 `cmd`），但没有通过
+/// `page_data::is_extension_json`（缺 `__atb_internal_cmd:true` 或 cmd 不在白名单）。
+///
+/// 只对含 `cmd` 的 JSON 对象报错，避免把合法的 JS 对象字面量误判；其余 JSON 形状
+/// 仍交给 `validate_js` 按普通 JS 预检。
+fn non_internal_extension_json(script: &str) -> Option<Problem> {
+    let trimmed = script.trim();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    let value: Value = serde_json::from_str(trimmed).ok()?;
+    if !value.is_object() || !value.get("cmd").is_some_and(Value::is_string) {
+        return None;
+    }
+    Some(
+        Problem::new(
+            "invalid_json",
+            "exec 收到的是扩展控制命令 JSON，但缺少 __atb_internal_cmd:true 或 cmd 不在内部白名单内",
+            "扩展控制帧只由 daemon 内部构造；执行 JS 请写普通脚本，要返回对象用 `return ({...})`",
+        )
+        .with_example("atb exec 'return {ok: true}'")
+        .with_field("script"),
+    )
+}
+
 /// 按 op 对已经构造好的 payload 做统一预检。
 ///
 /// 放在 CLI 侧、发请求之前：错的命令不会先打到 daemon 再等一个页面级错误回来。
@@ -1068,18 +1107,20 @@ pub fn preflight_payload(op: &str, payload: &Value) -> Result<(), Problem> {
             .map(str::trim)
             .filter(|value| !value.is_empty())
     };
-    // exec 也接受扩展协议 JSON（{"cmd": ...}），那不是 JS，不能按括号配平检查。
-    let is_extension_json = |text: &str| {
-        let trimmed = text.trim();
-        trimmed.starts_with('{') && serde_json::from_str::<Value>(trimmed).is_ok()
-    };
-
+    // exec 也接受扩展协议 JSON（内部控制帧），但那必须是 daemon 构造的：
+    // 只有带 `__atb_internal_cmd:true` 且 cmd 在内部白名单内才跳过 JS 预检。
+    // 用户脚本里自然写出的 `{"cmd":"status"}` 不再被当成控制命令。
     check_numeric_fields(payload)?;
 
     match op {
         "exec" => {
             if let Some(script) = payload.get("script").and_then(Value::as_str) {
-                if !is_extension_json(script) {
+                if !crate::server::page_data::is_extension_json(script) {
+                    // 形如控制帧、但没通过内部判定：直接给结构化错误，别让它一路
+                    // 走到 daemon 才报「不认识的命令」。
+                    if let Some(problem) = non_internal_extension_json(script) {
+                        return Err(problem);
+                    }
                     validate_js(script)?;
                 }
             }
@@ -1096,6 +1137,11 @@ pub fn preflight_payload(op: &str, payload: &Value) -> Result<(), Problem> {
             }
         }
         "upload" => {
+            // 与 click/fill 等动作保持同一套 target 预检：upload 的
+            // `target` 是文件输入框选择器，写错了同样不该先打到 daemon。
+            if let Some(target) = selector_field("target") {
+                validate_selector(target)?;
+            }
             // 只查绝对路径：daemon 用自己的 cwd 解析相对路径，CLI 侧结论可能不同。
             if let Some(files) = payload.get("files").and_then(Value::as_array) {
                 for file in files.iter().filter_map(Value::as_str) {
@@ -1130,8 +1176,33 @@ mod payload_tests {
     use super::*;
 
     #[test]
-    fn exec_payload_accepts_extension_json() {
+    fn exec_payload_accepts_marked_internal_command() {
+        // 只有 daemon 内部构造（显式标记 + 白名单 cmd）才跳过 JS 预检。
+        let payload = json!({
+            "script": "{\"__atb_internal_cmd\":true,\"cmd\":\"status\"}"
+        });
+        assert!(preflight_payload("exec", &payload).is_ok());
+    }
+
+    #[test]
+    fn exec_payload_rejects_unmarked_control_json() {
+        // 用户脚本 `{"cmd":"status"}` 不再被当成控制帧：CLI 侧提前给结构化错误。
         let payload = json!({ "script": "{\"cmd\":\"status\"}" });
+        let err = preflight_payload("exec", &payload).unwrap_err();
+        assert_eq!(err.code, "invalid_json");
+        assert_eq!(err.field.as_deref(), Some("script"));
+        assert!(!err.hint.is_empty());
+
+        // 标记存在但 cmd 不在白名单：同样拒绝。
+        let payload = json!({
+            "script": "{\"__atb_internal_cmd\":true,\"cmd\":\"rm-everything\"}"
+        });
+        assert_eq!(
+            preflight_payload("exec", &payload).unwrap_err().code,
+            "invalid_json"
+        );
+        // 普通 JS 对象字面量不受影响。
+        let payload = json!({ "script": "return ({ ok: true })" });
         assert!(preflight_payload("exec", &payload).is_ok());
     }
 
@@ -1187,7 +1258,7 @@ mod payload_tests {
 
     #[test]
     fn numeric_fields_inside_steps_are_checked() {
-        // batch / run 的每一步参数都在 steps[*].args 里，只查顶层会整条漏掉（R1-10）。
+        // batch / run 的每一步参数都在 steps[*].args 里，只查顶层会整条漏掉。
         let payload = json!({
             "steps": [
                 { "op": "read", "args": { "timeout": 1e300 } }
@@ -1215,7 +1286,7 @@ mod payload_tests {
 
     #[test]
     fn numeric_count_fields_accept_normal_values() {
-        // 上限定太紧会把合法命令挡在门外：常见取值必须通过（R1-10）。
+        // 上限定太紧会把合法命令挡在门外：常见取值必须通过。
         let payload = json!({
             "limit": 5000,
             "max_nodes": 2000,
@@ -1254,5 +1325,17 @@ mod payload_tests {
         // 相对路径交给 daemon 解析，CLI 侧不预判。
         let relative = json!({ "target": "#file", "files": ["./missing.txt"] });
         assert!(preflight_payload("upload", &relative).is_ok());
+    }
+
+    #[test]
+    fn upload_validates_target_selector() {
+        // upload 与 click/fill 一样会对 target 做选择器预检。
+        let bad = json!({ "target": "input[name=\"q\"", "files": [] });
+        assert_eq!(
+            preflight_payload("upload", &bad).unwrap_err().code,
+            "invalid_selector"
+        );
+        let ok = json!({ "target": "input[type=file]", "files": [] });
+        assert!(preflight_payload("upload", &ok).is_ok());
     }
 }

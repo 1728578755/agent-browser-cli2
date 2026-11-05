@@ -28,7 +28,9 @@ pub(crate) async fn get_html(
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        return Ok(clean_text(&text));
+        // 降级路径也必须再过一次 maxchars —— 页面侧 maxChars 只是请求值，
+        // 老版本扩展 / 文本抽取都可能给回超预算的内容。
+        return Ok(truncate_output(clean_text(&text), maxchars));
     }
     // 十万级页面上，optHTML 的调用开销和 122KB 结果的跨进程传输都要 1~2 秒，
     // 而调用方真正要的是「页面里有什么」：直接走单遍文本抽取。
@@ -60,9 +62,12 @@ pub(crate) async fn get_html(
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        return Ok(format!(
-            "<!-- scan: {element_count} elements > {HUGE_PAGE_ELEMENTS}, returned text instead of HTML (use read / scan --fast) -->\n{}",
-            clean_text(&text)
+        return Ok(truncate_output(
+            format!(
+                "<!-- scan: {element_count} elements > {HUGE_PAGE_ELEMENTS}, returned text instead of HTML (use read / scan --fast) -->\n{}",
+                clean_text(&text)
+            ),
+            maxchars,
         ));
     }
     let opt = html::js_opt_html();
@@ -105,9 +110,12 @@ pub(crate) async fn get_html(
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        return Ok(format!(
-            "<!-- scan: {elements} elements > 60000, returned text instead of HTML (use read / scan --fast) -->\n{}",
-            clean_text(&text)
+        return Ok(truncate_output(
+            format!(
+                "<!-- scan: {elements} elements > 60000, returned text instead of HTML (use read / scan --fast) -->\n{}",
+                clean_text(&text)
+            ),
+            maxchars,
         ));
     }
     page = html::optimize_html_for_tokens(&page);
@@ -116,10 +124,22 @@ pub(crate) async fn get_html(
     // 而不是白跑一次。
     // `maxchars` 是字符预算，`String::len()` 是字节数：中文页按字节比会在远未超预算时
     // 就进 truncate，白跑一次 O(n) 计数（结果不变，纯浪费）。
-    if page.chars().count() > maxchars {
-        page = html::smart_truncate(page, maxchars);
-    }
+    page = truncate_output(page, maxchars);
     Ok(page)
+}
+
+/// 统一的 `maxchars` 二次截断。
+///
+/// 主路径与三条降级路径（text_only / 超大页面 / 页面侧 TOO_LARGE）都走这里，
+/// 避免「只有主路径截断、降级路径原样返回超长内容」。
+/// 截断后的文本以 `[TRUNCATED]` 结尾（由 `html::smart_truncate` 追加），
+/// 消费方（monitor 等）可据此把回包标成 `truncated:true`；
+/// 结果字符数（含标记）不超过 `maxchars`。
+pub(crate) fn truncate_output(text: String, maxchars: usize) -> String {
+    if maxchars == 0 || text.chars().count() <= maxchars {
+        return text;
+    }
+    html::smart_truncate(text, maxchars)
 }
 
 pub(crate) fn clean_text(input: &str) -> String {
@@ -140,13 +160,71 @@ pub(crate) fn clean_text(input: &str) -> String {
     out
 }
 
+/// 内部扩展命令的显式标记。
+///
+/// 只有 daemon 自己构造的控制帧才带这个字段；用户脚本里自然写出的
+/// `{"cmd":"..."}` 不再被当成控制命令（以前会绕过 `wrap_user_script` 直接下发）。
+pub(crate) const INTERNAL_CMD_MARKER: &str = "__atb_internal_cmd";
+
+/// 允许走「内部命令」通道的 cmd 白名单（与 `assets/atb_bridge/background.js`
+/// 的 `handleExtMessage` 分发保持一致；新增扩展命令时两边一起加）。
+const INTERNAL_CMD_WHITELIST: &[&str] = &[
+    "status",
+    "setPort",
+    "setProfileLabel",
+    "setWsToken",
+    "cookies",
+    "cdp",
+    "batch",
+    "captureVisible",
+    "captureFullPage",
+    "blockingExtensions",
+    "openTab",
+    "closeTab",
+    "networkStart",
+    "networkList",
+    "networkDetail",
+    "networkClear",
+    "networkStop",
+    "consoleStart",
+    "consoleList",
+    "consoleClear",
+    "consoleStop",
+    "debugClearAll",
+    "tabs",
+    "inject",
+    "injectProbe",
+    "frames",
+    "downloads",
+    "pageOp",
+    "netIntercept",
+    "selfCheck",
+    "management",
+    "contentSettings",
+    "cancel",
+];
+
+/// 这一段字符串是否是 daemon 内部的扩展控制命令。
+///
+/// 旧判据只要求「JSON 形状 + 含 cmd」，用户脚本 `{"cmd":"..."}`
+/// 会被原样直送扩展、绕过用户脚本包装与错误上抛；现在必须同时满足
+/// 1. 带显式内部标记 `__atb_internal_cmd: true`；
+/// 2. `cmd` 在内部白名单内。
 pub(crate) fn is_extension_json(script: &str) -> bool {
     let trimmed = script.trim();
-    trimmed.starts_with('{')
-        && serde_json::from_str::<Value>(trimmed)
-            .ok()
-            .and_then(|v| v.get("cmd").cloned())
-            .is_some()
+    if !trimmed.starts_with('{') {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+        return false;
+    };
+    if value.get(INTERNAL_CMD_MARKER).and_then(Value::as_bool) != Some(true) {
+        return false;
+    }
+    value
+        .get("cmd")
+        .and_then(Value::as_str)
+        .is_some_and(|cmd| INTERNAL_CMD_WHITELIST.contains(&cmd))
 }
 
 /// 把用户脚本包成语义确定的 async IIFE。
@@ -185,13 +263,24 @@ pub(crate) fn wrap_user_script(script: &str) -> String {
   }}
   let __abcStarted = false;
   try {{
-    // 只执行一次；探针用来证明这一行之前的代码没有跑过。
-    const __abcValue = eval('__abcStarted = true;\n' + __abcTrimmed);
+    // 探针与用户代码拆成两次 eval，用户代码不再带任何前缀 ——
+    // 旧实现 `eval('__abcStarted = true;\n' + code)` 会让首行 `"use strict"`
+    // 不再是「指令序言」（整段退化成非严格模式），行号也整体 +1。
+    eval('__abcStarted = true');
+    const __abcValue = eval(__abcTrimmed);
     return __abcValue instanceof Promise ? await __abcValue : __abcValue;
   }} catch (__abcError) {{
-    if (__abcError instanceof SyntaxError && !__abcStarted) {{
-      // eval 在编译阶段就失败 ⇒ 用户代码一行都没执行，换通道不会造成第二次副作用。
-      return await (new __abcAsync(__abcTrimmed))();
+    if (__abcError instanceof SyntaxError) {{
+      // 区分两种 SyntaxError：
+      // 1. eval 在**编译阶段**失败（顶层 return / 脚本上下文非法）⇒ 一行都没执行，
+      //    换 AsyncFunction 安全；
+      // 2. 用户代码运行时自己 throw 的 SyntaxError ⇒ 绝不能再跑第二次。
+      // 判定：把同一段代码包进恒假的 if 块再 eval 一次 —— 只编译、不执行。
+      let __abcEvalLegal = true;
+      try {{ eval('if (false) {{' + __abcTrimmed + '\n}}'); }} catch (_) {{ __abcEvalLegal = false; }}
+      if (__abcStarted && !__abcEvalLegal) {{
+        return await (new __abcAsync(__abcTrimmed))();
+      }}
     }}
     // 运行期 SyntaxError 是用户代码自己抛的，不能再跑第二次。
     throw __abcError;

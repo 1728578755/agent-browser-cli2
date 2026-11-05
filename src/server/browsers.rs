@@ -13,7 +13,28 @@ pub(crate) struct BrowserTarget {
     pub(crate) extension_version: Option<String>,
 }
 
+/// `/browsers` 的查询参数。
+///
+/// `force_refresh=true` 时跳过快照 TTL 缓存，强制向扩展拉一次（旧行为的逃生口）。
+#[derive(Debug, Deserialize, Default)]
+pub(crate) struct BrowsersQuery {
+    #[serde(default, alias = "forceRefresh")]
+    pub(crate) force_refresh: bool,
+}
+
+/// 上次成功拉取标签快照的单调时刻。
+///
+/// `browsers` 原本每次调用都强制拉一次快照：`atb browsers` / `status` 这类轮询命令
+/// 会不断打断扩展的 debugger 会话（每次刷新都要一次 tabs 往返），而且拉取失败时
+/// 没有任何提示。这里给快照加一个短 TTL（默认 5s，`ATB_BROWSERS_SNAPSHOT_TTL_SEC`），
+/// 保留 `force_refresh` 作为「我要最新」的逃生口。
+static SNAPSHOT_REFRESHED_AT: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+
 /// 枚举当前所有 (browser, profile) 目标；每个组合取一个代表标签页。
+///
+/// 代表标签 = **数值最小的 tab_id**。旧实现取 `sessions.first`，
+/// 而 `groups` 的 value 来自 `HashMap::values()` 的迭代顺序——同一份状态多跑两次
+/// 可能给出不同的代表标签，`atb browsers` 的输出因此不可复现。
 pub(crate) async fn browser_targets(state: &AppState) -> Vec<BrowserTarget> {
     let driver = state.driver.read().await;
     let mut groups: HashMap<(String, String), Vec<&Session>> = HashMap::new();
@@ -25,12 +46,12 @@ pub(crate) async fn browser_targets(state: &AppState) -> Vec<BrowserTarget> {
     }
     let mut targets = Vec::new();
     for ((browser_id, profile_id), sessions) in groups {
-        let default_key = driver.default_session_key.clone();
-        let chosen = sessions
-            .iter()
-            .find(|s| default_key.as_deref() == Some(s.session_key.as_str()))
-            .or_else(|| sessions.first())
-            .copied();
+        let chosen = sessions.into_iter().min_by(|left, right| {
+            tab_numeric_order(&left.tab_id)
+                .cmp(&tab_numeric_order(&right.tab_id))
+                .then_with(|| left.tab_id.cmp(&right.tab_id))
+                .then_with(|| left.session_key.cmp(&right.session_key))
+        });
         let Some(session) = chosen else { continue };
         targets.push(BrowserTarget {
             browser_id,
@@ -51,14 +72,44 @@ pub(crate) async fn browser_targets(state: &AppState) -> Vec<BrowserTarget> {
     targets
 }
 
-pub(crate) async fn browsers(State(state): State<AppState>) -> Json<Value> {
+pub(crate) async fn browsers(
+    State(state): State<AppState>,
+    Query(query): Query<BrowsersQuery>,
+) -> Json<Value> {
     touch(&state).await;
     // daemon 刚启动 / 扩展刚重连时，会话表还是空的，直接读会返回 count:0，
     // 调用方据此判定「没有浏览器」——其实只是快照还没到（tabs 早已这样对齐）。
     // 只读档等待，避免浏览器真的没开时白等 5 秒。
     wait_for_sessions(&state, WAIT_SESSIONS_READ).await;
-    // 再主动向扩展要一次标签快照；失败就用现有快照，不阻塞、不报错。
-    let _ = refresh_tabs_via_extension(&state, None, Duration::from_millis(1500)).await;
+    // 快照按 TTL 复用，不再每次强制拉取；`force_refresh` 可绕过。
+    let ttl = Duration::from_secs(crate::settings::env_u64_clamped(
+        "ATB_BROWSERS_SNAPSHOT_TTL_SEC",
+        5,
+        0,
+        300,
+    ));
+    let now = Instant::now();
+    let cache_fresh = {
+        let last = SNAPSHOT_REFRESHED_AT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        last.map(|at| now.duration_since(at) < ttl).unwrap_or(false)
+    };
+    let mut refreshed = false;
+    let mut refresh_error: Option<String> = None;
+    if query.force_refresh || !cache_fresh {
+        match refresh_tabs_via_extension(&state, None, Duration::from_millis(1500)).await {
+            Ok(_) => {
+                refreshed = true;
+                let mut last = SNAPSHOT_REFRESHED_AT
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                *last = Some(Instant::now());
+            }
+            // 失败就用现有快照，但把原因如实写进回包（旧实现 `let _ =` 静默吞掉）。
+            Err(err) => refresh_error = Some(err.to_string()),
+        }
+    }
     let targets = browser_targets(&state).await;
     let mut browsers: Vec<Value> = Vec::new();
     for target in &targets {
@@ -95,7 +146,16 @@ pub(crate) async fn browsers(State(state): State<AppState>) -> Json<Value> {
         "profile_count": targets.len(),
         "browsers": browsers,
         "targets": targets,
+        // 快照是否本次真的拉过、TTL 多长。调用方可据此判断 `targets`
+        // 是「刚查到的」还是「几秒内的缓存」。
+        "snapshot_refreshed": refreshed,
+        "snapshot_ttl_sec": ttl.as_secs(),
     });
+    if let Some(message) = refresh_error {
+        // 刷新失败不影响已有快照的可用性，但必须能被发现（旧实现静默丢弃）。
+        result["refresh_error"] = json!(message);
+        result["refresh_error_code"] = json!(refresh_error_code(&message));
+    }
     if targets.is_empty() && has_live_bridge(&*state.driver.read().await) {
         // 桥活着但一条快照都没有：是「还没到」而不是「没有浏览器」。给出可判定的
         // warning_code + retryable + retry_after_ms，调用方不用读中文就能决定重试。

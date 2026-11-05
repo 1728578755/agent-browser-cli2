@@ -39,7 +39,7 @@ pub(crate) async fn read_value(state: &AppState, req: ReadRequest) -> Result<Val
     // `innerTextLimit` 是 page_read.js 的**节点数**阈值（页面侧默认 30000），
     // 不是字符数：节点数 <= 该值时用 innerText 精确抽取，超过则退化为近似可见
     // 文本（textMode:'visible-approx'）。此前 daemon 侧根本没有下发通道，
-    // CLI 传什么都不会生效（read 侧）。
+    // CLI 传什么都不会生效（X-15 read 侧）。
     // - None 不下发，保持页面默认；
     // - `0` 视为「未指定」而不是「最小上限」：页面脚本的约定就是 <=0 用默认
     //   （见 page_read.js 的参数约定注释），把它夹成 1000 会让「顺手写 0」的
@@ -277,6 +277,22 @@ pub(crate) async fn wait_value(
     req: WaitRequest,
     cancel: Option<&AtomicBool>,
 ) -> Result<Value> {
+    // `wait` 是唯一没做 clamp 的入口 —— `--interval 0` 会忙轮询把页面
+    // 主线程占满，极大 / NaN 的 `--timeout` 会把 Duration 饱和成近乎无限等。
+    // 统一在这里收敛，并把实际生效值回显在回包里（timeout / interval）。
+    let mut req = req;
+    let max_total = crate::settings::wait_max_total_sec();
+    let min_interval_sec = crate::settings::wait_min_interval_ms() as f64 / 1000.0;
+    req.timeout = if req.timeout.is_finite() {
+        req.timeout.clamp(0.1, max_total)
+    } else {
+        max_total.min(30.0)
+    };
+    req.interval = if req.interval.is_finite() {
+        req.interval.max(min_interval_sec)
+    } else {
+        min_interval_sec
+    };
     let condition = if let Some(js) = req.js.as_deref().filter(|js| !js.trim().is_empty()) {
         js.to_string()
     } else if let Some(selector) = req.selector.as_deref().filter(|s| !s.trim().is_empty()) {
@@ -408,6 +424,9 @@ pub(crate) async fn wait_value(
             "tab_id": tab_id_of_session(&session_key),
             "session_key": session_key,
             "condition": condition,
+            // 回显实际生效的预算（可能已被 clamp）。
+            "timeout": req.timeout,
+            "interval": req.interval,
             "matched": outcome.get("matched").cloned().unwrap_or(Value::Bool(false)),
             "ok": outcome.get("matched").cloned().unwrap_or(Value::Bool(false)),
             "polls": outcome.get("checks").cloned().unwrap_or(Value::Null),
@@ -446,6 +465,9 @@ pub(crate) async fn wait_value(
         "tab_id": session_key.rsplit(':').next().unwrap_or_default(),
         "session_key": session_key,
         "condition": condition,
+        // 回显实际生效的预算（可能已被 clamp）。
+        "timeout": req.timeout,
+        "interval": req.interval,
         "matched": outcome.get("matched").cloned().unwrap_or(Value::Bool(false)),
         "ok": outcome.get("ok").cloned().unwrap_or(Value::Bool(false)),
         "polls": outcome.get("polls").cloned().unwrap_or(Value::Null),

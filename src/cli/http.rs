@@ -13,9 +13,18 @@ pub(crate) fn secs(value: f64) -> Duration {
 /// `%USERPROFILE%\shots\a.png`（`--out` 不报错地写错位置）或「文件不存在」（`upload`）。
 /// 唯一可靠的做法是 CLI 侧先绝对化。
 pub(crate) fn absolutize_path(raw: &str) -> String {
+    absolutize_path_inner(raw).0
+}
+
+/// 同 [`absolutize_path`]，额外返回「是否发生了非 UTF-8 有损转换」。
+///
+/// `Path::to_string_lossy` 会把无法解码的字节替换成 U+FFFD：路径本身仍然「看起来
+/// 正常」，但 daemon 打开的是另一个不存在的文件。调用方应把 `lossy=true` 写进回包
+/// （`path_lossy`），让 Agent 知道这条路径不能直接复用。
+fn absolutize_path_inner(raw: &str) -> (String, bool) {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return raw.to_string();
+        return (raw.to_string(), false);
     }
     let expanded: PathBuf = if trimmed == "~" {
         home_dir().unwrap_or_else(|_| PathBuf::from(trimmed))
@@ -38,30 +47,47 @@ pub(crate) fn absolutize_path(raw: &str) -> String {
         }
     };
     // `cwd.join("./x.pdf")` 会保留 `./` 片段，报错信息里出现 `...\./x.pdf` 这种混合分隔符。
-    let cleaned = path_clean::clean(&absolute).to_string_lossy().to_string();
+    let cleaned_path = path_clean::clean(&absolute);
+    // 先判断再 lossy：`to_str()` 为 None 才说明原始字节不是合法 UTF-8。
+    let lossy = cleaned_path.to_str().is_none();
+    let cleaned = cleaned_path.to_string_lossy().to_string();
     // Windows 上 Chrome 的 `DOM.setFileInputFiles` 只认反斜杠路径：传 `E:/a/b.pdf`
-    // 会「命令成功但文件没挂上」（一个真实触发面）。
+    // 会「命令成功但文件没挂上」（的一个真实触发面）。
     #[cfg(windows)]
     let cleaned = cleaned.replace('/', "\\");
-    cleaned
+    (cleaned, lossy)
 }
 
 /// 只对「确实是本地路径字段」的键做绝对化，避免误改选择器/URL。
+///
+/// 任一字段发生非 UTF-8 有损转换时，在 payload 顶层写 `path_lossy: true`。
 pub(crate) fn absolutize_payload_paths(payload: &mut Value, keys: &[&str]) {
     let Some(object) = payload.as_object_mut() else {
         return;
     };
+    let mut lossy = false;
     for key in keys {
         match object.get_mut(*key) {
-            Some(Value::String(raw)) => *raw = absolutize_path(raw),
+            Some(Value::String(raw)) => {
+                let (path, was_lossy) = absolutize_path_inner(raw);
+                lossy |= was_lossy;
+                *raw = path;
+            }
             Some(Value::Array(items)) => {
                 for item in items.iter_mut() {
                     if let Value::String(raw) = item {
-                        *raw = absolutize_path(raw);
+                        let (path, was_lossy) = absolutize_path_inner(raw);
+                        lossy |= was_lossy;
+                        *raw = path;
                     }
                 }
             }
             _ => {}
+        }
+    }
+    if lossy {
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("path_lossy".to_string(), Value::Bool(true));
         }
     }
 }
@@ -83,10 +109,17 @@ pub(crate) fn http_client() -> Result<&'static Client> {
     if let Some(client) = CLIENT.get() {
         return Ok(client);
     }
-    // 只连 127.0.0.1，必须绕开环境里的 HTTP_PROXY/HTTPS_PROXY：
+    // 只连 127.0.0.1，默认必须绕开环境里的 HTTP_PROXY/HTTPS_PROXY：
     // 有代理的机器上（企业网络、调试代理），reqwest 默认会把 localhost 请求也发给代理，
     // 代理连不上就返回 502 文本，CLI 便误报「daemon 未运行 / token 不匹配」。
-    let built = Client::builder().no_proxy().build()?;
+    //
+    // 改为可配置 `ATB_HTTP_NO_PROXY`（默认 `true` 保持现状）。需要把本地
+    // 请求交给抓包代理（Charles/mitmproxy）排查时设 `ATB_HTTP_NO_PROXY=0`。
+    let mut builder = Client::builder();
+    if crate::settings::env_bool("ATB_HTTP_NO_PROXY", true) {
+        builder = builder.no_proxy();
+    }
+    let built = builder.build()?;
     let _ = CLIENT.set(built);
     Ok(CLIENT.get().expect("client just initialized"))
 }
@@ -168,13 +201,13 @@ pub(crate) fn ensure_protocol_compatible(protocol: u32) -> Result<()> {
         return Ok(());
     }
     Err(anyhow!(
-        "CLI 与 daemon 版本不配套：CLI 协议 {expected}，18767 上的 daemon 协议 {protocol}。\n\
+        "CLI 与 daemon 版本不配套：CLI 协议 {expected}，{PORT} 上的 daemon 协议 {protocol}。\n\
          这通常是因为升级后旧 daemon 还在跑（它会一直占着端口）。\n\
          修复（二选一）：\n\
          1. 重启 daemon：atb restart\n\
          2. 若 restart 仍不生效，说明端口被别的安装占着：\n\
-            Windows: netstat -ano | findstr 18767 然后 taskkill /PID <pid> /F\n\
-            macOS/Linux: lsof -i:18767 然后 kill <pid>\n\
+            Windows: netstat -ano | findstr {PORT} 然后 taskkill /PID <pid> /F\n\
+            macOS/Linux: lsof -i:{PORT} 然后 kill <pid>\n\
          处理完再执行 atb status，确认 protocol={expected}"
     ))
 }
@@ -189,13 +222,57 @@ pub(crate) fn daemon_log_path_hint() -> String {
 /// 否则后续每条命令只会报「插件未连接」，看起来像扩展没装。
 pub(crate) fn degraded_daemon_error(reason: &str) -> anyhow::Error {
     anyhow!(
-        "daemon 在跑，但插件端口（默认 18765）没有监听：{reason}\n\
+        "daemon 在跑，但插件端口（默认 {}）没有监听：{reason}\n\
          最常见的原因是刚重启过 daemon，旧的扩展连接还在 TIME_WAIT（Windows 约 2 分钟），\
          新 daemon 绑定该端口时拿到 os error 10048。\n\
          处理：稍等一会再试；或立刻用 `atb set-extension-port <其它端口>` 换一个端口。\n\
          daemon 日志: {}",
+        config::DEFAULT_EXTENSION_PORT,
         daemon_log_path_hint()
     )
+}
+
+/// CLI 侧 HTTP 失败的**结构化**载体。
+///
+/// `request()` 以前只把 401 翻译成一句中文，调用方（`status`/`doctor`）只能靠字符串
+/// 子串猜「是超时还是 token 不匹配」。现在失败带着稳定的 `code` 与 `status` 往上抛，
+/// 上层用 `downcast_ref` 判断，不再解析文案。
+#[derive(Debug)]
+// `status` 目前只用于诊断展示；序列化/上层分支主要看 `code`。保留它是为了让
+// 调用方能区分 401 与 403（例如 doctor 输出更精确的提示）。
+#[allow(dead_code)]
+pub(crate) struct HttpFailure {
+    pub(crate) code: &'static str,
+    pub(crate) status: Option<u16>,
+    pub(crate) message: String,
+    pub(crate) hint: String,
+}
+
+impl std::fmt::Display for HttpFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for HttpFailure {}
+
+/// 从 `request()` 的 Err 里取结构化错误码；取不到返回 `None`。
+///
+/// 顺序刻意是「结构化优先」：先看我们自己的 [`HttpFailure`]，再把 reqwest 的
+/// 分类（`is_timeout`/`is_connect`）映射成码。**不再**用中英文子串兜底判类型。
+pub(crate) fn http_failure_code(err: &anyhow::Error) -> Option<&'static str> {
+    if let Some(failure) = err.downcast_ref::<HttpFailure>() {
+        return Some(failure.code);
+    }
+    if let Some(source) = err.downcast_ref::<reqwest::Error>() {
+        if source.is_timeout() {
+            return Some("health_timeout");
+        }
+        if source.is_connect() {
+            return Some("daemon_not_running");
+        }
+    }
+    None
 }
 
 pub(crate) fn request(
@@ -226,9 +303,14 @@ pub(crate) fn request(
     // 所以这里对 401 + invalid_api_token 做一次「丢缓存重读 + 重发」，仍 401 才认定
     // 真的不匹配。POST 重发是安全的：401 表示请求被鉴权层拒绝，从未进入业务逻辑。
     for attempt in 0..2 {
-        let (_, value) = send_once(method, &url, &payload, timeout)?;
-        let invalid_token =
-            value.get("error_code").and_then(Value::as_str) == Some("invalid_api_token");
+        // 必须同时看 HTTP status 与响应体。只看 body 会在两种情况下
+        // 漏判：daemon 的鉴权中间件直接回 401 但 body 不是我们的 JSON（或没有
+        // error_code）；以及旧 daemon 回 403 表达同样的「token 不对」。
+        let (status, value) = send_once(method, &url, &payload, timeout)?;
+        let body_code = value.get("error_code").and_then(Value::as_str);
+        let invalid_token = status == reqwest::StatusCode::UNAUTHORIZED
+            || status == reqwest::StatusCode::FORBIDDEN
+            || body_code == Some("invalid_api_token");
         if invalid_token && attempt == 0 {
             invalidate_api_token();
             continue;
@@ -237,10 +319,17 @@ pub(crate) fn request(
             let token_path = config::api_token_path()
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|_| "~/.atb/api-token".to_string());
-            return Err(anyhow!(
-                "daemon 正在运行，但 API token 不匹配（{token_path}）；通常是残留的旧 daemon 占用了 18767。\n\
-                 处理方式：结束占用 18767 的进程后重试，或先关闭其他 atb 实例"
-            ));
+            return Err(anyhow::Error::new(HttpFailure {
+                code: "invalid_api_token",
+                status: Some(status.as_u16()),
+                message: format!(
+                    "daemon 正在运行，但 API token 不匹配（{token_path}，HTTP {}）；通常是残留的旧 daemon 占用了 {PORT}。",
+                    status.as_u16()
+                ),
+                hint: format!(
+                    "结束占用 {PORT} 的进程后重试；或先关闭其他 atb 实例。也可运行 atb doctor --fix 自动处理"
+                ),
+            }));
         }
         return Ok(value);
     }
@@ -393,9 +482,9 @@ pub(crate) fn ensure_server_locked() -> Result<()> {
             }
         }
         return Err(anyhow!(
-            "18767 已被占用，但对 /ping 无响应：可能是残留的旧 daemon 或别的程序。\n\
-             处理：先结束占用 18767 的进程再重试（Windows: netstat -ano | findstr 18767 后 \
-             taskkill /PID <pid> /F；macOS/Linux: lsof -i:18767）。\n\
+            "{PORT} 已被占用，但对 /ping 无响应：可能是残留的旧 daemon 或别的程序。\n\
+             处理：先结束占用 {PORT} 的进程再重试（Windows: netstat -ano | findstr {PORT} 后 \
+             taskkill /PID <pid> /F；macOS/Linux: lsof -i:{PORT}）。\n\
              daemon 日志: {log_path}"
         ));
     }
@@ -418,7 +507,7 @@ pub(crate) fn ensure_server_locked() -> Result<()> {
         }
     }
     Err(anyhow!(
-        "atb server 启动超时（15s）：18767 可能被其它进程占用，或 daemon 启动即退出。\n\
+        "atb server 启动超时（15s）：{PORT} 可能被其它进程占用，或 daemon 启动即退出。\n\
          daemon 日志: {log_path}（也可运行 atb logs --tail 100 查看）"
     ))
 }
@@ -437,7 +526,8 @@ pub(crate) fn start_server() -> Result<()> {
         .arg("daemon")
         // 别拿 exe 目录当工作目录：相对路径参数（如 screenshot --out）会以安装目录为基准，
         // 既不可预期，装在只读位置时也可能直接失败。
-        .current_dir(dirs::home_dir().unwrap_or_else(env::temp_dir))
+        // 与 `~` 展开同源：统一走 `config::home_dir`（内部即 dirs）。
+        .current_dir(config::home_dir().unwrap_or_else(env::temp_dir))
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err));

@@ -158,7 +158,7 @@ pub(crate) fn json_result(result: Result<Value>) -> Value {
 /// 用于「请求被处理了」不等于「业务成功」的命令：外层 `ok` 跟随内层的业务结论。
 ///
 /// 以前 challenge / downloads wait 的超时走 `json_result(Ok(...))`，外层固定 `ok: true`，
-/// HTTP 直调方看到 `ok:true` 会以为等待成功。
+/// HTTP 直调方看到 `ok:true` 会以为等待成功（B-02）。
 /// `result` 内部结构与字段名一律不动：CLI 依赖 `/result/passed`、`/result/cleared`、
 /// `/result/ok`；只把外层 `ok` 修正为真实结论。
 pub(crate) fn json_result_with_inner_ok(result: Result<Value>) -> Value {
@@ -527,7 +527,7 @@ pub(crate) async fn dom_set_files(
         .await?;
     } else if let Some(selector) = object_id.strip_prefix("__selector:") {
         // 用 nodeId 而不是 objectId：部分 Chrome 版本会「接受 objectId 但什么都不做」，
-        // 命令返回成功、文件却没挂上（另一个真实触发面）。
+        // 命令返回成功、文件却没挂上（的另一个真实触发面）。
         // getDocument → querySelector → setFileInputFiles 是文档化的标准链路。
         batch_cdp_call(
             state,
@@ -804,7 +804,52 @@ pub(crate) async fn run_target_action(
             )
             .await
         }
-        OperationKind::MouseClick => dom_mouse_click(state, tab_id, &object_id, timeout).await,
+        // 受限页面上 `@e` 只有 backendNodeId 时两条回落都不可用 ——
+        // CDP 的 Input.* 被 Chrome 拒绝，页面内合成事件又只接受 CSS 选择器。
+        // 失败后按快照里的 role/name 重定位出唯一 selector，再走
+        // `mouse_click_selector`（CDP 仍不可用时它内部会回落合成事件）。
+        // 重定位不到就原样返回 CDP 错误并补 hint，绝不猜一个节点去点。
+        OperationKind::MouseClick => {
+            match dom_mouse_click(state, tab_id, &object_id, timeout).await {
+                Ok(value) => Ok(value),
+                Err(err)
+                    if is_ref_target(target)
+                        && (is_page_protected_error(&err.to_string())
+                            || err.to_string().contains("禁止调试器注入")) =>
+                {
+                    match retry_relocate_selector(state, tab_id, target, timeout).await? {
+                        Some(selector) => {
+                            let mut value =
+                                mouse_click_selector(state, tab_id, &selector, timeout).await?;
+                            if let Value::Object(map) = &mut value {
+                                map.insert("ref_relocated".to_string(), json!(true));
+                                map.insert("ref_selector".to_string(), json!(selector));
+                                map.insert(
+                                    "relocated_after_error".to_string(),
+                                    json!(err.to_string()),
+                                );
+                            }
+                            Ok(value)
+                        }
+                        None => {
+                            let hint = "该 @e 只有 backendNodeId 且页面禁止调试器注入，\
+                                        无法按 role/name 重定位；请重新 snapshot\
+                                        （JS 快照会带上 CSS 选择器）或改用 --selector / 坐标点击";
+                            if is_page_protected_error(&err.to_string()) {
+                                // 保留受限站点的结构化形态（error_code:"page_protected"），
+                                // 把 hint 塞进 raw 便于排障。
+                                Err(anyhow::Error::new(PageProtectedError {
+                                    raw: format!("{err}；重定位失败：{hint}"),
+                                }))
+                            } else {
+                                Err(anyhow!("{err}；hint: {hint}"))
+                            }
+                        }
+                    }
+                }
+                Err(err) => Err(err),
+            }
+        }
     };
     let operation = match operation {
         Ok(value) => value,
@@ -956,7 +1001,7 @@ pub(crate) fn ensure_page_action_ok(operation: &Value) -> Result<()> {
 /// 对不可聚焦元素（`<div>` / `<span>` / 没有 tabindex 的容器，或 `focus` 被页面
 /// `preventDefault`）调用 `el.focus()` 是 no-op：页面脚本照样回 `ok:true`，但
 /// `active:false`。daemon 放行后 `dispatch_keys` 会把按键发给**当前实际聚焦的元素**
-/// （通常是 body），命令却报 `success` + `dispatched:N` —— 按键全废且完全静默。
+/// （通常是 body），命令却报 `success` + `dispatched:N` —— 按键全废且完全静默（C-01）。
 ///
 /// 缺 `active` 字段（旧扩展）时按「无法证明失败」放行，保持向后兼容。
 pub(crate) fn ensure_focus_landed(operation: &Value, target: &str) -> Result<()> {
@@ -1195,7 +1240,7 @@ pub(crate) async fn run_send_keys_action(
                     run_page_action(state, tab_id, "focus", json!(selector), json!({}), timeout)
                         .await?;
                 // 页面动作可能以 ok:false 返回而不是 Err；而且「元素找到了、但没聚焦
-                // 成功」（`active:false`）也必须拦——否则按键会静默打进 body。
+                // 成功」（`active:false`）也必须拦——否则按键会静默打进 body（C-01）。
                 ensure_focus_landed(&focused, &selector).map_err(|err| {
                     anyhow!("无法把焦点移到目标元素（{selector}），按键未发送：{err}")
                 })?;

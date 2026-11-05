@@ -213,21 +213,33 @@ for (const at of exitCalls) {
 // 命令改名为 atb 后，开关改成 config::env_compat("EXIT0")：先读 ATB_EXIT0，
 // 再回退旧名 AGENT_BROWSER_CLI_EXIT0。这里同时校验「调用点」与「旧名回退」，
 // 否则改名会把已经写进用户脚本的兼容开关静默废掉（会复发）。
+//
+// 两个正则必须落在**同一个语义单元**里。旧写法在整个 cli 源码上分别
+// grep，`code != 0 && exit0_compat()` 和 `matches!(..., "1" | "true")` 来自两个
+// 不同函数也能同时命中——只要任何地方出现过一次就绿，等于没锁住「同一开关」。
 const CONFIG_RS = join(HERE, '..', 'src', 'config.rs');
 const configSource = readFileSync(CONFIG_RS, 'utf8');
-check(
-  '保留 EXIT0 兼容开关（调用点）',
-  /env_compat\("EXIT0"\)/.test(source),
-);
+check('保留 EXIT0 兼容开关（调用点）', /env_compat\("EXIT0"\)/.test(source));
+
+const exitCodeBody = fnBody(source, 'exit_code');
+const exit0Body = fnBody(source, 'exit0_compat');
+check('找到 exit_code 实现', !!exitCodeBody);
+check('找到 exit0_compat 实现', !!exit0Body);
+if (exitCodeBody && exit0Body) {
+  check(
+    'EXIT0 只在 code != 0 时把退出码改成 0（判断在 exit_code 内）',
+    /code\s*!=\s*0\s*&&\s*exit0_compat\s*\(\s*\)/.test(exitCodeBody),
+    exitCodeBody.slice(0, 200),
+  );
+  check(
+    'EXIT0 只认 1/true（解析在 exit0_compat 内）',
+    /matches!\(\s*value\.to_string_lossy\(\)\.trim\(\),\s*"1"\s*\|\s*"true"\s*\)/.test(exit0Body),
+    exit0Body.slice(0, 200),
+  );
+}
 check(
   '兼容开关仍然认旧变量名 AGENT_BROWSER_CLI_',
   /AGENT_BROWSER_CLI_\{suffix\}/.test(configSource),
-);
-check(
-  '兼容开关生效时才吞掉非零退出码',
-  /code\s*!=\s*0\s*&&\s*exit0_compat\s*\(\s*\)/.test(source) &&
-    /matches!\(\s*value\.to_string_lossy\(\)\.trim\(\),\s*"1"\s*\|\s*"true"\s*\)/.test(source),
-  'EXIT0 必须只在 code != 0 且值为 1/true 时返回 0',
 );
 
 // ---- 7. 退出码常量互不冲突 -------------------------------------------
@@ -235,7 +247,14 @@ check(
 const exitFailure = numberConst(source, 'EXIT_FAILURE');
 const exitTimeout = numberConst(source, 'EXIT_JOB_TIMEOUT');
 check('EXIT_FAILURE 为 1', exitFailure === 1, String(exitFailure));
-check('EXIT_JOB_TIMEOUT 非 0 且与 EXIT_FAILURE 不同', exitTimeout !== null && exitTimeout !== 0 && exitTimeout !== exitFailure, String(exitTimeout));
+// 契约基线（CLI 退出码契约）：
+// job wait / download-wait 的超时退出码固定为 3，且必须与普通失败 1 区分。
+// 旧断言只要求「非 0 且不等于 1」，改成 2 或 99 也能绿 —— 调用方按 3 分支就失效。
+check(
+  'EXIT_JOB_TIMEOUT 为 3（契约基线：等待超时专用退出码）',
+  exitTimeout === 3,
+  String(exitTimeout),
+);
 
 // ---- 汇总 ------------------------------------------------------------
 

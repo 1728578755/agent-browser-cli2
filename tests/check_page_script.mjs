@@ -54,25 +54,46 @@ if (failed) {
   process.exit(1);
 }
 
-// 新增的页面脚本（read / find / action）只做「能解析 + 入口函数存在」的最小校验。
-// 它们依赖 DOM，无法在 Node 里完整执行；但模板串里的语法错误能在这里提前发现。
+// 新增的页面脚本（read / find / action / snapshot / wait / stealth / challenge /
+// net）只做「能解析 + 入口函数存在」的最小校验。它们依赖 DOM，无法在 Node 里完整
+// 执行；但模板串里的语法错误能在这里提前发现。
+//
+// 
+//   - `entries: []` 是空断言（循环里一个 missing 都不会产生），必须删掉或换成
+//     persist_boot 的真实可验证标记；
+//   - page_challenge.js 之前完全不在清单里，语法错误/入口改名都发现不了；
+//   - 入口不能用 `source.includes('function __abcX(')` 这种子串判断（注释里写一句
+//     也能过），改为先 `new Function(source)` 确认可解析，再用词边界匹配声明，
+//     并强制入口名带 `__abc` 前缀。
 const assetChecks = [
-  { file: "page_read.js", entry: "__abcRead" },
+  { file: "page_read.js", entries: ["__abcRead"] },
   { file: "page_find.js", entries: ["__abcFind", "__abcCssPath", "__abcFindVisible", "__abcMaskValue"] },
   { file: "page_action.js", entries: ["__abcAct", "__abcResolve", "__abcDispatch"] },
   { file: "page_snapshot.js", entries: ["__abcSnapshot", "__abcSnapCssPath", "__abcSnapRole"] },
   { file: "page_net.js", entries: ["__abcNet"] },
   { file: "page_wait.js", entries: ["__abcWait"] },
   { file: "page_stealth.js", entries: ["__abcStealth"] },
-  { file: "atb_bridge/persist_boot.js", entries: [] },
+  { file: "page_challenge.js", entries: ["__abcChallenge"] },
+  // persist_boot.js 是 IIFE，没有 `__abc` 全局入口；它的契约是「命中后通知 SW
+  // 应用持久注入」，用消息类型做真实标记，而不是留一个空 entries。
+  { file: "atb_bridge/persist_boot.js", entries: [], markers: [/type:\s*['"]persist-apply['"]/] },
 ];
 for (const check of assetChecks) {
   const source = fs.readFileSync(path.join(here, "..", "assets", check.file), "utf8");
-  const entries = check.entries || [check.entry];
+  const entries = check.entries || [];
   try {
+    // 只编译不执行：页面脚本顶层依赖 window/document，执行会直接抛错；
+    // 但语法错误（例如重复 let）在这里就能抓到。
     new Function(source);
-    const missing = entries.filter((name) => !source.includes(`function ${name}(`));
+    const missing = entries.filter((name) => !new RegExp(`\\bfunction\\s+${name}\\s*\\(`).test(source));
     if (missing.length) throw new Error(`缺少函数: ${missing.join(", ")}`);
+    const badPrefix = entries.filter((name) => !name.startsWith("__abc"));
+    if (badPrefix.length) throw new Error(`入口名缺少 __abc 前缀: ${badPrefix.join(", ")}`);
+    const missingMarkers = (check.markers || []).filter((pattern) => !pattern.test(source));
+    if (missingMarkers.length) throw new Error(`缺少契约标记: ${missingMarkers.join(", ")}`);
+    if (!entries.length && !(check.markers || []).length) {
+      throw new Error("用例没有任何可验证的入口或标记（空断言）");
+    }
     console.log(`  PASS  ${check.file} 可解析且入口齐全`);
   } catch (e) {
     failed += 1;

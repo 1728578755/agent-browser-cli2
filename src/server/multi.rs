@@ -23,6 +23,10 @@ pub(crate) struct MultiRequest {
     pub(crate) dry_run: bool,
     #[serde(default)]
     pub(crate) stop_on_error: bool,
+    /// 目标解析范围：`agent`（默认，只看本智能体 open 过的标签）/
+    /// `all`（显式跨 agent）。缺省时由 `ATB_MULTI_SCOPE` 决定。
+    #[serde(default)]
+    pub(crate) scope: Option<String>,
 }
 
 /// 多标签并发执行：一次请求完成「解析目标 → 并发执行 → 按输入顺序汇总」。
@@ -83,11 +87,36 @@ pub(crate) async fn multi_value(state: &AppState, req: MultiRequest) -> Value {
         }
     }
 
-    let targets =
-        match resolve_targets(state, &spec, req.browser.as_deref(), req.profile.as_deref()).await {
-            Ok(targets) => targets,
-            Err(err) => return err.to_json(),
-        };
+    // 默认只解析本 agent 打开的标签（多智能体共用同一浏览器时不串线）；
+    // 只有显式 `scope:"all"`（或 ATB_MULTI_SCOPE=all）才跨 agent。
+    let scope_all = match req.scope.as_deref() {
+        Some("all") => true,
+        Some("agent") => false,
+        Some(other) => {
+            return json!({
+                "ok": false,
+                "error": format!("multi: 未知 scope {other:?}"),
+                "error_code": "invalid_scope",
+                "hint": "scope 只接受 \"agent\"（默认，只操作本智能体 open 的标签）或 \"all\"（显式跨智能体）",
+            });
+        }
+        None => crate::settings::multi_scope_default() == "all",
+    };
+    let resolved = match resolve_targets(
+        state,
+        &spec,
+        req.browser.as_deref(),
+        req.profile.as_deref(),
+        !scope_all,
+    )
+    .await
+    {
+        Ok(resolved) => resolved,
+        Err(err) => return err.to_json(),
+    };
+    let skipped_foreign = resolved.skipped_foreign;
+    let targets = resolved.targets;
+    let scope_label = if scope_all { "all" } else { "agent" };
 
     let plan: Vec<Value> = targets
         .iter()
@@ -109,6 +138,8 @@ pub(crate) async fn multi_value(state: &AppState, req: MultiRequest) -> Value {
             "dry_run": true,
             "op": req.op,
             "target": spec.describe(),
+            "scope": scope_label,
+            "skipped_foreign": skipped_foreign,
             "count": targets.len(),
             "targets": plan,
         });
@@ -142,7 +173,7 @@ pub(crate) async fn multi_value(state: &AppState, req: MultiRequest) -> Value {
                 );
             }
             // 拿不到许可不能「无许可继续执行」：那会让 concurrency 形同虚设，
-            // 几十个目标一起压浏览器（S1-05 的同类点，open/run 已修，这里补齐）。
+            // 几十个目标一起压浏览器（的同类点，open/run 已修，这里补齐）。
             let _permit = match permits.acquire_owned().await {
                 Ok(permit) => permit,
                 Err(err) => {
@@ -283,6 +314,10 @@ pub(crate) async fn multi_value(state: &AppState, req: MultiRequest) -> Value {
         "ok": failed == 0 && succeeded > 0,
         "op": req.op,
         "target": spec.describe(),
+        // 回显解析范围与「因归属被跳过」的数量。默认 agent 范围下
+        // skipped_foreign>0 表示「还有别的智能体的标签没被操作」，不是失败。
+        "scope": scope_label,
+        "skipped_foreign": skipped_foreign,
         "count": results.len(),
         "succeeded": succeeded,
         "failed": failed,

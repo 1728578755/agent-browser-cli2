@@ -162,15 +162,95 @@ async function main() {
   {
     const { calls } = await runCase(() => ({}));
     check(
-      '3. continueResponse 成功时 continueRequest 最多调用一次',
-      countOf(calls, 'Fetch.continueRequest') <= 1,
+      '3. continueResponse 成功时 continueRequest 恰好 0 次（不重复续传）',
+      countOf(calls, 'Fetch.continueRequest') === 0,
       JSON.stringify(methodsOf(calls)),
     );
     check(
-      '3b. 成功路径始终调用了 continueResponse',
+      '3b. 成功路径始终调用了 continueResponse 且恰好一次',
       countOf(calls, 'Fetch.continueResponse') === 1,
       JSON.stringify(methodsOf(calls)),
     );
+  }
+
+  // 5) 最外层入口：handleFetchPausedResponse 成功路径只能续传一次。
+  //
+  // 旧用例只调用 continueFetchResponse（最内层），既看不到「外层是否把 return
+  // 之后的第二个分支也跑了一遍」，也看不到 guard.settled 是否真的落定。
+  {
+    const { calls, context } = buildContext(() => ({}));
+    const fn = context.handleFetchPausedResponse;
+    check('5. background.js 暴露最外层 handleFetchPausedResponse', typeof fn === 'function');
+    if (typeof fn === 'function') {
+      const session = { tabId: 1, intercept: { stats: {} } };
+      const state = {
+        rules: [{ match: '/api/success', response: { status: 202, headers: { 'x-rewritten': '1' } } }],
+        log: [],
+        debugPass: true,
+      };
+      const guard = {};
+      let error = null;
+      try {
+        await fn(session, state, {
+          requestId: 'R-OK',
+          request: { url: 'https://example.com/api/success', method: 'GET' },
+          responseStatusCode: 200,
+          responseStatusText: 'OK',
+          responseHeaders: [{ name: 'content-type', value: 'application/json' }],
+        }, guard);
+      } catch (e) {
+        error = e;
+      }
+      check('5b. 最外层成功路径不抛错', !error, error && error.message);
+      check(
+        '5c. 最外层成功路径 continueResponse 恰好一次、continueRequest 零次',
+        countOf(calls, 'Fetch.continueResponse') === 1 && countOf(calls, 'Fetch.continueRequest') === 0,
+        JSON.stringify(methodsOf(calls)),
+      );
+      check('5d. 最外层成功路径把 guard 标记为已落定', guard.settled === true, JSON.stringify(guard));
+      check(
+        '5e. 最外层成功路径写入一条 rewrite 日志（stage=response/status=202）',
+        state.log.some((item) => item.requestId === 'R-OK' && item.action === 'rewrite' && item.stage === 'response' && item.status === 202),
+        JSON.stringify(state.log),
+      );
+    }
+  }
+
+  // 6) 最外层入口：continueResponse 失败时仍必须由外层补一次 continueRequest。
+  {
+    const { calls, context } = buildContext((method) => {
+      if (method === 'Fetch.continueResponse') throw new Error('Invalid InterceptionId');
+      return {};
+    });
+    const fn = context.handleFetchPausedResponse;
+    if (typeof fn === 'function') {
+      const session = { tabId: 1, intercept: { stats: {} } };
+      const state = {
+        rules: [{ match: '/api/fallback', response: { status: 202 } }],
+        log: [],
+        debugPass: true,
+      };
+      const guard = {};
+      let error = null;
+      try {
+        await fn(session, state, {
+          requestId: 'R-FB',
+          request: { url: 'https://example.com/api/fallback', method: 'GET' },
+          responseStatusCode: 200,
+          responseStatusText: 'OK',
+          responseHeaders: [{ name: 'content-type', value: 'application/json' }],
+        }, guard);
+      } catch (e) {
+        error = e;
+      }
+      check('6. 最外层回退路径不抛错', !error, error && error.message);
+      check(
+        '6b. 最外层回退路径至少一次 continueResponse + 恰好一次 continueRequest',
+        countOf(calls, 'Fetch.continueResponse') >= 1 && countOf(calls, 'Fetch.continueRequest') === 1,
+        JSON.stringify(methodsOf(calls)),
+      );
+      check('6c. 最外层回退路径同样标记 guard 落定', guard.settled === true, JSON.stringify(guard));
+    }
   }
 
   // 4) 首选与回退都失败：不得抛错（requestPaused 处理器不能被异常打断）。

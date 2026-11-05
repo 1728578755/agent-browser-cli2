@@ -88,6 +88,8 @@ atb cleanup
 | 等条件 | `wait --selector/--text/--js` | 默认 10s，页面内观察，不占进程 |
 | 执行 JS | `exec 'return document.title'` | 封装命令覆盖不到时才用 |
 | iframe | `frames` → `--frame <id>` | `exec` / `inject` 的 `--all-frames` 可一次打全部 |
+| shadow DOM | `snapshot` / `find '宿主 >>> 按钮'` | 递归 open shadow root；结果项带 `scope:"shadow"`。closed shadow root 不可达，回包用 `shadow_closed_unreachable` 明示 |
+| 看 daemon 日志 | `logs --tail 100` | 输出 JSON：`{ok, lines[], path, truncated}`，按行消费用 `.lines[]` |
 | 抓请求 | `network start` 起，`network list` / `detail` 查看 | 或 `net hook` / `net log` |
 | 改响应 | `net mock <pattern> --body '...'` | `--engine cdp` 可拦静态资源与二进制 |
 | 下载 | `download <url> --filename a.pdf` | `download-wait --id <id>` 等完成 |
@@ -96,8 +98,10 @@ atb cleanup
 | 多标签 | `--tab 111,222` | 一条命令并发，不要循环 |
 | 多智能体 | `--agent <name>` / `ATB_AGENT` | 收尾用 `cleanup` |
 | 挑战页 | `challenge solve` | `open` 默认已自动尝试；失败用 `widget` + `click --at` 自己点，最后才 `focus` |
-| 多浏览器 | `browsers` / `broadcast` | 先看有多少实例 |
+| 多浏览器 | `browsers` / `broadcast` | 先看有多少实例；`broadcast` 的 `--args` 里写路径会按工作目录绝对化 |
 | 调试横幅 | `launch --dry-run` → `launch --restart` | 只在启动时生效 |
+| 版本与能力门禁 | `capabilities` | 一次核对 daemon/扩展版本与 `core` / `open_session` / `group` / `window` / `current` / `challenge` 门禁 |
+| 连不上先自修 | `doctor --fix`（加 `--force` 才杀进程） | 修旧 daemon 占端口、token 失配、扩展过旧；只诊断用 `doctor` |
 | 查全部参数 | `schema --json` | 顶层命令的机器可读参数与 error_code；子命令用 `--help` |
 
 ## 输出契约
@@ -126,6 +130,20 @@ atb cleanup
 | `element_not_found` | 选择器没命中 | `find` 确认元素存在、可见 |
 | `csp_blocked` | 页面 CSP 禁止注入 | 改用 `read` / `snapshot` / `click` 等封装命令 |
 | `timeout` | 操作超时 | 加 `--timeout`，或先 `wait` 再操作 |
+| `wait_js_failed` | `--wait-js` 条件没满足（脚本可能已执行） | 按失败处理：看 `js_return.wait` / `matched`，加时间或改谓词，不要当成功继续 |
+| `target_scope_empty` | `--tab all` / 多目标被 agent 归属过滤后为空 | 用 `--tab 123` 显式指定，或设 `ATB_MULTI_SCOPE=all` 跨 agent |
+| `agent_no_default`（`target_lost` 的 reason） | `ATB_SESSION_ISOLATION=strict` 下具名 agent 没有自己的默认目标 | 先 `atb open <url>` 建默认；或改回 `legacy` |
+| `download_id_required` | `ATB_DOWNLOAD_AUTO_CLAIM=false` 且 `download-wait` 没给 `--id` | 先 `downloads` 取 id，再 `download-wait --id <id>` |
+| `outcome_unknown` | 请求已发出但响应丢失（超时/断连），动作可能已执行 | 退出码 4；带同一个 `--idempotency-key` 重发，不要换 key |
+| `host_not_allowed` | HTTP `Host` 不是回环名 | 用 `127.0.0.1` / `localhost` 访问 daemon，不要用局域网 IP 或自定义域名 |
+| `ws_backpressure` | 下行队列满（目前只把 pong 控制通道改成有界，命令通道仍无界，因此该码目前是**预留**） | 偶发卡顿等几秒重试；持续出现重载扩展或 `atb restart`，高并发改用 `batch` 控并发 |
+| `capture_too_large` | 截图/PDF 超出 `ATB_IO_MAX_OUTPUT_MB` 或 `ATB_CAPTURE_MAX_PIXELS` | 降 `--max-height` / 改 `--format jpeg`，或调高 `ATB_IO_MAX_OUTPUT_MB` |
+| `pdf_too_tall` | 页面超出 PDF 单页/分页上限 | 用 `--max-height` 限高，或改 `screenshot --full-page` 留证 |
+| `challenge_probe_failed` | 挑战探测拿不到可用载荷（扩展断连/注入失败） | 重试一次；持续失败看 `diag`、`doctor`，不要当作「没有挑战」 |
+| `invalid_port` | URL 的端口不合法（如 `:99999`） | 改用合法端口；`scheme:数字` 不会被猜成 http |
+| `unsupported_file_host` | `file://host/...` 的主机不在允许列表 | 用 `file:///C:/...` 本机路径，或把主机加进 `ATB_FILE_HOSTS` |
+| `file_not_found` | 本地文件 / `--urls` 列表不存在 | 核对路径；`--urls` 的「像路径但不存在」不再被当成 URL 列表 |
+| `output_exists` | `ATB_IO_OVERWRITE=ask` 且目标已存在 | 换输出名，或设 `ATB_IO_OVERWRITE=force` / `backup` |
 | `challenge_timeout` | 挑战页没在时限内放行 | 见 [recipes.md](./references/recipes.md) 的挑战页配方 |
 
 完整错误码与排查见 [troubleshooting.md](./references/troubleshooting.md)。
@@ -162,22 +180,24 @@ atb job cancel <jobId>
 ```
 
 - `--async` 返回 `job.id`；`job wait` 默认等 300s，超时返回 `job_wait_timeout`，任务不丢。
-- 支持异步：页面读取（`read` / `scan` / `find` / `snapshot` / `cookies` / `frames`）、动作（`click` / `mouse-click` / `fill` / `send-keys` / `hover` / `select` / `check` / `scroll` / `upload`）、产物（`screenshot` / `save-pdf`）、脚本（`exec` / `inject`）、查询（`downloads` / `net`），以及 `wait`。
-- 不支持：`open` / `close` / `cleanup` / `tabs` / `tabtree` / `batch` / `scrape` / `challenge` / `stealth` / `status` / `doctor` 等需要立即拿到结果或改变会话的命令，会报 `unsupported_flag`（退出码 2）。
+- 支持异步：页面读取（`read` / `scan` / `find` / `snapshot` / `cookies` / `frames`）、动作（`click` / `mouse-click` / `fill` / `send-keys` / `hover` / `select` / `check` / `scroll` / `upload`）、产物（`screenshot` / `save-pdf`）、脚本（`exec` / `inject`），以及 `wait`。
+- 不支持：`open` / `close` / `cleanup` / `tabs` / `tabtree` / `browsers` / `lookup` / `run` / `batch` / `scrape` / `broadcast` / `net` / `network` / `console` / `downloads` / `download` / `download-wait` / `challenge` / `stealth` / `job` / `status` / `doctor` / `capabilities` / `logs` / `launch` / `restart` / `stop` / `daemon` / `set-extension-port` / `schema` / `profile-label` / `install-skill` / `trust-extension`，会报 `unsupported_flag`（退出码 2）。
 - 结果只在 daemon 内存里，重启即失；要留产物就写文件（`--out`）。
 - 大量 URL 用 `scrape`，不要用 `--async` 手工编排。
 
 ## 版本与扩展
 
-三方版本：CLI/daemon API 协议 `5`、扩展消息协议 `4`、扩展文件版本（当前 **5.2.9**）。
+三方版本：CLI/daemon API 协议 `5`、扩展消息协议 `4`、扩展文件版本（当前 **5.3.0**）。
 
 ```bash
 atb status        # 只在排障时看 compatibility：ok / 期望协议 / 已连接协议 / fixes
+atb capabilities  # 一次拿 daemon 版本、扩展版本与能力门禁（core/open_session/group/window/current/challenge）
 atb restart       # CLI 与 daemon 不配套
 atb restart --force   # daemon 占着 18767 且不认当前 token
 ```
 
 - 扩展旧了：用仓库 `assets/atb_bridge` 覆盖扩展目录，再到 `chrome://extensions`（Edge 为 `edge://extensions`）点「重新加载」。**覆盖文件不等于重载**。
+- `atb capabilities` 返回 `extension_not_connected` / `extension_outdated` / `daemon_not_running` 时按 `hint` 处理；它是判断「能力门禁够不够」的最短路径，比逐条试命令便宜。
 - `atb stealth` 返回 `extension_ok:false`：扩展低于 5.0.0，或覆盖后没重载。
 - 升级顺序：换扩展文件 → 重载扩展 → 升级 CLI，或先 `restart`。
 - 主命令统一 `atb`；环境变量新前缀 `ATB_*`，旧前缀 `AGENT_BROWSER_CLI_*` 仍生效；配置目录仍是 `~/.atb`。
@@ -191,7 +211,7 @@ atb restart --force   # daemon 占着 18767 且不认当前 token
 - 会 attach：`snapshot` 默认（要避开用 `snapshot --js`）、纯 CSS 选择器的 `click` / `fill`、`mouse-click`、`send-keys`、`upload`、`network` / `console`、整页/元素截图、`save-pdf`、`net mock --engine cdp`、挑战求解/点击、显式 CDP。设 `ATB_NO_DEBUGGER=1` 可彻底禁止 attach。
 - attach 被拒（页面内嵌别的扩展 iframe，`error_code:"page_protected"`）时不要直接放弃：截图/PDF/鼠标点击会自动回落，结果里看 `via` / `synthetic` 判断走的是哪条通道（`captureVisibleTab` / `captureFullPageStitched` / `stitched-image-pdf` / `synthetic:true`）。只有 `network`、`console`、`upload`、`send-keys`、元素截图仍需调试器。
 - 调试横幅无法运行时去除，唯一开关是启动参数 `--silent-debugger-extension-api`，只能通过 `atb launch --restart` 生效。
-- `trust-extension` 是单向的：只约束「谁能连 daemon」，不校验「扩展连的是不是真 daemon」。
+- `trust-extension` 是单向的：只约束「谁能连 daemon」，不校验「扩展连的是不是真 daemon」。默认 `ATB_WS_TRUST_MODE=compat` 会放行任何本机连接；共用机器时同时配白名单与 token，并把 `ATB_WS_TRUST_MODE` 设为 `both` 再 `atb restart`（只配置不切档仍按 compat 放行）。
 - daemon 默认空闲 300 秒且无扩展连接时退出，扩展连着时不退；退出后端口空窗期可能被本机其它进程占用，下一条命令会自动拉起。
 - `chrome://`、扩展页、`about:blank` 上的可操作能力受限，先导航到普通 `http/https` 页面。
 

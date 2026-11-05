@@ -53,6 +53,8 @@ function runAs(platform, arch, { glibc = false } = {}) {
   try {
     const result = spawnSync(process.execPath, ['-r', sandbox.preload, sandbox.entry], {
       encoding: 'utf8',
+      // wrapper 正常应在 1s 内退出；5s 是防挂死的硬上限。
+      timeout: 5000,
       env: {
         ...process.env,
         FAKE_PLATFORM: platform,
@@ -80,23 +82,47 @@ test('缺少二进制时是可读的 Error，而不是 ReferenceError', () => {
   assert.match(stderr, /npm install @g1728578755\/atb/);
 });
 
-test('平台包名映射：linux-x64', () => {
-  const { stderr } = runAs('linux', 'x64', { glibc: true });
-  assert.match(stderr, /@g1728578755\/atb-linux-x64/);
-});
+// 平台矩阵表驱动，覆盖 ×os ×arch ×libc 三轴；每条同时校验退出码与
+// stderr 里的平台包名/自救提示。旧用例只 match 包名，即使 wrapper 以 0 退出
+// （把错误吞掉）也会绿。
+const PLATFORM_MATRIX = [
+  { label: 'linux-x64 (glibc)', platform: 'linux', arch: 'x64', glibc: true, expect: /@g1728578755\/atb-linux-x64/ },
+  { label: 'linux-arm64 (glibc)', platform: 'linux', arch: 'arm64', glibc: true, expect: /@g1728578755\/atb-linux-arm64/ },
+  { label: 'darwin-x64', platform: 'darwin', arch: 'x64', glibc: false, expect: /@g1728578755\/atb-darwin-x64/ },
+  { label: 'darwin-arm64', platform: 'darwin', arch: 'arm64', glibc: false, expect: /@g1728578755\/atb-darwin-arm64/ },
+  { label: 'win32-x64', platform: 'win32', arch: 'x64', glibc: false, expect: /@g1728578755\/atb-win32-x64/ },
+  {
+    label: 'win32-arm64（无预编译包）',
+    platform: 'win32',
+    arch: 'arm64',
+    glibc: false,
+    expect: /未提供 win32-arm64 的预编译包/,
+    also: /cargo build --release/,
+    not: /可选依赖 @g1728578755\/atb-win32/,
+  },
+  {
+    label: 'linux-x64 (musl/Alpine，无预编译包)',
+    platform: 'linux',
+    arch: 'x64',
+    glibc: false,
+    expect: /未提供 linux-x64 的预编译包/,
+    also: /cargo build --release/,
+    not: /@g1728578755\/atb-linux-x64/,
+  },
+];
 
-test('平台包名映射：darwin-arm64', () => {
-  const { stderr } = runAs('darwin', 'arm64');
-  assert.match(stderr, /@g1728578755\/atb-darwin-arm64/);
-});
-
-test('平台包名映射：win32-arm64 没有预编译包（走自编译提示）', () => {
-  const { stderr } = runAs('win32', 'arm64');
-  assert.match(stderr, /未提供 win32-arm64 的预编译包/);
-  // null 分支的提示必须是「怎么自救」，而不是「重装可选依赖」。
-  assert.match(stderr, /cargo build --release/);
-  assert.doesNotMatch(stderr, /可选依赖 @g1728578755\/atb-win32/);
-});
+for (const item of PLATFORM_MATRIX) {
+  test(`平台矩阵：${item.label}`, () => {
+    const { status, stderr } = runAs(item.platform, item.arch, { glibc: item.glibc });
+    assert.equal(status, 1, `预期退出码 1，实际 ${status}；stderr: ${stderr}`);
+    assert.match(stderr, item.expect, `stderr 未命中平台提示：
+${stderr}`);
+    if (item.also) assert.match(stderr, item.also, `缺少可操作提示：
+${stderr}`);
+    if (item.not) assert.doesNotMatch(stderr, item.not, `不应出现错误的安装引导：
+${stderr}`);
+  });
+}
 
 test('wrapper 把 ATB_PACKAGE_DIR 注入子进程 env', () => {
   const probe = 'console.log(JSON.stringify({pkg: process.env.ATB_PACKAGE_DIR, legacy: process.env.AGENT_BROWSER_CLI_PACKAGE_DIR}))';

@@ -1,0 +1,52 @@
+{
+  "//": "平台清单唯一真相源。scripts/sync-version.mjs、scripts/package-platform.mjs、npm/bin/atb.js、scripts/platforms.mjs（供 publish.yml 生成 matrix）都从这里读；新增/删除平台只改这一处 + 真实构建机。",
+  "//libc": "null 表示不限制 libc；linux 只发 glibc（Alpine/musl 走自编译），所以写 \"glibc\"。",
+  "registry": "https://registry.npmjs.org",
+  "platforms": [
+    {
+      "name": "darwin-arm64",
+      "os": "darwin",
+      "cpu": "arm64",
+      "libc": null,
+      "rustTarget": "aarch64-apple-darwin",
+      "binary": "atb",
+      "runner": "macos-14"
+    },
+    {
+      "name": "darwin-x64",
+      "os": "darwin",
+      "cpu": "x64",
+      "libc": null,
+      "rustTarget": "x86_64-apple-darwin",
+      "binary": "atb",
+      "runner": "macos-15-intel"
+    },
+    {
+      "name": "linux-x64",
+      "os": "linux",
+      "cpu": "x64",
+      "libc": "glibc",
+      "rustTarget": "x86_64-unknown-linux-gnu",
+      "binary": "atb",
+      "runner": "ubuntu-22.04"
+    },
+    {
+      "name": "linux-arm64",
+      "os": "linux",
+      "cpu": "arm64",
+      "libc": "glibc",
+      "rustTarget": "aarch64-unknown-linux-gnu",
+      "binary": "atb",
+      "runner": "ubuntu-22.04-arm"
+    },
+    {
+      "name": "win32-x64",
+      "os": "win32",
+      "cpu": "x64",
+      "libc": null,
+      "rustTarget": "x86_64-pc-windows-msvc",
+      "binary": "atb.exe",
+      "runner": "windows-2022"
+    }
+  ]
+}

@@ -1,6 +1,6 @@
 # 能力现状：已实现 / 下一步 / 边界
 
-更新时间：2026-11-04（扩展 5.2.9 ATB，CLI 0.7.1，CLI↔daemon 协议 5，扩展协议 4）
+更新时间：2026-11-04（扩展 5.3.0 ATB，CLI 0.7.2，CLI↔daemon 协议 5，扩展协议 4）
 
 顶层命令 **55 个**（`atb --help`，不含 `help`；另有 `net` / `job` / `challenge` / `stealth` / `network` / `console` / `lookup` / `profile-label` / `trust-extension` 等子命令）。主命令名为 `atb`。
 
@@ -10,7 +10,7 @@
 
 ## 1. 已实现
 
-### 命令面扩展：schema / capabilities / doctor --fix / scrape（0.7.1 之后新增）
+### 命令面扩展：schema / capabilities / doctor --fix / scrape
 
 | 能力 | 命令 | 说明 |
 |---|---|---|
@@ -19,21 +19,43 @@
 | 诊断自动修复 | `atb doctor --fix [--force]` | 旧 daemon 占端口（netstat/lsof 找 PID；`--force` 才 taskkill，否则只打印命令）、API token 失配（删 `~/.atb/api-token`）、扩展过旧（打印带实际路径的重载指引）；每条输出 `{fix, executed, result}` |
 | 批量抓取 | `atb scrape` | `--urls` 文件/逗号列表（去重）→ 分批后台开页（`--batch`，默认 4）→ 并发执行 JS（`--concurrency`，默认 4）→ 结果写 `--out`（JSONL：`{url, tab_id, ok, data, error, elapsed_ms, attempts, outcome_unknown}`）→ 批完关页 → 失败退避重试（3s/5s/7s，`--retry` 默认 3 轮）→ 摘要；默认每个 URL 只写一条最终记录（诊断「第几次才成功」用 `--record-attempts` 逐次写）；`outcome_unknown` 的 URL 不重试、最终退出码 4；`--batch/--concurrency` 超出 1..=32 退出 2；`--js-file` 缺省取 `{title,url,text(前9000字)}`；全部 CLI 侧编排，复用 open/exec/close，不改 daemon |
 
+### 当前能力（CLI 0.7.2 / 扩展 5.3.0）
+
+| 能力 | 命令/字段 | 说明 |
+|---|---|---|
+| open shadow DOM | `find` / `snapshot` / `read` | 递归收集 open shadow root，命中项带 `scope:"shadow"`、`pierce:true`、`host_selector`、`shadow_path`；选择器写成「宿主 `>>>` 相对路径」，`find` / `read` / `action` 都能再吃回这种写法。回包给出 `scope`（`main-frame-only` / `main-frame+shadow`）、`frame_count`、`shadow_roots`、`shadow_skipped`、`shadow_closed_unreachable`；`snapshot --engine js` 另给 `coverage_complete` / `coverage_hint` |
+| 图片型 PDF 分页 + dpr 归一 | `save-pdf` | 整页长图按 14200pt 切片成多页（`pages` / `page_height_pt` / `width_pt` / `height_pt`），页面不再超过 PDF 14400pt 上限；设备像素先按 `dpr` 归一成 CSS px，HiDPI 下不再放大一倍。回包如实标 `paper:"image"`、`paper_applied:false`、`landscape:null`、`scale:null` |
+| `--max-height` 全路径生效 | `screenshot --full-page` / `save-pdf` | CDP 主路径同样按 `max_height_px / dpr` 截断并回 `truncated:true`（此前只对拼图回落的显示通道生效） |
+| PDF / 截图体积护栏 | `ATB_IO_MAX_OUTPUT_MB` / `ATB_CAPTURE_MAX_PIXELS` | 编码前按 base64 长度比对预算，超限返回结构化 `capture_too_large`；拼接按像素总量判断，默认 8000 万，不再 OOM |
+| 下载名净化 | `download --filename` / daemon | 拒绝绝对路径、分隔符、`..`、空名、Windows 保留名、尾部点空格；取 basename，超 180 字符截断保留扩展名。回包 `filename_sanitized{requested,applied,changed,warnings}`；`--dir` 拒绝 `..` 段 |
+| 下载取消与归属 | `download-wait` | `ATB_DOWNLOAD_CANCEL_ON_TIMEOUT` / `ATB_DOWNLOAD_CANCEL_ERASE` 控制超时是否取消/擦除；`ATB_DOWNLOAD_AUTO_CLAIM=false` 且无 `--id` 时回 `download_id_required`；每 agent 记住最近 N 条（`ATB_DOWNLOAD_REGISTRY_DEPTH`，默认 8），回包 `claimed_from` |
+| WS 四档信任 | `ATB_WS_TRUST_MODE` | `compat`（默认）/ `whitelist` / `token` / `both`；非 compat 档 fail-closed，缺配置或校验失败直接拒绝握手（`ws_whitelist_not_configured` / `ws_untrusted_extension` / `ws_token_not_configured` / `ws_token_invalid`）。`/health.ws_security` 与 `atb status` 透出 `mode` + `warning` |
+| cancel 帧 | `exec` 超时/取消 | daemon 向扩展发 `{cmd:"cancel", execId, tabId}`，扩展按 `execId` 释放这次 attach；被 network/console/Fetch 复用时不打断，回 `cancelled:false, reason:"in_use"` |
+| 幂等落盘收敛 | `--idempotency-key` | 默认 `ATB_IDEMPOTENCY_PERSIST=redacted`，只写 `{key,scope,at,status}`；`full` 才写响应体（单条 256KB），`off` 不落盘。错误响应（4xx/`ok:false`）不再进缓存；`Pending` 占位有 Drop 守卫，取消/panic 不会让同 key 永久 504 |
+| 网络/console 上限 | `network list` / `console list` | `limit` clamp 到 1–500 并回显 `clamped`；`networkStart` / `consoleStart` 下发 `max_entries`（默认 5000）与 `idempotent:true`，重复 start 不清空缓冲；单条日志 `url`/`body`/`headers` 超 `ATB_NET_LOG_ITEM_CHARS`（默认 8192）截断并标 `truncated` |
+| 规则上限 | `net mock --engine cdp` | 单条 body 超 `ATB_NET_RULE_MAX_BYTES`（默认 2MiB）报 `net_rule_too_large`；每 profile 规则条数上限 `ATB_NET_RULE_MAX_RULES`（默认 64） |
+| `logs` 输出 JSON | `atb logs` | 返回 `{ok, lines[], path, truncated}`；按行消费改用 `--tail` + `.lines[]`，不再逐行裸文本 |
+| `capabilities` / `doctor --fix` | 运维 | `capabilities` 一次核对 daemon/扩展版本与能力门禁；`doctor --fix [--force]` 自动修复端口占用、token 失配、扩展过旧，`--force` 才杀进程 |
+| `broadcast` 路径与 dry-run | `broadcast` | 走 `finalize_page_payload`：`out` 等路径绝对化 + 目标语法预检；`--dry-run` 在本地出计划，不拉 daemon；`ATB_ALLOW_RELATIVE_OUT=1` 保留旧的相对路径行为 |
+| `tabs --limit 0` | `tabs` | `0` 表示**不截断**（返回全部），不是空列表；`tabs_count` 保持原始总数，另给 `returned_count` 与 `total_before_limit` |
+| 组合命令结果语义 | `--wait-js` / `scrape` / `broadcast` | `wait.ok=false` 或 `matched=false` 时写 `wait_js_failed`，顶层 `ok:false` + 退出码 1；`scrape` 的传输层失败标 `outcome_unknown`（退出码 4）且不重试；`ATB_RESULT_STRICT=strict` 可让组合命令任一子结论失败即整体失败 |
+
 ### 反检测与挑战自动等待（0.6.0 新增）
 
 | 能力 | 命令 | 说明 |
 |---|---|---|
-| 命令改名 | `atb` | Cargo `[[bin]]`、clap `name`/`bin_name` 均为 `atb`；npm `bin` 提供 `atb`，指向 `npm/bin/atb.js`；配置目录仍为 `~/.atb`（有意不改，避免新旧 daemon 各用一套目录与端口） |
-| 环境变量新前缀 | `ATB_AGENT` / `ATB_EXIT0` / `ATB_IDLE_TTL` / `ATB_NO_DEBUGGER` / `ATB_BIN` / `ATB_PACKAGE_DIR` | 新名优先，旧前缀 `AGENT_BROWSER_CLI_*` 继续生效 |
+| 命令改名 | `atb` | Cargo `[[bin]]`、clap `name`/`bin_name` 均为 `atb`；npm `bin` 为 `atb`；配置目录仍为 `~/.atb`（有意不改，避免新旧 daemon 各用一套目录与端口） |
+| 环境变量新前缀 | `ATB_AGENT` / `ATB_EXIT0` / `ATB_IDLE_TTL` / `ATB_NO_DEBUGGER` / `ATB_BIN` / `ATB_HOME` / `ATB_WS_TRUST_MODE` 等 | 新名优先，旧前缀 `AGENT_BROWSER_CLI_*` 继续生效；完整的 65 个 `ATB_*`（56 个用户可见 + 9 个测试/CI）按主题分组列在 README「环境变量」章节 |
 | 痕迹审计 | `stealth audit`（默认） | MAIN world 审计站点可读信号，输出 `score`(0-100) / `level`(clean/low/medium/high) / `headline` / `findings[]` / `env` / `self_fixable` / `extension_version` / `extension_ok` / `fixes` |
 | 审计项 scope | `findings[].scope` | `self`=本工具自身（own_globals / own_dom_badge / own_net_hook）；`browser`=启动方式与窗口状态（webdriver / Headless UA / plugins 空 / 窗口 0 / SwiftShader / 时区空 / Notification 权限不一致 / **tab_hidden 后台标签**）；`unknown`=框架残留与被他人改写的 fetch/XHR |
 | 自查清理 | `stealth scrub` | 只清本工具痕迹：先 `__abcNet({action:'reset'})` 还原 fetch/XHR，再删注入全局与角标节点，返回 `restored` / `removed` / `remaining`；不动 `scope:"browser"` |
-| 扩展 5.x 隐蔽化 | 自动生效 | 页面操作脚本默认 ISOLATED world（只有 `net` / `stealth` 在 MAIN）；角标默认关闭 + closed Shadow DOM（宿主 id `atb-status-host`）；网络状态槽改为不可枚举 `window['__atb_net_<随机>']`，包装函数做 `toString()` 伪装与 `name`/`length` 对齐 |
+| 扩展 5.x 隐蔽化 | 自动生效 | 页面操作脚本默认 ISOLATED world；只有 `challenge`（要读 `window.turnstile` / `_cf_chl_opt` / `__hcaptcha_cfg`）、`net`（要包装页面 fetch/XHR）、`stealth`（要在站点视角审计）走 MAIN world，`challenge` 入口 `__abcChallenge` 不可枚举且可删除。角标默认关闭 + closed Shadow DOM（宿主 id `atb-status-host`）；网络状态槽改为不可枚举 `window['__atb_net_<随机>']`，包装函数做 `toString()` 伪装与 `name`/`length` 对齐 |
 | 打开即处理挑战 | `open --challenge auto\|wait\|off` | 默认 auto：标题判别（`Just a moment` / `Attention required` / `Checking your browser` / `请稍候` / `安全验证` 等，标题为空也探一次）→ 正常页面零额外往返；命中后**一律先跑一次元素驱动的主动求解**（不再拿「页面脚本说有没有可点组件」当门，因为组件是异步渲染进 closed shadow root 的），拿不到再退被动等待，默认 `--challenge-timeout 15`；拿到 token / 离开挑战页返回 `cleared:true`；需要人点时返回 `need_human` + `hints` |
 | 判定只认可见证据 | `challenge status` | `blocking` 只由**看得见的拦截页**（标题 / `#challenge-stage` / 正文）判定；CF 的 `challenge-platform` 脚本与 `_cf_chl_opt`、各家 WAF 的 SDK 脚本在正常页面上也常驻，只记进 `signals`，不再据此判拦截（否则已放行的站点会被永久当成挑战页，`wait` 白等到超时） |
-| 挑战页零注入 | 自动 | `challenge` 的页面侧调用一律走扩展 ISOLATED world（`PAGE_OP_WORLD.challenge`），脚本不写任何 `window.*`。旧实现用 eval 进 MAIN world 写 `window.__abcChlSeenAt`，成了可读的自动化指纹：点击被接收但 Turnstile 永不给 token（实测修好后同站点 7 次过 6 次）|
+| 挑战页零全局污染 | 自动 | `challenge` 的页面脚本跑在 **MAIN world**（`PAGE_OP_WORLD.challenge = 'MAIN'`），因为判定必须读站点自己挂在页面 `window` 上的全局：`window.turnstile`、`window._cf_chl_opt`、hCaptcha 的 `__hcaptcha_cfg`。ISOLATED world 有独立 window，读这些全局恒为 `undefined`，会稳定误判「没有挑战」。代价是入口 `window.__abcChallenge` 对页面可见，因此必须**不可枚举 + 可配置**（`Object.defineProperty(..., {enumerable:false, configurable:true})`）：`Object.keys(window)` 看不到，`delete` 也能成功，`stealth scrub` 不会永远报 `remaining`。旧实现用顶层 `function __abcChallenge(){}`，那是 classic script 的不可删除全局，且可枚举 |
 | 组件在 closed shadow root 里 | `challenge status` 的 `turnstile` | CF 把 Turnstile iframe 挂在页面的 **closed shadow root**：页面 JS 的 `querySelectorAll('iframe')` 恒为 0、`#challenge-stage` 也不存在，但组件其实已经渲染。判据只用 DOM：「CF 挑战页 + 隐藏的 `cf-turnstile-response` 字段 + 无可见 iframe/stage」→ `turnstile.shadow_widget:true`、`interactive:true`，不再误报 `stalled: turnstile_not_rendered` |
-| 硬拦截快速失败 | `challenge wait/solve/auto` | CF 的 `Sorry, you have been blocked`（error 1020/1015）点也点不了、等也不放行，识别到 `kind:"blocked"` 立刻返回 `error_code:"challenge_blocked"` 与处置建议，不再空耗 `--timeout` |
+| 硬拦截快速失败 | `challenge wait/solve/auto` | CF 的 `Sorry, you have been blocked`（error 1020/1015）点也点不了、等也不放行，识别到 `kind:"blocked"` 立刻返回 `error_code:"challenge_blocked"` 与处置建议，不再空耗 `--timeout`；`hard_block` 只在 CF 专属证据成立时为 true，普通 403 是 `blocked:true, hard_block:false`（另带 `plain_blocked` 诊断位），不再被误判成硬拦截 |
+| 等待超时按失败 | `challenge wait` | `ok` 跟 `cleared` 走：超时 / `need_human` 回 `ok:false`（`error:"timeout"` / `error_code:"challenge_wait_timeout"`），不再是「`ok:true` + `cleared:false`」；daemon 仍按 `cleared` 判定，并保留 `passed` 语义 |
 | 卡住时兜底 reload | `challenge wait --reload-after <秒>` | 默认 0 = 不 reload；挑战 cookie 可能已下发、页面脚本没走完时整页 reload 一次再继续等 |
 | 标题误判收敛 | `challenge status` 的 `suspected` | 标题分两档：CF 专属文案（`Just a moment` / `Attention required` / `Verifying you are human` 等）直接判拦截；通用文案（`One more step` / `Access Denied`）只记 `suspected:true` + `signals:title-only-suspect`，必须等到 DOM/脚本实锤（`#challenge-stage` / orchestrate 脚本 / `#sec-if-cpt-container`）才升级，避免把 403 页当验证码页白等一轮 |
 
@@ -55,7 +77,7 @@
 | 窗口最小化修正 | 自动 | `--background` 或窗口被最小化时 `outerWidth=0` / `visibility=hidden`，CF 的 Turnstile 不会执行 → 等待期间发现环境不可见就先 `tabs switch`（不抢焦点）恢复窗口 |
 | Cookie 清理 | `cookies --clear [--url <页面>] [--domain <域>]` | 按 url 清能删到分区 cookie（`cf_clearance`）；单站点 >200 条直接拒绝，防误删 |
 
-### 页面脚本健壮性（页面脚本修复）
+### 页面脚本健壮性
 
 | 问题 | 现在的行为 |
 |---|---|
@@ -70,7 +92,7 @@
 | `net fetch` 自我欺骗 | 诊断请求改用 hook 之前的原始 `fetch`，命中不了自己写的 mock，返回体标 `bypassed_hooks:true` |
 | scan 的浮层剔除失效 | `nodeInfo` WeakMap 现在真的写入（此前从未 `set`，整条 `R:covered`/`R:floatingAd` 链路是死代码）；固定定位的图片广告会被剔出 scan 结果 |
 | 超深 DOM 让 scan 崩掉 | 页面侧克隆与分析加了 512 层上限（与 `html.rs` 的 `MAX_DOM_DEPTH` 同阈值），超限返回 `…truncated: DOM deeper than 512 levels`；其它异常统一成 `__ABC_SCAN_ERROR__<msg>` 由 daemon 转结构化错误 |
-| 页面污染全局函数 | 扩展每次调用都重新注入页面脚本（不再「探测到同名函数就跳过」），并对 MAIN world 的 `__abcNet` / `__abcStealth` 校验不可枚举标记 `__abcOwn`；被页面抢占时明确报错，不执行页面提供的实现 |
+| 页面污染全局函数 | 扩展每次调用都重新注入页面脚本（不再「探测到同名函数就跳过」），并对 MAIN world 的 `__abcNet` / `__abcStealth` / `__abcChallenge` 校验不可枚举标记 `__abcOwn`（三者都是 `requireOwn:true`）；被页面抢占时明确报错，不执行页面提供的实现 |
 | 调试日志污染页面 | `simphtml_opt` 的 `console.log`（含遗留的 `area/totalArea` 调试语句）默认全关，需要时传 `{debug:true}`；文件末尾多余的 `optHTML()` 裸调用已删，注入不再白白整页克隆一遍 |
 | `--interval` 对 `wait --js` 无效 | daemon 传的键名由 `intervalMs` 改为 `minIntervalMs`，`wait --js --interval 5` 实测 11s 内只巡检 3 次（此前被静默按 50ms 巡检） |
 | 列表容器被改 id | `find_list` 不再给页面容器写 `id='_ljq..'`，改用不落地 DOM 的 nth-of-type 路径 |
@@ -97,7 +119,7 @@
 | 只检查不执行 | `<命令> --dry-run` | 输出解析后的目标与计划；不产生页面副作用 |
 | 退出码 | — | `0` 成功 / `1` 执行失败 / `2` 命令写错 / `3` 等待超时 / `4` 结果未知（动作可能已执行，带同一 `--idempotency-key` 重发）/ `130` 取消 |
 | 输出占位符 | `screenshot/save-pdf --out 'shots/{index}-{tab}.png'` | 多目标写同一文件会在预检阶段被拒绝 |
-| 长图高度上限 | `screenshot --full-page --max-height N` / `save-pdf --max-height N` | 仅拼图回落通道使用；单位是**设备像素**（与 `scrollH × dpr` 比较），默认 20000，超出按上限截断并标 `truncated:true` |
+| 长图高度上限 | `screenshot --full-page --max-height N` / `save-pdf --max-height N` | CDP 主路径与拼图回落通道都生效：单位是**设备像素**（与 `scrollH × dpr` 比较），默认 20000，超出按上限截断并标 `truncated:true`（截断时附 `requested_height` 与 hint） |
 
 ### 会话与标签
 
@@ -174,7 +196,7 @@
 
 `chrome.scripting.executeScript` 注入函数本身不受页面 CSP 限制，但函数内部 `eval` 会。于是给固定操作准备了一条不 eval 的路径：扩展注入 `ops/page_*.js`（与 daemon 侧同源），再调用其全局函数。
 
-> **5.0.0 起**：这条通道默认注入 **ISOLATED world**，`window.__abcRead` 之类的全局只存在于扩展的隔离世界，站点读不到。只有 `net`（要包装页面 `fetch`）和 `stealth`（要在页面视角审计）仍走 MAIN world。
+> **5.0.0 起**：这条通道默认注入 **ISOLATED world**，`window.__abcRead` 之类的全局只存在于扩展的隔离世界，站点读不到。只有 `challenge`（判定要读 `window.turnstile` / `_cf_chl_opt` / `__hcaptcha_cfg`）、`net`（要包装页面 `fetch`）和 `stealth`（要在页面视角审计）走 MAIN world。
 
 > **2026-11-01 更新**：`ops/` 与 `assets/` 两处副本不再靠手工同步——`npm run sync:extension` 生成/更新副本，`npm run check:extension` 在 CI 里守卫一致性。改过 `assets/page_*.js` 后必须跑一次 sync，否则扩展实际注入的还是旧副本。
 
@@ -295,3 +317,11 @@
 - 扩展未安装/未连接的浏览器不会出现在 `browsers` 里；`broadcast --browser edge` 在没装 Edge 扩展时会返回 `no_target`。
 - **隐式默认目标有粘性**：默认标签所在连接断开时，daemon 会把这条标签记进 `preferred_default_session_key`（6 小时 TTL），同一标签重连后自动恢复为默认；只有标签真的关了才会永久切走。`read` 在「≥2 个浏览器 + 未显式指定目标」时会附带 `multi_browser_hint`；`/health.connection` 的 `default_session_key` 与 `profiles[].is_default` 可查当前默认落在哪个浏览器。
 - 具名 agent（`--agent`）的默认标签失效时，**动作类命令**直接报 `target_lost` 而不是回退到别人的标签（多智能体不串线）；`open` 例外：它会先清掉失效默认再开新页，所以 `cleanup` 之后仍能继续 `open`。
+
+**明确保留的限制**
+
+- **closed shadow root 不可达**：`find` / `snapshot` / `read` 只能递归 open shadow root；closed shadow root 内的节点页面 JS 与扩展注入都取不到，回包用 `shadow_closed_unreachable:true` 明示。CF 的 Turnstile 就常在 closed shadow root 里，所以 `challenge` 改用 CDP `DOM.getDocument{pierce:true}` 而不是页面查询。
+- **Chrome match pattern 不支持端口**：`net hook --persist` 的 `*://host/*` 无法表达 `host:port`，同一 host 的不同端口会互相命中；回包会带 `warning`，要按端口隔离只能用 `--match` 显式指定或改 `net route --engine cdp`。
+- **WS 无 TLS**：daemon 与扩展之间的 WebSocket 是明文回环连接，`ATB_WS_TRUST_MODE` 只能约束「谁能连」，不能让扩展证明「对端是真 daemon」。要完全闭合需要 daemon 侧 HMAC 挑战，当前未实现；默认 `compat` 档下同机进程可伪造 `Origin`。
+- **`e2e-live` 未在本机验证**：CI 新增的 `e2e-live`（xvfb + Chrome for Testing + `--load-extension`）已接入工作流，但本机没有 Chrome/xvfb，未实跑；Chrome 137+ 对 `--load-extension` 的支持需首次 CI 验证。
+- **`snapshot --js` 的 shadow 覆盖依赖脚本版本**：旧扩展不回 `scope` / `shadow_*` 字段，此时 `coverage_complete` 不出现（形状保持兼容），不能据此判断「已覆盖 shadow」。

@@ -138,6 +138,29 @@ test('closed shadow root 里的 Turnstile：判为可交互，且不判 stalled'
   assert.ok(out.hints.some((hint) => hint.includes('closed shadow root')));
 });
 
+test('真·closed shadow root：所有 DOM 查询为空，只靠 turnstile + _cf_chl_opt 仍能识别', () => {
+  // 上一个用例用 `present` 模拟一个隐藏响应字段（本质仍能 querySelector
+  // 到）。真实形态是 closed shadow root —— 页面 JS 对 iframe/stage/响应字段
+  // 一律查不到，只有 turnstile 实例、_cf_chl_opt 和编排脚本可见。
+  const out = run({
+    title: '请稍候…',
+    scripts: CF_SCRIPTS,
+    present: [],
+    iframeSrc: [],
+    // 关键：只有页面全局（turnstile / _cf_chl_opt）能证明组件存在。
+    turnstile: true,
+    chlOpt: { cType: 'interactive' },
+    stalledFor: 12000,
+  });
+  assert.equal(out.detected, true);
+  assert.equal(out.turnstile.iframes, 0);
+  assert.equal(out.turnstile.stage, false);
+  // 隐藏响应字段也查不到（closed shadow root 的典型表现），但 cType 能证明实例存在。
+  assert.equal(out.turnstile.shadow_widget, true);
+  assert.equal(out.interactive, true);
+  assert.equal(out.stalled, false);
+});
+
 test('确实没下发组件：仍然报 stalled，交给上层换环境', () => {
   const out = run({
     title: '请稍候…',

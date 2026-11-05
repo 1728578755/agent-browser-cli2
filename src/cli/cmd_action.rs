@@ -47,7 +47,7 @@ pub(crate) fn run_action_command(op: &str, args: ActionArgs, is_async: bool) -> 
             args.tab.as_deref(),
             args.browser.as_deref(),
             args.profile.as_deref(),
-            args.timeout + 5.0,
+            http_budget(args.timeout),
         )?;
     }
     Ok(())
@@ -110,7 +110,7 @@ pub(crate) fn cmd_wait(args: WaitArgs, is_async: bool) -> Result<()> {
             args.tab.as_deref(),
             args.browser.as_deref(),
             args.profile.as_deref(),
-            args.timeout + 5.0,
+            http_budget(args.timeout),
         )?;
     }
     Ok(())
@@ -232,9 +232,10 @@ pub(crate) fn cmd_challenge(args: ChallengeArgs, is_async: bool) -> Result<()> {
     // auto / click 是一次性主动求解，预算就是 --timeout，不能再按 30s 掐断。
     let long_running = matches!(action.as_str(), "wait" | "solve" | "auto" | "click");
     let http_timeout = if long_running {
-        effective_timeout + 15.0
+        // 统一「业务超时 + slack」，不再各命令各写一个魔法余量。
+        http_budget(effective_timeout + 5.0)
     } else {
-        30.0
+        http_budget(30.0)
     };
     let mut value = request("POST", "/challenge", Some(payload), http_timeout)?;
     // 超时 / 未通过不是成功：把顶层 ok 改成 false，统一由 print_json 的
@@ -242,7 +243,7 @@ pub(crate) fn cmd_challenge(args: ChallengeArgs, is_async: bool) -> Result<()> {
     if long_running && value.get("ok").and_then(Value::as_bool) == Some(true) {
         // `passed` 是主判据，`cleared` 是兜底：wait 的目标就是「离开挑战页」，
         // 而 daemon 曾经只在 solve 分支写 `passed`，于是成功清除被判成
-        // challenge_timeout。两道口径都接受，避免再被单侧改动打穿。
+        // challenge_timeout（B-25）。两道口径都接受，避免再被单侧改动打穿。
         let achieved = value
             .pointer("/result/passed")
             .or_else(|| value.pointer("/result/cleared"))
@@ -317,7 +318,7 @@ pub(crate) fn cmd_stealth(args: StealthArgs, is_async: bool) -> Result<()> {
         "profile": args.profile,
     });
     ensure_server()?;
-    let value = request("POST", "/stealth", Some(payload), args.timeout + 10.0)?;
+    let value = request("POST", "/stealth", Some(payload), http_budget(args.timeout))?;
     print_json(value);
     Ok(())
 }

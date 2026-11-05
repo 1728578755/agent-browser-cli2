@@ -104,7 +104,28 @@ pub(crate) fn report_failure(err: &anyhow::Error) -> i32 {
             Some(usage.hint.clone()),
             usage.suggestion.clone(),
         ),
-        None => ("unexpected_error".to_string(), err.to_string(), None, None),
+        // HTTP 层失败带结构化 code/hint（/17）：直接把稳定码透出去，
+        // 否则会被兜底成 unexpected_error，调用方就分不清 token 失配与环境故障。
+        None => match err.downcast_ref::<HttpFailure>() {
+            Some(failure) => (
+                failure.code.to_string(),
+                failure.message.clone(),
+                Some(failure.hint.clone()),
+                None,
+            ),
+            // 非用法错误以前完全不给 hint，Agent 只能看到一句 `Error: ...`。
+            // 这里补一条「先自检、再看日志、再重试」的通用可执行建议；具体命令仍可在
+            // 自己的分支里给出更精确的 hint（本函数只在兜底时用）。
+            None => (
+                "unexpected_error".to_string(),
+                err.to_string(),
+                Some(format!(
+                    "先运行 atb doctor 看环境自检（端口/扩展连接/配置），再到 atb logs --tail 100 查看 daemon 日志；\
+                     若与 daemon 通信失败，可 atb status 确认后用 atb restart 重启。原始错误链：{err:#}"
+                )),
+                None,
+            ),
+        },
     };
     let mut value = json!({ "ok": false, "error": message, "error_code": code });
     if let Some(hint) = hint {
@@ -168,7 +189,7 @@ pub(crate) fn print_json(mut value: Value) {
         // 失败在 daemon 升级前后会被归进不同分支，退出码漂移（P1 契约被破坏）。
         if value.get("error_code").is_none() {
             if text.contains("exec_timeout") {
-                // A1-09：exec/action 超时不代表结果丢失，扩展可能稍后才回包。
+                // exec/action 超时不代表结果丢失，扩展可能稍后才回包。
                 // exec_id 由 daemon 附在 error 文本里，5 分钟内可查询。
                 value["hint"] = json!("结果可能已通过 GET /exec-result/<exec_id> 查询（5 分钟内有效），exec_id 见 error 字段");
             } else if text.trim_start().starts_with("outcome_unknown") {
@@ -201,7 +222,8 @@ pub(crate) fn print_json(mut value: Value) {
                 // 4 = 结果未知：POST 已发出但响应丢失，动作可能已执行。
                 // 与 1（明确失败）分开，智能体不应盲目重试，先查询或带幂等键重发。
                 Some("outcome_unknown") => EXIT_UNKNOWN,
-                // 动作可能已执行（回包缺失、Input 协议错）。
+                // 当前 daemon 不再生产该码（统一用 outcome_unknown），
+                // 但协议 4 的旧 daemon 仍可能回它；保留映射属兼容分支，不是死代码。
                 // 与 outcome_unknown 同级：不要重放，先查状态。
                 Some("action_indeterminate") => EXIT_UNKNOWN,
                 // 2 = 命令本身写错了（选择器 / JS / 参数 / 目标），改命令就能解决。

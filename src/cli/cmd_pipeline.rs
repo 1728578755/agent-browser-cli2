@@ -10,6 +10,8 @@ pub(crate) fn submit_job(op: &str, args: Value) -> Result<Value> {
     if let Err(problem) = finalize_page_payload(op, &mut args) {
         return Ok(problem.to_json());
     }
+    // 写类 op 显式目标护栏：与同步路径同一口径，ATB_REQUIRE_TAB=1 时生效。
+    enforce_write_tab(op, args.get("switch_tab_id").and_then(Value::as_str))?;
     // 后台任务按「一条命令一个目标」建模；多目标提交会被拆成 N 个 job，
     // 但调用方只拿到一个 id，结果必然对不上。这里直接说清楚怎么改。
     if let Some(tab) = args.get("switch_tab_id").and_then(Value::as_str) {
@@ -197,6 +199,40 @@ pub(crate) fn pipeline_http_timeout(steps: &Value) -> f64 {
     total.clamp(60.0, 86_400.0)
 }
 
+/// 合并 `stop_on_error` 的两种来源（步骤文件 / `--continue-on-error`）并回写生效值。
+///
+/// 同一套「文件值优先、显式冲突报错、最终回显」的逻辑以前只写在 `run`
+/// 里，`batch` 完全没有，导致两条管道对同一个键的处理完全不同。抽出来共用。
+fn apply_stop_on_error(
+    object: &mut serde_json::Map<String, Value>,
+    continue_on_error: bool,
+) -> Result<bool> {
+    let file_stop_on_error = object.get("stop_on_error").and_then(Value::as_bool);
+    if continue_on_error && file_stop_on_error == Some(true) {
+        return Err(usage_failure(
+            "unsupported_combination",
+            "--continue-on-error（遇错继续）与步骤文件里的 \"stop_on_error\": true（遇错即停）冲突",
+            "二者只能留一个：去掉 --continue-on-error，或把步骤文件的 stop_on_error 改成 false / 删掉该键",
+        ));
+    }
+    // 文件给了就以文件为准；否则 `--continue-on-error` 取反（默认遇错即停）。
+    let stop_on_error = file_stop_on_error.unwrap_or(!continue_on_error);
+    object.insert("stop_on_error".to_string(), json!(stop_on_error));
+    Ok(stop_on_error)
+}
+
+/// 把「合并后真正生效的 stop_on_error」回显到 `result_meta`，调用方不必自己再推一遍。
+fn echo_stop_on_error(value: &mut Value, stop_on_error: bool) {
+    if let Some(map) = value.as_object_mut() {
+        let meta = map
+            .entry("result_meta".to_string())
+            .or_insert_with(|| json!({}));
+        if let Some(meta) = meta.as_object_mut() {
+            meta.insert("stop_on_error".to_string(), json!(stop_on_error));
+        }
+    }
+}
+
 pub(crate) fn cmd_run(args: RunArgs, is_async: bool) -> Result<()> {
     let _ = is_async;
     if is_async {
@@ -221,31 +257,13 @@ pub(crate) fn cmd_run(args: RunArgs, is_async: bool) -> Result<()> {
             "顶层写成 {\"steps\":[...]}，或直接给一个数组",
         ));
     };
-    // 文件里的 stop_on_error 以前用 `entry.or_insert` 写入，文件给了值就
-    // 静默盖掉 --continue-on-error——同一个 flag 在两条来源上两种语义，调用方无从发现。
-    // 现在：两边都显式且冲突 → exit 2；只有文件给 → 保留文件值；都没给 → 按 flag 推导。
-    // （`--continue-on-error` 是布尔开关，只有「给了」= true 这一种显式形态。）
-    let file_stop_on_error = object.get("stop_on_error").and_then(Value::as_bool);
-    if args.continue_on_error && file_stop_on_error == Some(true) {
-        return Err(usage_failure(
-            "unsupported_combination",
-            "run: --continue-on-error（遇错继续）与步骤文件里的 \"stop_on_error\": true（遇错即停）冲突",
-            "二者只能留一个：去掉 --continue-on-error，或把步骤文件的 stop_on_error 改成 false / 删掉该键",
-        ));
-    }
-    let stop_on_error = file_stop_on_error.unwrap_or(!args.continue_on_error);
-    object.insert("stop_on_error".to_string(), json!(stop_on_error));
+    // 文件里的 stop_on_error 以前用 `entry.or_insert` 写入，
+    // 文件给了值就静默盖掉 --continue-on-error。现在 run/batch 共用同一份合并逻辑。
+    let stop_on_error = apply_stop_on_error(object, args.continue_on_error)?;
     let http_timeout = pipeline_http_timeout(&payload);
     let mut value = request("POST", "/run", Some(payload), http_timeout)?;
     // 回显生效值：两种来源合并后到底停不停，调用方不必自己按同样的规则再推一遍。
-    if let Some(map) = value.as_object_mut() {
-        let meta = map
-            .entry("result_meta".to_string())
-            .or_insert_with(|| json!({}));
-        if let Some(meta) = meta.as_object_mut() {
-            meta.insert("stop_on_error".to_string(), json!(stop_on_error));
-        }
-    }
+    echo_stop_on_error(&mut value, stop_on_error);
     print_json(value);
     Ok(())
 }
@@ -270,13 +288,28 @@ pub(crate) fn cmd_batch(args: BatchArgs, is_async: bool) -> Result<()> {
             "顶层写成 {\"steps\":[...]}，或直接给一个数组",
         ));
     };
-    object.insert(
-        "concurrency".to_string(),
-        json!(args.concurrency.clamp(1, 32)),
-    );
+    // `batch --concurrency` 以前静默 `clamp(1,32)`，与 scrape 的 exit 2 口径相反。
+    // 同一类参数在两条命令上不能一个报错一个改值，否则调用方永远不知道该信哪个。
+    let max_parallel = super::cmd_scrape::MAX_PARALLEL;
+    if args.concurrency == 0 || args.concurrency > max_parallel {
+        return Err(usage_failure(
+            "invalid_argument",
+            format!(
+                "batch --concurrency 必须在 1~{max_parallel} 之间（收到 {}）",
+                args.concurrency
+            ),
+            "与 atb scrape 同一上限；过大会让 daemon 一次性开出过多标签页",
+        ));
+    }
+    object.insert("concurrency".to_string(), json!(args.concurrency));
+    // batch 也走同一份 stop_on_error 合并（无 --continue-on-error 开关，
+    // 文件给了就沿用文件值，缺省仍是遇错即停），并回显生效值。
+    let stop_on_error = apply_stop_on_error(object, false)?;
     // 同 run：超时按步骤预算算，不再写死 600s。
     let http_timeout = pipeline_http_timeout(&payload);
-    print_json(request("POST", "/batch", Some(payload), http_timeout)?);
+    let mut value = request("POST", "/batch", Some(payload), http_timeout)?;
+    echo_stop_on_error(&mut value, stop_on_error);
+    print_json(value);
     Ok(())
 }
 

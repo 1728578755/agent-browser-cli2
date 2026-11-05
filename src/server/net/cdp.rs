@@ -1,5 +1,86 @@
 use super::*;
 
+/// CDP 规则的体积上限。
+///
+/// `body` / `response.body` 会被整份落进 `net-hooks.json`，再随每条规则广播给**每个**
+/// 标签；一条 20MB 的 mock body 会让 daemon 落盘 + N 次 WS 消息同时爆掉。
+/// 返回 `(单条字节上限, 单 profile 规则条数上限)`，可用环境变量调整。
+fn net_rule_limits() -> (usize, usize) {
+    (
+        crate::settings::env_usize_clamped(
+            "ATB_NET_RULE_MAX_BYTES",
+            2 * 1024 * 1024,
+            1024,
+            16 * 1024 * 1024,
+        ),
+        crate::settings::env_usize_clamped("ATB_NET_RULE_MAX_RULES", 64, 1, 500),
+    )
+}
+
+fn json_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+/// 校验一条拦截规则的可下发性：body 类型、字节数。
+///
+/// 页面引擎与 CDP 引擎共用同一份规则形状，校验放在 `net_value` 解析完 rule 之后
+/// 统一做一次，避免只有 `--engine cdp` 受保护。
+pub(crate) fn validate_net_rule(action: &str, rule: &Value) -> Result<()> {
+    let (max_bytes, _) = net_rule_limits();
+    for key in ["body", "requestBody"] {
+        let Some(value) = rule.get(key).filter(|value| !value.is_null()) else {
+            continue;
+        };
+        if !(value.is_string() || value.is_object() || value.is_array()) {
+            return Err(anyhow!(
+                "net {action}: rule.{key} 必须是字符串或 JSON 对象/数组（收到 {}）",
+                json_kind(value)
+            ));
+        }
+        let bytes = value
+            .as_str()
+            .map(str::len)
+            .unwrap_or_else(|| value.to_string().len());
+        if bytes > max_bytes {
+            return Err(anyhow!(
+                "net_rule_too_large: rule.{key} 有 {bytes} 字节，超过上限 {max_bytes} 字节\
+                 （可用 ATB_NET_RULE_MAX_BYTES 调整，值域 1KiB..16MiB）；\
+                 建议改为短 stub，或让页面自己请求大文件（clamped: 未下发，规则未写入）"
+            ));
+        }
+    }
+    if let Some(response_body) = rule
+        .get("response")
+        .and_then(|response| response.get("body"))
+        .filter(|value| !value.is_null())
+    {
+        if !(response_body.is_string() || response_body.is_object() || response_body.is_array()) {
+            return Err(anyhow!(
+                "net {action}: rule.response.body 必须是字符串或 JSON 对象/数组（收到 {}）",
+                json_kind(response_body)
+            ));
+        }
+        let bytes = response_body
+            .as_str()
+            .map(str::len)
+            .unwrap_or_else(|| response_body.to_string().len());
+        if bytes > max_bytes {
+            return Err(anyhow!(
+                "net_rule_too_large: rule.response.body 有 {bytes} 字节，超过上限 {max_bytes} 字节\
+                 （可用 ATB_NET_RULE_MAX_BYTES 调整）；clamped: 未下发，规则未写入"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// 网络层增删改：只改 profile 上的规则，然后逐标签下发到扩展。
 ///
 /// 返回体里的 `applied` 已经说明下发明细；旧签名多带一个恒为 `true` 的 bool，
@@ -41,6 +122,7 @@ pub(crate) async fn net_cdp_action(
             if pattern.is_empty() {
                 return Err(anyhow!("net {action}: rule.match 不能为空"));
             }
+            validate_net_rule(action, &rule)?;
             let method = rule
                 .get("method")
                 .and_then(Value::as_str)
@@ -59,6 +141,17 @@ pub(crate) async fn net_cdp_action(
                     == method;
                 same_match && same_method
             });
+            // 条数上限只对「新增」生效：更新已有规则不该被上限挡住。
+            if existing.is_none() {
+                let (_, max_rules) = net_rule_limits();
+                if rules.len() >= max_rules {
+                    return Err(anyhow!(
+                        "net_rule_too_large: 当前 profile 已有 {} 条 CDP 规则，达到上限 {max_rules}\
+                         （可用 ATB_NET_RULE_MAX_RULES 调整）；请先 `net unroute` 掉不用的规则",
+                        rules.len()
+                    ));
+                }
+            }
             match existing {
                 Some(index) => rules[index] = rule.clone(),
                 None => rules.push(rule.clone()),
@@ -93,27 +186,59 @@ pub(crate) async fn net_cdp_action(
             let before = rules.len();
             rules.retain(|item| item.get("match").and_then(Value::as_str) != Some(needle.as_str()));
             let removed = before - rules.len();
+            // 删光规则后必须 `stop` 关掉 Fetch 域：只发一个空 `rules` 会让
+            // Fetch 仍处于 enabled 状态，浏览器侧继续暂停/转发每个请求，
+            // 而 daemon 侧 `cdpEnabled` 还是 true —— 用户再没有任何命令能把它关掉。
+            let cleared = rules.is_empty();
+            let verb = if cleared { "stop" } else { apply_verb };
+            let payload_rules = if cleared { json!([]) } else { json!(rules) };
             // 重建待办时即使 cdpEnabled 为 false 也要下发：否则重启后的首个
             // unroute 只改配置，浏览器侧的旧拦截还在。
-            let apply = if enabled || rebuild {
-                net_cdp_broadcast(state, profile_key, apply_verb, &json!(rules), timeout).await?
+            let apply = if cleared || enabled || rebuild {
+                net_cdp_broadcast(state, profile_key, verb, &payload_rules, timeout).await?
             } else {
                 Value::Null
             };
             config["cdpRules"] = json!(rules);
-            if rebuild
+            let fully_applied = apply.get("ok").and_then(Value::as_bool) == Some(true)
                 && apply
                     .get("failed")
                     .and_then(Value::as_array)
                     .map(|failed| failed.is_empty())
-                    .unwrap_or(true)
-            {
-                config["cdpRebuildRequired"] = json!(false);
+                    .unwrap_or(true);
+            let mut warning: Option<String> = None;
+            if cleared {
+                if fully_applied {
+                    config["cdpEnabled"] = json!(false);
+                    config["cdpRebuildRequired"] = json!(false);
+                } else if apply.is_null() {
+                    // 没有可下发的标签（配置里本来就没启用）：同步复位即可。
+                    config["cdpEnabled"] = json!(false);
+                } else {
+                    // 部分标签没停下来：保留 cdpEnabled=true，让下一次 unroute / reset
+                    // 还能再命中它们（否则配置已复位，这些标签的拦截再也停不掉）。
+                    warning = Some(
+                        "部分标签未能停止 CDP 拦截，已保留 cdpEnabled 以便重试（见 applied.failed）"
+                            .to_string(),
+                    );
+                }
+            } else if enabled || rebuild {
+                config["cdpEnabled"] = json!(true);
+                if rebuild && fully_applied {
+                    config["cdpRebuildRequired"] = json!(false);
+                }
             }
-            Ok(json!({
+            let mut payload = json!({
                 "ok": true, "action": "unroute", "engine": "cdp",
-                "removed": removed, "routes": rules.len(), "all": rules, "applied": apply
-            }))
+                "removed": removed, "routes": rules.len(), "all": rules, "applied": apply,
+                // cleared=true 表示规则已删光且已下发 stop；cdp_enabled 是写回后的真实状态。
+                "cleared": cleared,
+                "cdp_enabled": config.get("cdpEnabled").cloned().unwrap_or(json!(false)),
+            });
+            if let Some(warning) = warning {
+                payload["warning"] = json!(warning);
+            }
+            Ok(payload)
         }
         _ => Err(anyhow!("net: engine=cdp 不支持 action {action}")),
     }
@@ -133,28 +258,61 @@ pub(crate) async fn profile_sessions(state: &AppState, profile_key: &str) -> Vec
 
 /// 把 `debugPass` 开关同步到扩展侧的 per-tab 状态，让 CDP 的 pass 日志真正开始记录。
 ///
-/// 走 `rules` 而不是 `start`：`start` 会清空已有日志与统计。失败不致命，
-/// 只是这次 `net log --debug-pass` 拿不到 pass 条目。
+/// 走 `rules` 而不是 `start`：`start` 会清空已有日志与统计。`enabled` 是**每次都要
+/// 下发**的最终值：旧实现只在打开时下发 `debugPass: true`，于是
+/// `net log`（不带 `--debug-pass`）永远关不掉上一次打开的开关，pass 日志只增不减，
+/// 也无从判断当前到底是开还是关。
 pub(crate) async fn net_cdp_set_debug_pass(
     state: &AppState,
     profile_key: &str,
     config: &Value,
     timeout: Duration,
-) {
+    enabled: bool,
+) -> Value {
     let rules = config.get("cdpRules").cloned().unwrap_or_else(|| json!([]));
-    for session_key in profile_sessions(state, profile_key).await {
-        let _ = extension_control(
-            state,
-            &session_key,
-            "netIntercept",
-            json!({ "action": "rules", "rules": rules, "debugPass": true }),
-            timeout,
-        )
-        .await;
+    let sessions = profile_sessions(state, profile_key).await;
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut set = tokio::task::JoinSet::new();
+    for session_key in sessions {
+        let task_state = state.clone();
+        let rules = rules.clone();
+        set.spawn(async move {
+            let tab_id = tab_id_of_session(&session_key);
+            let outcome = extension_control(
+                &task_state,
+                &session_key,
+                "netIntercept",
+                json!({ "action": "rules", "rules": rules, "debugPass": enabled }),
+                timeout,
+            )
+            .await;
+            (tab_id, outcome)
+        });
     }
+    let mut applied = 0usize;
+    let mut failed: Vec<Value> = Vec::new();
+    loop {
+        let joined = match tokio::time::timeout_at(deadline, set.join_next()).await {
+            Ok(Some(joined)) => joined,
+            Ok(None) | Err(_) => break,
+        };
+        match joined {
+            Ok((_tab_id, Ok(_))) => applied += 1,
+            Ok((tab_id, Err(err))) => failed.push(json!({
+                "tab_id": tab_id,
+                "error": humanize_extension_error(&err.to_string()),
+            })),
+            Err(err) => eprintln!("net: debugPass 同步任务异常退出: {err}"),
+        }
+    }
+    json!({ "ok": failed.is_empty(), "enabled": enabled, "applied": applied, "failed": failed })
 }
 
 /// 把规则下发到该 profile 下的每个标签（Fetch 域是 per-tab 的）。
+///
+/// 并发 + 统一 deadline：旧实现串行等待每个标签，N 个标签各带一个
+/// `timeout`，总耗时可达 N×timeout；调用方此时正持有 `net_persist_lock`，
+/// 后续所有 net 命令都会被一起堵住（首请求慢 → 之后 150s 全线超时）。
 pub(crate) async fn net_cdp_broadcast(
     state: &AppState,
     profile_key: &str,
@@ -166,23 +324,40 @@ pub(crate) async fn net_cdp_broadcast(
     if sessions.is_empty() {
         return Err(anyhow!("该 profile 没有可用的标签页"));
     }
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut set = tokio::task::JoinSet::new();
+    for session_key in sessions.iter().cloned() {
+        let task_state = state.clone();
+        let action = action.to_string();
+        let rules = rules.clone();
+        set.spawn(async move {
+            let tab_id = tab_id_of_session(&session_key);
+            let outcome = extension_control(
+                &task_state,
+                &session_key,
+                "netIntercept",
+                json!({ "action": action, "rules": rules }),
+                timeout,
+            )
+            .await;
+            (session_key, tab_id, outcome)
+        });
+    }
     let mut applied = 0usize;
     let mut failures = Vec::new();
     // 扩展侧把「无法收窄 urlPattern、只能退化成 `*`（全量拦截）」的 match 放在
     // `fallbackMatches`（status / start / rules 三种回包都有）。合并多标签后去重，
     // 让 routes / route --engine cdp 的输出能看出是哪条规则把范围放大成了全量。
     let mut fallback_matches: Vec<String> = Vec::new();
-    for session_key in &sessions {
-        match extension_control(
-            state,
-            session_key,
-            "netIntercept",
-            json!({ "action": action, "rules": rules }),
-            timeout,
-        )
-        .await
-        {
-            Ok(value) => {
+    let mut pending: Vec<String> = sessions.clone();
+    loop {
+        let joined = match tokio::time::timeout_at(deadline, set.join_next()).await {
+            Ok(Some(joined)) => joined,
+            Ok(None) | Err(_) => break,
+        };
+        match joined {
+            Ok((session_key, _tab_id, Ok(value))) => {
+                pending.retain(|key| key != &session_key);
                 applied += 1;
                 if let Some(items) = value.get("fallbackMatches").and_then(Value::as_array) {
                     for item in items {
@@ -193,11 +368,23 @@ pub(crate) async fn net_cdp_broadcast(
                     }
                 }
             }
-            Err(err) => failures.push(json!({
-                "tab_id": tab_id_of_session(session_key),
-                "error": humanize_extension_error(&err.to_string())
-            })),
+            Ok((session_key, tab_id, Err(err))) => {
+                pending.retain(|key| key != &session_key);
+                failures.push(json!({
+                    "tab_id": tab_id,
+                    "error": humanize_extension_error(&err.to_string())
+                }));
+            }
+            Err(err) => eprintln!("net: 网络层规则下发任务异常退出: {err}"),
         }
+    }
+    // 预算用完后仍在跑（或被 abort）的标签：状态未知，按超时如实上报，
+    // 别让「没回来」看起来像「已经生效」。
+    for session_key in pending {
+        failures.push(json!({
+            "tab_id": tab_id_of_session(&session_key),
+            "error": format!("timeout: {}s 内未收到该标签的确认", timeout.as_secs()),
+        }));
     }
     if applied == 0 {
         let first = failures

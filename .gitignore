@@ -8,6 +8,7 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+node_modules/
 
 # Logs and local runtime state
 *.log

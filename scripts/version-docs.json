@@ -1,0 +1,90 @@
+{
+  "//": "版本串落点清单。sync-version.mjs 用它同时做校验与改写：patterns 里必须恰好有一个捕获组，捕获到的就是版本号；exclude 命中的行整行跳过（用于「扩展低于 5.0.0」这类阈值描述，不能当版本改写）。",
+  "//rules": "每条 file 至少命中 1 次，否则视为守卫失效并报错：只写固定句式时，文档一改措辞就会静默失守。历史快照不在此清单内。",
+  "cli": [
+    {
+      "file": "README.md",
+      "patterns": [
+        "release[- ]v(\\d+\\.\\d+\\.\\d+)",
+        "CLI / daemon\\s*\\|\\s*`(\\d+\\.\\d+\\.\\d+)`",
+        "- 当前版本[：:]\\s*`(\\d+\\.\\d+\\.\\d+)`"
+      ]
+    },
+    {
+      "file": "README_EN.md",
+      "patterns": [
+        "release[- ]v(\\d+\\.\\d+\\.\\d+)",
+        "CLI / daemon\\s*\\|\\s*`(\\d+\\.\\d+\\.\\d+)`",
+        "- Current version:\\s*`(\\d+\\.\\d+\\.\\d+)`"
+      ]
+    },
+    {
+      "file": "AI_INSTALL.md",
+      "patterns": [
+        "CLI\\s*`(\\d+\\.\\d+\\.\\d+)`",
+        "CLI (\\d+\\.\\d+\\.\\d+)",
+        "atb --version[^\\n]{0,16}?(\\d+\\.\\d+\\.\\d+)"
+      ]
+    },
+    {
+      "file": "SECURITY.md",
+      "patterns": ["最新版\\s*`(\\d+\\.\\d+\\.\\d+)`"]
+    },
+    {
+      "file": "CHANGELOG.md",
+      "patterns": [
+        "CLI / daemon\\s*\\|\\s*`(\\d+\\.\\d+\\.\\d+)`",
+        "CLI 仍为\\s*`(\\d+\\.\\d+\\.\\d+)`",
+        "compare/v(\\d+\\.\\d+\\.\\d+)\\.\\.\\.HEAD"
+      ]
+    },
+    {
+      "file": "docs/FEATURE_STATUS.md",
+      "patterns": ["CLI (\\d+\\.\\d+\\.\\d+)"]
+    }
+  ],
+  "extension": [
+    {
+      "file": "README.md",
+      "patterns": ["扩展[^\\d\\n]{0,20}(\\d+\\.\\d+\\.\\d+)"],
+      "exclude": ["低于.*\\d+\\.\\d+\\.\\d+", "127\\.0\\.0\\.\\d+"]
+    },
+    {
+      "file": "README_EN.md",
+      "patterns": ["[Ee]xtension[^\\d\\n]{0,32}(\\d+\\.\\d+\\.\\d+)"],
+      "exclude": ["older than.*\\d+\\.\\d+\\.\\d+", "127\\.0\\.0\\.\\d+"]
+    },
+    {
+      "file": "AI_INSTALL.md",
+      "patterns": ["\\b(5\\.\\d+\\.\\d+)\\b"]
+    },
+    {
+      "file": "SECURITY.md",
+      "patterns": ["当前扩展\\s*`(\\d+\\.\\d+\\.\\d+)`"]
+    },
+    {
+      "file": "PRIVACY.md",
+      "patterns": ["扩展文件版本\\s*(\\d+\\.\\d+\\.\\d+)"]
+    },
+    {
+      "file": "docs/FEATURE_STATUS.md",
+      "patterns": ["扩展 (\\d+\\.\\d+\\.\\d+)"]
+    },
+    {
+      "file": "docs/BEST_PRACTICES.md",
+      "patterns": ["扩展的文件版本（当前\\s*(\\d+\\.\\d+\\.\\d+)"]
+    },
+    {
+      "file": "skills/atb/SKILL.md",
+      "patterns": ["扩展文件版本（当前 \\*\\*(\\d+\\.\\d+\\.\\d+)"]
+    },
+    {
+      "file": "skills/atb/references/troubleshooting.md",
+      "patterns": ["扩展文件版本\\s*`(\\d+\\.\\d+\\.\\d+)`"]
+    },
+    {
+      "file": "CHANGELOG.md",
+      "patterns": ["Chrome 扩展\\s*\\|\\s*`(\\d+\\.\\d+\\.\\d+)`"]
+    }
+  ]
+}

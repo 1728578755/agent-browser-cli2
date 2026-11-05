@@ -2,11 +2,16 @@ use super::*;
 #[allow(unused_imports)]
 use clap::{Args, Parser, Subcommand};
 
+/// 用户主目录（`~` 展开用）。
+///
+/// 以前是「HOME → USERPROFILE」，与 daemon 的启动 cwd（`dirs::home_dir`）
+/// 是两套口径。Windows/Git-Bash/WSL 下 `HOME` 常被改成别的目录，于是 `--out ~/x`
+/// 与 daemon 侧解析出的 `~` 指向不同位置。
+///
+/// 现在统一走 `config::home_dir`（建立的唯一解析入口，内部即
+/// `dirs::home_dir()`）；`ATB_HOME` 只影响**配置目录**，不再影响 `~` 展开。
 pub(crate) fn home_dir() -> Result<PathBuf> {
-    env::var_os("HOME")
-        .or_else(|| env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .ok_or_else(|| anyhow!("无法定位用户主目录"))
+    config::home_dir().ok_or_else(|| anyhow!("无法定位用户主目录"))
 }
 
 // ---------------------------------------------------------------- WebSocket 信任配置
@@ -48,26 +53,53 @@ pub(crate) fn load_ws_trust_json_inner(path: &Path, allow_empty: bool) -> Result
         Ok(text) => text,
         // 文件不存在等于「未配置」，即兼容模式，不要报错。
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(json!({})),
+        // 配置读/解析失败要给稳定 error_code + 可执行修复建议，
+        // 而不是让 anyhow 冒到 main 变成一句 `Error: ...`。
         Err(err) => {
-            return Err(err).with_context(|| format!("读取信任配置失败: {}", path.display()))
+            return Err(usage_failure(
+                "invalid_trust_config",
+                format!("读取信任配置失败: {}（{err}）", path.display()),
+                format!(
+                    "检查该文件的权限；确认无误后删除 {} 再重跑，或用 atb trust-extension --clear 回到兼容模式",
+                    path.display()
+                ),
+            ))
         }
     };
     if text.trim().is_empty() {
         if allow_empty {
             return Ok(json!({}));
         }
-        return Err(usage_err!(
-            "信任配置为空（{}）：空文件不会被当成「未配置」，daemon 会拒绝所有 WebSocket 连接。\
-             要回到兼容模式请删除该文件；要重新配置可运行 atb trust-extension <id>（会直接覆盖）",
-            path.display()
+        return Err(usage_failure(
+            "invalid_trust_config",
+            format!(
+                "信任配置为空（{}）：空文件不会被当成「未配置」，daemon 会拒绝所有 WebSocket 连接",
+                path.display()
+            ),
+            format!(
+                "要回到兼容模式请删除 {}；要重新配置可运行 atb trust-extension <id>（会直接覆盖）",
+                path.display()
+            ),
         ));
     }
-    let value: Value = serde_json::from_str(&text)
-        .with_context(|| format!("信任配置不是合法 JSON: {}", path.display()))?;
+    let value: Value = serde_json::from_str(&text).map_err(|err| {
+        usage_failure(
+            "invalid_trust_config",
+            format!("信任配置不是合法 JSON: {}（{err}）", path.display()),
+            format!(
+                "删除 {} 后重跑，或用 atb trust-extension --clear 重建（形如 {{\"extension_ids\": [], \"token\": null}}）",
+                path.display()
+            ),
+        )
+    })?;
     if !value.is_object() {
-        return Err(usage_err!(
-            "信任配置必须是 JSON 对象（形如 {{\"extension_ids\": [...], \"token\": \"...\"}}）: {}",
-            path.display()
+        return Err(usage_failure(
+            "invalid_trust_config",
+            format!(
+                "信任配置必须是 JSON 对象（形如 {{\"extension_ids\": [...], \"token\": \"...\"}}）: {}",
+                path.display()
+            ),
+            format!("删除 {} 后重跑 atb trust-extension <id> 重建", path.display()),
         ));
     }
     Ok(value)
@@ -109,16 +141,78 @@ pub(crate) fn save_ws_trust_json(path: &Path, value: &Value) -> Result<()> {
             .with_context(|| format!("创建临时文件失败: {}", tmp.display()))?;
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
-        // Windows 上打开中的文件不能改名，先显式关闭句柄（与 save_api_token 一致）。
+        // 临时文件里已经含 token：替换前就收紧，避免「文件名可猜 + 中间态」被读。
+        // Windows 上打开中的文件不能改 ACL 也不能改名，所以先显式关闭句柄。
         drop(file);
+        #[cfg(windows)]
+        if let Err(err) = config::restrict_file_and_backup_acl(&tmp) {
+            eprintln!(
+                "警告: 收紧临时文件 {} 的权限失败: {err}（同机其他用户可能读到握手 token）",
+                tmp.display()
+            );
+        }
         config::replace_file_atomically(&tmp, path)
             .with_context(|| format!("保存信任配置失败: {}", path.display()))?;
         Ok(())
     })();
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
+        return result;
     }
-    result
+    // `ws-trust.json` 可能含握手 token，保护级别必须与
+    // `api-token` 对齐。统一复用 `config::restrict_file_and_backup_acl`
+    // （Windows：去继承 ACE + 移除宽松 ACE + 只授权当前用户 SID；`.bak` 同样处理），
+    // 不再在 CLI 侧维护第二份 icacls 逻辑。
+    #[cfg(windows)]
+    if let Err(err) = config::restrict_file_and_backup_acl(path) {
+        eprintln!(
+            "警告: 收紧 {} 的权限失败: {err}（同机其他用户可能读到握手 token）",
+            path.display()
+        );
+    }
+    // 落盘后读回权限做自检（Unix 校验 mode，Windows 校验 ACL 不再有继承项）。
+    // 收紧失败不阻断保存（配置已写入），但必须让人看到，不能静默 fail-open。
+    if !ws_trust_permissions_are_private(path) {
+        eprintln!(
+            "警告: {} 的权限未能收紧到「仅本人可读」，同机其他用户可能读到握手 token；\
+             请检查目录 ACL 或用 ATB_HOME 指到私有目录",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// 落盘后读回校验：Unix 看 mode，Windows 看 icacls 输出是否还有继承项 `(I)`。
+#[cfg(unix)]
+fn ws_trust_permissions_are_private(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    match fs::metadata(path) {
+        Ok(metadata) => {
+            let mode = metadata.permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                // rename 在某些文件系统上不保留 mode：再显式设一次 0600。
+                let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+                return fs::metadata(path)
+                    .map(|m| m.permissions().mode() & 0o077 == 0)
+                    .unwrap_or(false);
+            }
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+#[cfg(windows)]
+fn ws_trust_permissions_are_private(path: &Path) -> bool {
+    let Ok(output) = Command::new("icacls").arg(path).output() else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    // `(I)` 表示继承 ACE：说明 `/inheritance:r` 没生效（或读回的是旧 ACL）。
+    !text.contains("(I)")
 }
 
 /// 读 extension_ids 并按原顺序去重（服务端比对时会各自 trim + 忽略大小写）。
@@ -245,7 +339,9 @@ pub(crate) fn print_trust_state(
         "extension_ids": ids,
         "token_required": token_required,
         "enforcing": enforcing,
-        "path": path,
+        // `json!({"path": &Path})` 在非 UTF-8 路径上会 panic（serde 不支持 Path）。
+        // 与其它输出口径一致，统一转成 display 字符串。
+        "path": path.display().to_string(),
         "message": message,
     });
     if let Some(checked) = checked {
@@ -267,8 +363,12 @@ pub(crate) fn print_trust_state(
     Ok(())
 }
 
-pub(crate) fn run_trust_extension(args: TrustExtensionArgs) -> Result<()> {
-    let path = ws_trust_path()?;
+/// `trust-extension` 的参数互斥/完整性校验。
+///
+/// 抽出来的原因：以前 `--dry-run` 只校验了 `--remove` 与 `--token` 冲突两项，
+/// 于是 `--list --clear`、`--clear <id>`、空参数在 dry-run 下都返回 `ok:true`，
+/// 去掉 `--dry-run` 才报错——典型的「假绿」。现在两条路径共用同一份规则。
+fn validate_trust_args(args: &TrustExtensionArgs) -> Result<()> {
     let other_than_list = args.extension_id.is_some()
         || args.remove
         || args.clear
@@ -276,22 +376,55 @@ pub(crate) fn run_trust_extension(args: TrustExtensionArgs) -> Result<()> {
         || args.clear_token;
     let other_than_clear =
         args.extension_id.is_some() || args.remove || args.token.is_some() || args.clear_token;
-    // `trust-extension --dry-run` 以前会真的改写 ws-trust.json。
-    if DRY_RUN.load(Ordering::Relaxed) {
-        // 复核（/7）：dry-run 也必须做本地参数校验，否则「计划 ok:true」之后
-        // 去掉 --dry-run 才发现 ID 不合法 / --remove 少了 ID，等于假绿。
-        let extension_id = match args.extension_id.as_deref() {
-            Some(raw) => Some(normalize_extension_id(raw)?),
-            None => None,
-        };
-        if args.remove && extension_id.is_none() {
+    if args.list && other_than_list {
+        return Err(usage_err!(
+            "--list 只读，不能和 <id> / --remove / --clear / --token / --clear-token 同时使用"
+        ));
+    }
+    if args.clear && other_than_clear {
+        return Err(usage_err!(
+            "--clear 会清空白名单与 token，不能和 <id> / --remove / --token / --clear-token 同时使用"
+        ));
+    }
+    if args.remove && args.extension_id.is_none() {
+        return Err(usage_err!(
+            "--remove 需要同时给出扩展 ID：atb trust-extension <id> --remove"
+        ));
+    }
+    if args.clear_token && args.token.is_some() {
+        return Err(usage_err!("--token 和 --clear-token 不能同时使用"));
+    }
+    if let Some(raw) = args.token.as_deref() {
+        if raw.trim().is_empty() {
             return Err(usage_err!(
-                "--remove 需要同时给出扩展 ID：atb trust-extension <id> --remove"
+                "--token 不能是空字符串；要清除 token 请用 --clear-token"
             ));
         }
-        if args.clear_token && args.token.is_some() {
-            return Err(usage_err!("--token 和 --clear-token 不能同时使用"));
-        }
+    }
+    if args.extension_id.is_none()
+        && args.token.is_none()
+        && !args.clear_token
+        && !args.list
+        && !args.clear
+    {
+        return Err(usage_err!(
+            "需要扩展 ID，或改用 --list / --clear / --token <值> / --clear-token"
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn run_trust_extension(args: TrustExtensionArgs) -> Result<()> {
+    let path = ws_trust_path()?;
+    // dry-run 与真实分支共用同一套校验，避免「计划 ok、执行报错」。
+    validate_trust_args(&args)?;
+    // 扩展 ID 的格式校验与分支无关：非法 ID 在 dry-run 下也必须暴露。
+    let extension_id = match args.extension_id.as_deref() {
+        Some(raw) => Some(normalize_extension_id(raw)?),
+        None => None,
+    };
+    // `trust-extension --dry-run` 以前会真的改写 ws-trust.json。
+    if DRY_RUN.load(Ordering::Relaxed) {
         let action = if args.list {
             "list"
         } else if args.clear {
@@ -310,53 +443,29 @@ pub(crate) fn run_trust_extension(args: TrustExtensionArgs) -> Result<()> {
             "dry_run": true,
             "op": "trust-extension",
             "action": action,
-            "path": path,
+            "path": path.display().to_string(),
             "extension_id": extension_id,
             "hint": "去掉 --dry-run 才会写盘；写盘后会对不可信连接触发一次重载",
         }));
         return Ok(());
     }
     if args.list {
-        if other_than_list {
-            return Err(usage_err!(
-                "--list 只读，不能和 <id> / --remove / --clear / --token / --clear-token 同时使用"
-            ));
-        }
         let value = load_ws_trust_json(&path)?;
         return print_trust_state(&path, &value, "list", false, &TrustReload::Skipped);
     }
     if args.clear {
-        if other_than_clear {
-            return Err(usage_err!(
-                "--clear 会清空白名单与 token，不能和 <id> / --remove / --token / --clear-token 同时使用"
-            ));
-        }
         save_ws_trust_json(&path, &json!({ "extension_ids": [], "token": null }))?;
         let value = load_ws_trust_json(&path)?;
         // 清空 = 回到兼容模式，此时不应再踢任何连接（白名单为空表示「谁都能连」）。
         let reload = reload_daemon_trust();
         return print_trust_state(&path, &value, "clear", true, &reload);
     }
-    if args.remove && args.extension_id.is_none() {
-        return Err(usage_err!(
-            "--remove 需要同时给出扩展 ID：atb trust-extension <id> --remove"
-        ));
-    }
-    if args.clear_token && args.token.is_some() {
-        return Err(usage_err!("--token 和 --clear-token 不能同时使用"));
-    }
-    if args.extension_id.is_none() && args.token.is_none() && !args.clear_token {
-        return Err(usage_err!(
-            "需要扩展 ID，或改用 --list / --clear / --token <值> / --clear-token"
-        ));
-    }
 
     let mut value = load_ws_trust_json_for_update(&path)?;
     let before = value.clone();
     let mut ids = trust_ids_of(&value);
     let mut actions: Vec<&str> = Vec::new();
-    if let Some(raw) = args.extension_id.as_deref() {
-        let id = normalize_extension_id(raw)?;
+    if let Some(id) = extension_id.clone() {
         if args.remove {
             let before_len = ids.len();
             ids.retain(|item| item != &id);
@@ -408,4 +517,75 @@ pub(crate) fn run_trust_extension(args: TrustExtensionArgs) -> Result<()> {
         TrustReload::Skipped
     };
     print_trust_state(&path, &value, &actions.join("+"), changed, &reload)
+}
+
+#[cfg(test)]
+mod trust_args_tests {
+    use super::*;
+
+    fn empty_args() -> TrustExtensionArgs {
+        TrustExtensionArgs {
+            extension_id: None,
+            remove: false,
+            list: false,
+            clear: false,
+            token: None,
+            clear_token: false,
+        }
+    }
+
+    #[test]
+    fn validate_rejects_invalid_combinations() {
+        // dry-run 曾经对这些组合返回 ok:true。
+        assert!(validate_trust_args(&empty_args()).is_err(), "空参数应报错");
+
+        let mut list_and_clear = empty_args();
+        list_and_clear.list = true;
+        list_and_clear.clear = true;
+        assert!(
+            validate_trust_args(&list_and_clear).is_err(),
+            "--list 与 --clear 互斥"
+        );
+
+        let mut remove_without_id = empty_args();
+        remove_without_id.remove = true;
+        assert!(
+            validate_trust_args(&remove_without_id).is_err(),
+            "--remove 需要 <id>"
+        );
+
+        let mut empty_token = empty_args();
+        empty_token.token = Some("   ".to_string());
+        assert!(
+            validate_trust_args(&empty_token).is_err(),
+            "--token 不能是空白"
+        );
+
+        let mut token_and_clear = empty_args();
+        token_and_clear.token = Some("secret".to_string());
+        token_and_clear.clear_token = true;
+        assert!(
+            validate_trust_args(&token_and_clear).is_err(),
+            "--token 与 --clear-token 互斥"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_single_intent() {
+        let mut list = empty_args();
+        list.list = true;
+        assert!(validate_trust_args(&list).is_ok());
+
+        let mut clear = empty_args();
+        clear.clear = true;
+        assert!(validate_trust_args(&clear).is_ok());
+
+        let mut add = empty_args();
+        add.extension_id = Some("abcdefghijklmnopabcdefghijklmnop".to_string());
+        assert!(validate_trust_args(&add).is_ok());
+
+        let mut token = empty_args();
+        token.token = Some("secret".to_string());
+        assert!(validate_trust_args(&token).is_ok());
+    }
 }

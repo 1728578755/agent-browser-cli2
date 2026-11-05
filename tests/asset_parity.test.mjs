@@ -4,7 +4,10 @@
 // 真正被 scripting.executeScript 注入的那一份。两份靠复制同步，历史上就出现过
 // 只改一边、线上跑的是旧逻辑的问题（TOKEN_SELECTORS 被删掉就是这么漏出去的）。
 // 这里做逐字节比对，并给出差异偏移，方便定位。
-import { existsSync, readFileSync, statSync } from 'node:fs';
+//
+// 页面清单不再手工维护：`assets/page_*.js` 出现一个新脚本就自动纳入比对，
+// 避免「新增 page_xxx.js 却忘了加进 PAGES」的静默漏洞。
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -13,13 +16,17 @@ const ROOT = join(HERE, '..');
 const ASSETS = join(ROOT, 'assets');
 const OPS = join(ASSETS, 'atb_bridge', 'ops');
 
-const PAGES = ['action', 'challenge', 'find', 'net', 'read', 'snapshot', 'stealth', 'wait'];
-
+const PAGES = readdirSync(ASSETS)
+  .filter((name) => /^page_.*\.js$/.test(name))
+  .map((name) => name.replace(/^page_/, '').replace(/\.js$/, ''))
+  .sort();
+// 清单为空说明目录结构变了，后续循环会一条断言都不产生（假绿），必须显式判红。
 const results = [];
 function check(name, ok, detail) {
   results.push({ name, ok, detail });
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${ok || !detail ? '' : '\n        → ' + detail}`);
 }
+check('assets/page_*.js 页面清单非空', PAGES.length > 0, `扫描到 ${PAGES.length} 个页面脚本`);
 
 function firstDiffOffset(a, b) {
   const limit = Math.min(a.length, b.length);
@@ -128,26 +135,81 @@ for (const [label, ok] of versionChecks) {
   check(`${label} = manifest ${extVersion}`, ok, `README 与 manifest.json（${extVersion}）不一致`);
 }
 
-// 更强的守卫：**当前文档**里出现的任何 `5.2.x` 都必须等于 manifest 版本。
-// 只查固定句式会漏掉「安装文档里 7 处 5.2.5」这种整篇漂移（v11 实测踩到）。
-// 历史快照（CODE_REVIEW_* / WORKLOG_* / REMEDIATION_* / CHANGELOG_ARCHIVE）不在此列。
-const CURRENT_DOCS = [
+// 更强的守卫：**当前文档**里出现的任何 `5.x.y` 都必须等于 manifest 版本。
+// 只查固定句式会漏掉「安装文档里多处旧版本号」这种整篇漂移。
+// 历史快照不在此列。
+//
+// 清单来源：
+//   1. scripts/version-docs.json 的 extension[] —— 打包脚本与文档共用同一份落点，
+//      新增文档自动纳入；文件缺失时回落到内置清单（离线 / 局部检出也能跑）。
+//   2. 内置清单必须包含 SECURITY.md / PRIVACY.md：这两份是用户与审计判断扩展
+//      版本的主要依据，曾经整篇停在 5.2.5 而守卫全绿。
+const FALLBACK_DOCS = [
   'README.md',
   'README_EN.md',
   'AI_INSTALL.md',
+  'SECURITY.md',
+  'PRIVACY.md',
   'docs/FEATURE_STATUS.md',
   'docs/BEST_PRACTICES.md',
   'skills/atb/SKILL.md',
   'skills/atb/references/commands.md',
   'skills/atb/references/recipes.md',
   'skills/atb/references/troubleshooting.md',
+  'CHANGELOG.md',
 ];
-for (const rel of CURRENT_DOCS) {
-  const text = readFileSync(join(ROOT, ...rel.split('/')), 'utf8');
-  const versions = [...text.matchAll(/5\.2\.\d+/g)].map((match) => match[0]);
+let docsSpec = FALLBACK_DOCS.map((file) => ({ file, exclude: [] }));
+try {
+  const parsed = JSON.parse(readFileSync(join(ROOT, 'scripts', 'version-docs.json'), 'utf8'));
+  const fromSpec = Array.isArray(parsed.extension)
+    ? parsed.extension
+        .filter((entry) => entry && typeof entry.file === 'string')
+        .map((entry) => ({
+          file: entry.file,
+          exclude: Array.isArray(entry.exclude) ? entry.exclude : [],
+        }))
+    : [];
+  if (fromSpec.length > 0) docsSpec = fromSpec;
+} catch {
+  // 清单不存在/不可解析：继续用内置清单，守卫不能因此静默消失。
+}
+
+// 历史能力门槛（「扩展低于 5.0.0」「5.0.0 起」）说的是旧版本边界，不是「当前版本」。
+// 这些行必须豁免，否则升级扩展会逼着文档篡改历史。
+const HISTORICAL_THRESHOLD =
+  /低于\s*5\.\d+\.\d+|older than\s*5\.\d+\.\d+|≥\s*5\.0\.0|5\.0\.0\s*(起|之前|的改动)/;
+// CHANGELOG 的历史段落必然包含旧版本号，只扫文件头（当前版本表格/最新一节）。
+const HEADER_LINES = { 'CHANGELOG.md': 24 };
+
+const seen = new Set();
+for (const spec of docsSpec) {
+  if (seen.has(spec.file)) continue;
+  seen.add(spec.file);
+  const abs = join(ROOT, ...spec.file.split('/'));
+  if (!existsSync(abs)) {
+    check(`${spec.file} 存在（版本落点清单）`, false, '清单里的文档不存在');
+    continue;
+  }
+  const text = readFileSync(abs, 'utf8');
+  const headerLimit = HEADER_LINES[spec.file];
+  const lines = text.split(/\r?\n/);
+  const scanned = headerLimit ? lines.slice(0, headerLimit) : lines;
+  const excludes = spec.exclude.map((pattern) => new RegExp(pattern));
+  const versions = [];
+  for (const line of scanned) {
+    if (HISTORICAL_THRESHOLD.test(line)) continue;
+    if (excludes.some((pattern) => pattern.test(line))) continue;
+    for (const match of line.matchAll(/\b5\.\d+\.\d+\b/g)) versions.push(match[0]);
+  }
+  // 一条都没命中说明句式变了、文件被搬走或清单与文档脱节，守卫已经失效。
+  check(
+    `${spec.file} 能定位到扩展版本串（守卫未脱节）`,
+    versions.length > 0,
+    '文档里没有任何 5.x.y 版本串——落点清单可能已过期',
+  );
   const stale = [...new Set(versions)].filter((version) => version !== extVersion);
   check(
-    `${rel} 不含过期的 5.2.x`,
+    `${spec.file} 不含过期的扩展版本`,
     stale.length === 0,
     `出现了 ${stale.join(', ')}（manifest 是 ${extVersion}）——升级扩展后同步这些文档`,
   );

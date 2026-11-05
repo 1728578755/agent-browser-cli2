@@ -12,7 +12,16 @@ function __abcWait(opts) {
   const timeoutMs = opts.timeoutMs > 0 ? Math.floor(opts.timeoutMs) : 10000;
   const selector = opts.selector ? String(opts.selector) : '';
   const text = opts.text ? String(opts.text) : '';
-  const jsCode = opts.js ? String(opts.js) : '';
+  // 谓词来源有两条：
+  //   1) opts.jsFunc 已经是函数 —— daemon / 扩展侧下发**已编译**的实现，
+  //      走 executeScript({func}) 不触发 eval，也就不受页面 CSP 约束；
+  //   2) opts.js 是字符串 —— 只能在页面里 new AsyncFunction 编译。
+  //
+  // 旧错误文案声称「CSP 页面编译失败 ⇒ 上层走 CDP 回退」，
+  // 但本文件（以及扩展注入通道）**没有任何 CDP 回退**：字符串路径失败就是失败。
+  // 现在如实返回结构化错误，不把调用方引向一条不存在的通道。
+  const jsFunc = typeof opts.jsFunc === 'function' ? opts.jsFunc : null;
+  const jsCode = !jsFunc && opts.js ? String(opts.js) : '';
   const visible = opts.visible === true;
   const minIntervalMs = opts.minIntervalMs >= 0 ? Math.floor(opts.minIntervalMs) : 50;
 
@@ -162,8 +171,8 @@ function __abcWait(opts) {
   }
 
   // 谓词编译：三种写法都要支持——语句级 return、裸表达式、多语句 + await。
-  // 编译只做一次；放在 Promise 外面，CSP 页面（禁 unsafe-eval）会同步抛错，
-  // 上层据此走 CDP 回退。
+  // 编译只做一次。**在页面里 new AsyncFunction 等于 eval**：页面 CSP 禁
+  // unsafe-eval 时会同步抛 EvalError。这里不掩饰这一点，只把失败如实交回上层。
   function compilePredicate(code) {
     const trimmed = String(code || '').trim();
     if (!trimmed) throw new Error('wait: js 为空');
@@ -175,8 +184,31 @@ function __abcWait(opts) {
     return new AsyncFunction(trimmed);
   }
 
-  const predicate = jsCode ? compilePredicate(jsCode) : null;
-  const mode = jsCode ? 'js-observer' : 'observer';
+  let predicate = jsFunc;
+  if (!predicate && jsCode) {
+    try {
+      predicate = compilePredicate(jsCode);
+    } catch (e) {
+      const detail = (e && e.message) || String(e);
+      return {
+        ok: false,
+        matched: false,
+        mode: 'js-observer',
+        error: 'js_predicate_compile_failed: ' + detail,
+        error_code: 'js_predicate_compile_failed',
+        // 归因写清楚：可能是 CSP（禁 unsafe-eval），也可能是谓词本身语法错。
+        // 无论哪种，本通道都没有 CDP 回退 —— 请改用 selector/text 条件，
+        // 或由调用方把谓词编译成函数后再下发（opts.jsFunc）。
+        hint: '字符串谓词在页面内编译失败（页面 CSP 禁止 unsafe-eval，或谓词本身语法错误）；'
+          + '本通道没有 CDP 回退，请改用 --selector/--text，或把谓词编译成函数下发',
+        polls: 0,
+        checks: 0,
+        elapsed_ms: 0
+      };
+    }
+  }
+  const hasPredicate = typeof predicate === 'function';
+  const mode = hasPredicate ? 'js-observer' : 'observer';
 
   return new Promise((resolve) => {
     let lastError = null;
@@ -200,7 +232,7 @@ function __abcWait(opts) {
         clearTimeout(trailing);
         trailing = null;
       }
-      if (jsCode) {
+      if (hasPredicate) {
         try { document.removeEventListener('visibilitychange', onMutation, true); } catch (_) {}
       }
     }
@@ -288,7 +320,7 @@ function __abcWait(opts) {
     }
 
     // 非 JS 条件（selector / text）的变更入口。节流窗口内的变更不能直接丢
-    // ：旧实现 `tick(false)` 在窗口内直接 return，恰好落在窗口里的那次
+    // 旧实现 `tick(false)` 在窗口内直接 return，恰好落在窗口里的那次
     // 「目标出现」就永久漏报，只能等超时。现在窗口内的变更加一个 trailing，
     // 窗口结束（minIntervalMs 后）必须再查一次。
     function onDomChange() {
@@ -335,7 +367,7 @@ function __abcWait(opts) {
       return finish(true, extra);
     }
 
-    if (jsCode) {
+    if (hasPredicate) {
       runPredicate();
     } else {
       tick(true);
@@ -344,7 +376,7 @@ function __abcWait(opts) {
 
     const root = document.documentElement || document;
     try {
-      observer = new MutationObserver(jsCode ? onMutation : onDomChange);
+      observer = new MutationObserver(hasPredicate ? onMutation : onDomChange);
       observer.observe(root, {
         childList: true,
         subtree: true,
@@ -356,7 +388,7 @@ function __abcWait(opts) {
       observer = null;
     }
 
-    if (jsCode) {
+    if (hasPredicate) {
       // 非 DOM 条件兜底：定时器 + 标签页可见性变化。
       ticker = setInterval(runPredicate, Math.max(minIntervalMs, 16));
       try {

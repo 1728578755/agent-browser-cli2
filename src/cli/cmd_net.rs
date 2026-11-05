@@ -41,7 +41,7 @@ pub(crate) fn parse_body(text: &str) -> Result<Value> {
         return match serde_json::from_str::<Value>(text) {
             Ok(value) => Ok(value),
             // 用法错（退出码 2），不是执行失败：以前走 anyhow → 退出码 1 +
-            // 纯文本，调用方会当成「可重试」。四个 --body 调用点统一继承。
+            // 纯文本，调用方会当成「可重试」（X-04）。四个 --body 调用点统一继承。
             Err(err) => Err(usage_failure(
                 "invalid_json",
                 format!(
@@ -61,7 +61,7 @@ pub(crate) fn run_net_command(cmd: NetCommand) -> Result<()> {
     let (payload, timeout) = match cmd.action {
         NetAction::Fetch(args) => {
             // 枚举值本地校验：非法值以前会原样下发，daemon 静默回落默认策略，
-            // 调用方以为「omit 掉了 cookie」，实际按 include 发了。
+            // 调用方以为「omit 掉了 cookie」，实际按 include 发了（X-15）。
             let credentials = args.credentials.to_ascii_lowercase();
             if !matches!(credentials.as_str(), "include" | "omit" | "same-origin") {
                 return Err(usage_failure(
@@ -95,7 +95,7 @@ pub(crate) fn run_net_command(cmd: NetCommand) -> Result<()> {
         NetAction::Hook(args) => {
             // 只把**显式给出**的开关放进 payload：服务端对 None 的处理是「沿用已存值」。
             // 旧实现每次都给 capture_bodies/max_log 默认值，第二次 `net hook --persist`
-            // 会把之前持久化的设置静默压回 false/200（端到端）。
+            // 会把之前持久化的设置静默压回 false/200（B-17 端到端）。
             let mut payload = json!({
                 "action": "hook",
                 "persist": args.persist,
@@ -232,9 +232,14 @@ pub(crate) fn run_net_command(cmd: NetCommand) -> Result<()> {
         ),
     };
     // 所有参数解析/校验都在起 daemon 之前完成：坏参数应当 exit 2，
-    // 而不是先把 daemon 拉起来再报错。
+    // 而不是先把 daemon 拉起来再报错（X-04 /）。
     ensure_server()?;
-    print_json(request("POST", "/net", Some(payload), timeout + 10.0)?);
+    print_json(request(
+        "POST",
+        "/net",
+        Some(payload),
+        http_budget(timeout),
+    )?);
     Ok(())
 }
 
@@ -247,7 +252,7 @@ pub(crate) fn run_network_command(args: NetworkCommand) -> Result<()> {
             Some(
                 json!({ "switch_tab_id": args.tab, "browser": args.browser, "profile": args.profile }),
             ),
-            args.timeout,
+            http_budget(args.timeout),
         )?),
         NetworkAction::List(args) => print_json(request(
             "POST",
@@ -259,7 +264,7 @@ pub(crate) fn run_network_command(args: NetworkCommand) -> Result<()> {
                 "filter": args.filter,
                 "limit": args.limit,
             })),
-            args.timeout,
+            http_budget(args.timeout),
         )?),
         NetworkAction::Detail(args) => print_json(request(
             "POST",
@@ -270,7 +275,7 @@ pub(crate) fn run_network_command(args: NetworkCommand) -> Result<()> {
                 "profile": args.profile,
                 "request_id": args.request_id,
             })),
-            args.timeout,
+            http_budget(args.timeout),
         )?),
         NetworkAction::Clear(args) => print_json(request(
             "POST",
@@ -278,7 +283,7 @@ pub(crate) fn run_network_command(args: NetworkCommand) -> Result<()> {
             Some(
                 json!({ "switch_tab_id": args.tab, "browser": args.browser, "profile": args.profile }),
             ),
-            args.timeout,
+            http_budget(args.timeout),
         )?),
         NetworkAction::Stop(args) => print_json(request(
             "POST",
@@ -286,7 +291,7 @@ pub(crate) fn run_network_command(args: NetworkCommand) -> Result<()> {
             Some(
                 json!({ "switch_tab_id": args.tab, "browser": args.browser, "profile": args.profile }),
             ),
-            args.timeout,
+            http_budget(args.timeout),
         )?),
     }
     Ok(())
@@ -301,7 +306,7 @@ pub(crate) fn run_console_command(args: ConsoleCommand) -> Result<()> {
             Some(
                 json!({ "switch_tab_id": args.tab, "browser": args.browser, "profile": args.profile }),
             ),
-            args.timeout,
+            http_budget(args.timeout),
         )?),
         ConsoleAction::List(args) => print_json(request(
             "POST",
@@ -313,7 +318,7 @@ pub(crate) fn run_console_command(args: ConsoleCommand) -> Result<()> {
                 "level": args.level,
                 "limit": args.limit,
             })),
-            args.timeout,
+            http_budget(args.timeout),
         )?),
         ConsoleAction::Clear(args) => print_json(request(
             "POST",
@@ -321,7 +326,7 @@ pub(crate) fn run_console_command(args: ConsoleCommand) -> Result<()> {
             Some(
                 json!({ "switch_tab_id": args.tab, "browser": args.browser, "profile": args.profile }),
             ),
-            args.timeout,
+            http_budget(args.timeout),
         )?),
         ConsoleAction::Stop(args) => print_json(request(
             "POST",
@@ -329,7 +334,7 @@ pub(crate) fn run_console_command(args: ConsoleCommand) -> Result<()> {
             Some(
                 json!({ "switch_tab_id": args.tab, "browser": args.browser, "profile": args.profile }),
             ),
-            args.timeout,
+            http_budget(args.timeout),
         )?),
     }
     Ok(())

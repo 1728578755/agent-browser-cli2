@@ -1,21 +1,87 @@
 // 页面结构化读取：一次注入返回正文、标题、元信息、表单与链接统计。
 // 只做只读操作，不触发页面副作用。
 //
-// 性能约定（大页面）：
+// performance 约定（大页面）：
 // - 文本、计数、标题、链接、表单字段都在一次遍历里完成，不做 5~6 次 querySelectorAll；
 // - 元素数超过 visibleInnerTextLimit 时不再用 innerText（需要整页布局），
 //   改用 TreeWalker 近似可见性，并在 text_mode 里标记 "approx"；
 // - 全程受 budgetMs / maxNodes 约束，超限时返回 partial:true，而不是把页面卡死。
+//
+// ---- shadow DOM / iframe 边界----
+// open shadow root 的正文与控件也算「页面内容」：旧实现只读 document，
+// Web Components 站点会读出空正文并报 ok:true（静默假成功）。
+// 现在 opts.shadowDom = auto（默认）/ off：
+//   * 正文：主文档照旧走 innerText/TreeWalker，shadow root 的文本单独追加，
+//     回包用 shadow_text_merged / shadow_text_truncated 标明；
+//   * 控件统计/表单字段：逐个 root 各查一次；
+//   * 选择器：`a >>> b` 写法会逐层进 open shadow root（与 page_action.js 一致）。
+// closed shadow root 在页面 JS 里不可达，iframe 内容需要逐 frame 注入，
+// 二者都在回包里显式标注（shadow_closed_unreachable / frame_count / scope）。
 function __abcRead(opts) {
   opts = opts || {};
   const doc = document;
+  const shadowMode = String((opts.shadowDom || 'auto')).toLowerCase() === 'off' ? 'off' : 'auto';
+
+  /// 收集 open shadow root（嵌套也算），带「被跳过」计数。
+  const __abcReadShadowRoots = () => {
+    const out = [];
+    let skipped = 0;
+    if (shadowMode === 'off') {
+      try {
+        for (const el of doc.querySelectorAll('*')) if (el.shadowRoot) skipped += 1;
+      } catch (_) {}
+      return { roots: out, skipped: skipped };
+    }
+    const queue = [{ root: doc, depth: 0 }];
+    while (queue.length) {
+      const item = queue.shift();
+      let hosts = [];
+      try { hosts = item.root.querySelectorAll('*'); } catch (_) { hosts = []; }
+      for (const el of hosts) {
+        let shadow = null;
+        try { shadow = el.shadowRoot; } catch (_) { shadow = null; }
+        if (!shadow) continue;
+        if (item.depth >= 8 || out.length >= 200) { skipped += 1; continue; }
+        out.push(shadow);
+        queue.push({ root: shadow, depth: item.depth + 1 });
+      }
+    }
+    return { roots: out, skipped: skipped };
+  };
+
+  /// `host >>> inner` 选择器解析：逐层进 open shadow root。
+  /// 返回 {ok, el} 或 {ok:false, invalid:true}。
+  const __abcReadResolve = (selector) => {
+    const raw = String(selector || '');
+    const parts = raw.split('>>>').map((item) => item.trim());
+    let scope = doc;
+    let el = null;
+    for (let i = 0; i < parts.length; i += 1) {
+      const part = parts[i];
+      if (!part) throw new Error('empty selector segment');
+      if (i === 0) {
+        el = scope.querySelector(part);
+      } else {
+        if (!el) return { ok: true, el: null };
+        let shadow = null;
+        try { shadow = el.shadowRoot; } catch (_) { shadow = null; }
+        if (!shadow) return { ok: true, el: null, closed_shadow: true };
+        el = shadow.querySelector(part);
+      }
+      if (!el) return { ok: true, el: null };
+    }
+    return { ok: true, el: el };
+  };
+
+  const shadow = __abcReadShadowRoots();
   // 非法选择器会让 querySelector 直接抛 DOMException；不包起来的话，调用方拿到的是
   // 通道级错误（pageOp failed: ...），分不清「选择器写错了」和「注入失败了」。
   // 与 page_wait.js 的 `invalid selector:` 口径对齐。
   let root = null;
   if (opts.selector) {
     try {
-      root = doc.querySelector(opts.selector);
+      const resolved = __abcReadResolve(opts.selector);
+      root = resolved.el || null;
     } catch (e) {
       return { ok: false, error: 'invalid selector: ' + opts.selector + ' (' + ((e && e.message) || e) + ')' };
     }
@@ -84,13 +150,22 @@ function __abcRead(opts) {
     return /current-password|new-password|cc-number|cc-csc|one-time-code/.test(autocomplete);
   }
 
+  /// 派生文本掩码：与 page_find.js 的 __abcMaskDerived 同语义、不同名。
+  /// 表单字段的 `name` 是站点写的**结构标识**（agent 靠它定位字段），不是用户输入，
+  /// 因此只掩码 placeholder 这类可能夹带半明文的派生文本，并保留 redacted 标记。
+  function maskDerived(el, value) {
+    const raw = value === undefined || value === null ? '' : String(value);
+    if (!secretField(el)) return raw;
+    return raw ? '•••' : raw;
+  }
+
   // 走一次 TreeWalker 收集文本；includeAll=false 时粗略跳过明显隐藏的子树。
-  function collectText(includeAll) {
+  function collectText(includeAll, scopeRoot) {
     const chunks = [];
     let length = 0;
     let visited = 0;
     let truncated = false;
-    const walker = doc.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
+    const walker = doc.createTreeWalker(scopeRoot, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
       acceptNode(node) {
         if (node.nodeType === 3) return NodeFilter.FILTER_ACCEPT;
         const tag = node.tagName;
@@ -136,7 +211,7 @@ function __abcRead(opts) {
   let visited = 0;
 
   if (includeHidden) {
-    const got = collectText(true);
+    const got = collectText(true, root);
     text = got.text;
     textTruncated = got.truncated;
     visited = got.visited;
@@ -144,14 +219,41 @@ function __abcRead(opts) {
     // 小页面：innerText 最准（会排除 CSS 隐藏内容），一次布局可以接受。
     text = normalize(root.innerText || root.textContent || '');
   } else {
-    const got = collectText(false);
+    const got = collectText(false, root);
     text = got.text;
     textTruncated = got.truncated;
     visited = got.visited;
     textMode = 'visible-approx';
   }
 
+  // shadow root 的正文：主文档的 innerText / TreeWalker 都不会穿进去，
+  // 单独追加（只在没指定 selector 时才做，指定了就按调用方给的子树读）。
+  let shadowTextMerged = false;
+  let shadowTextTruncated = false;
+  if (!opts.selector && shadow.roots.length) {
+    const budget = maxChars * 3;
+    const extra = [];
+    for (const sr of shadow.roots) {
+      if (now() > deadline) { shadowTextTruncated = true; break; }
+      let chunk = '';
+      try {
+        chunk = includeHidden
+          ? String(sr.textContent || '')
+          : normalize(sr.textContent || '');
+      } catch (_) { chunk = ''; }
+      if (!chunk) continue;
+      extra.push(chunk);
+      shadowTextMerged = true;
+      if (extra.join('\n').length >= budget) { shadowTextTruncated = true; break; }
+    }
+    if (extra.length) {
+      text = normalize(text + '\n' + extra.join('\n'));
+      if (text.length > budget) shadowTextTruncated = true;
+    }
+  }
+
   // 单次查询覆盖计数 / 标题 / 链接 / 表单，避免多次全量遍历。
+  // shadow root 各查一次（auto 模式），否则组件化站点会读出 0 链接 0 表单。
   const SELECTOR = 'a[href],img,input,textarea,select,button,form,h1,h2,h3,[role="button"]';
   const counts = { links: 0, images: 0, inputs: 0, buttons: 0, forms: 0 };
   const headings = [];
@@ -162,47 +264,53 @@ function __abcRead(opts) {
   let scanned = 0;
   let partial = textTruncated || nodeCount > maxNodes;
 
-  const elements = root.querySelectorAll(SELECTOR);
-  for (const el of elements) {
-    scanned += 1;
-    if (scanned > maxNodes) { partial = true; break; }
-    if ((scanned & 255) === 0 && now() > deadline) { partial = true; break; }
-    const tag = el.tagName;
-    if (tag === 'A') {
-      counts.links += 1;
-      if (wantLinks && links.length < 100) {
-        links.push({ text: clipped(el.textContent, 120), href: el.href });
-      }
-    } else if (tag === 'IMG') {
-      counts.images += 1;
-    } else if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
-      counts.inputs += 1;
-    } else if (tag === 'BUTTON' || el.getAttribute('role') === 'button') {
-      counts.buttons += 1;
-    } else if (tag === 'FORM') {
-      counts.forms += 1;
-      if (wantForms && forms.length < 20) {
-        const fields = [];
-        for (const f of el.querySelectorAll('input,textarea,select')) {
-          if (fields.length >= 50) break;
-          const secret = secretField(f);
-          fields.push({
-            name: f.name || '',
-            type: (f.type || f.tagName).toLowerCase(),
-            value: typeof f.value === 'string' ? (secret ? (f.value ? '•••' : '') : f.value.slice(0, 200)) : '',
-            redacted: secret || undefined,
-            placeholder: f.placeholder || '',
-            required: !!f.required
-          });
+  const elementScopes = opts.selector ? [root] : [root].concat(shadow.roots);
+  for (const scope of elementScopes) {
+    let elements = [];
+    try { elements = scope.querySelectorAll(SELECTOR); } catch (_) { elements = []; }
+    for (const el of elements) {
+      scanned += 1;
+      if (scanned > maxNodes) { partial = true; break; }
+      if ((scanned & 255) === 0 && now() > deadline) { partial = true; break; }
+      const tag = el.tagName;
+      if (tag === 'A') {
+        counts.links += 1;
+        if (wantLinks && links.length < 100) {
+          links.push({ text: clipped(el.textContent, 120), href: el.href });
         }
-        forms.push({ action: el.action || '', method: (el.method || 'get').toUpperCase(), fields });
-      }
-    } else if (tag === 'H1' || tag === 'H2' || tag === 'H3') {
-      if (headings.length < 50) {
-        const value = clipped(el.textContent, 200);
-        if (value) headings.push({ tag: tag.toLowerCase(), text: value });
+      } else if (tag === 'IMG') {
+        counts.images += 1;
+      } else if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
+        counts.inputs += 1;
+      } else if (tag === 'BUTTON' || el.getAttribute('role') === 'button') {
+        counts.buttons += 1;
+      } else if (tag === 'FORM') {
+        counts.forms += 1;
+        if (wantForms && forms.length < 20) {
+          const fields = [];
+          for (const f of el.querySelectorAll('input,textarea,select')) {
+            if (fields.length >= 50) break;
+            const secret = secretField(f);
+            fields.push({
+              name: f.name || '',
+              type: (f.type || f.tagName).toLowerCase(),
+              value: typeof f.value === 'string' ? (secret ? (f.value ? '•••' : '') : f.value.slice(0, 200)) : '',
+              redacted: secret || undefined,
+              // placeholder 常被站点写成「请输入密码/卡号后四位」，与 find 同口径掩码。
+              placeholder: maskDerived(f, f.placeholder),
+              required: !!f.required
+            });
+          }
+          forms.push({ action: el.action || '', method: (el.method || 'get').toUpperCase(), fields });
+        }
+      } else if (tag === 'H1' || tag === 'H2' || tag === 'H3') {
+        if (headings.length < 50) {
+          const value = clipped(el.textContent, 200);
+          if (value) headings.push({ tag: tag.toLowerCase(), text: value });
+        }
       }
     }
+    if (partial && scanned > maxNodes) break;
   }
 
   const meta = {};
@@ -212,6 +320,10 @@ function __abcRead(opts) {
     if (key && value && !(key in meta)) meta[key] = String(value).slice(0, 300);
   }
 
+  const frameCount = (() => {
+    try { return doc.querySelectorAll('iframe,frame').length; } catch (_) { return 0; }
+  })();
+
   const out = {
     ok: true,
     url: location.href,
@@ -220,9 +332,19 @@ function __abcRead(opts) {
     description: meta.description || meta['og:description'] || '',
     textLength: text.length,
     text: text.slice(0, maxChars),
-    truncated: text.length > maxChars || textTruncated,
+    truncated: text.length > maxChars || textTruncated || shadowTextTruncated,
     text_mode: textMode,
     partial,
+    // 扫描覆盖范围：iframe 内容不在本次结果里，必须让调用方看得见。
+    scope: shadow.roots.length > 0 ? 'main-frame+shadow' : 'main-frame-only',
+    frame_count: frameCount,
+    shadow_mode: shadowMode,
+    shadow_roots: shadow.roots.length,
+    shadow_skipped: shadow.skipped,
+    shadow_text_merged: shadowTextMerged || undefined,
+    shadow_text_truncated: shadowTextTruncated || undefined,
+    // 同上：只有页面确实用了 shadow DOM（见到 open root）时才提示 closed 可能不可达。
+    shadow_closed_unreachable: shadowMode === 'auto' && shadow.roots.length > 0,
     headings,
     counts,
     stats: {

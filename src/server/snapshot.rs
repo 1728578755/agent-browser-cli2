@@ -3,7 +3,7 @@ use super::*;
 /// 分页窗口右端（`offset + limit`）。
 ///
 /// `offset` 来自用户 JSON 且没有上限：debug 构建下 `usize::MAX + 1` 会 panic，
-/// release 会回绕，导致 `has_more` / `next_offset` 全错。
+/// release 会回绕，导致 `has_more` / `next_offset` 全错（B-14）。
 /// 这里用 `checked_add`，并保留一个宽松上限把明显越界的请求直接拒掉。
 pub(crate) const MAX_SNAPSHOT_OFFSET: usize = 1_000_000;
 
@@ -26,6 +26,68 @@ pub(crate) fn page_window(offset: usize, limit: usize) -> Result<usize> {
         .ok_or_else(|| anyhow!("offset 与 limit 之和过大（{offset} + {limit}）"))
 }
 
+/// 从 `batch` 的单步结果里取 CDP 原始回包。
+///
+/// 扩展把 `data` 作为规范位置，同时把 CDP 顶层字段并进条目（兼容旧读法）；
+/// 两个位置都要认，否则换个扩展版本就取不到 nodes。
+fn batch_step_payload(step: &Value) -> Option<&Value> {
+    step.get("data").or_else(|| step.get("result"))
+}
+
+/// 一次往返取回 AX 树 + 实时 `location.href`。
+///
+/// 为什么必须同一次往返：分别调用时页面可以在两次之间导航，拿到的树与 URL 属于
+/// 不同文档，`@e` 的 URL 基准就错了。batch 把两条 CDP 命令放进同一次
+/// `chrome.debugger` 往返，页面侧不存在「中间再导航」的窗口。
+///
+/// 失败降级：老扩展不支持 batch、或 `Runtime.evaluate` 被页面策略拒绝时，退回
+/// 单条 `getFullAXTree`（与修复前一致），URL 由调用方回落到 `tab.url`。
+async fn cdp_ax_tree_with_url(
+    state: &AppState,
+    session_key: &str,
+    timeout: Duration,
+) -> (Result<CdpCallResult>, Option<String>) {
+    let commands = vec![
+        json!({ "cmd": "cdp", "method": "Accessibility.getFullAXTree", "params": {} }),
+        json!({
+            "cmd": "cdp",
+            "method": "Runtime.evaluate",
+            "params": { "expression": "location.href", "returnByValue": true }
+        }),
+    ];
+    if let Ok(value) = batch_cdp_call(state, session_key, commands, timeout).await {
+        if let Some(results) = value.get("results").and_then(Value::as_array) {
+            let ax_data = results.first().and_then(batch_step_payload).cloned();
+            let live_url = results
+                .get(1)
+                .and_then(batch_step_payload)
+                .and_then(|data| data.get("result"))
+                .and_then(|result| result.get("value"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|url| !url.is_empty())
+                .map(str::to_string);
+            let ax = CdpCallResult {
+                ok: ax_data.is_some(),
+                data: ax_data,
+                error: None,
+            };
+            return (Ok(ax), live_url);
+        }
+    }
+    (
+        cdp_call(
+            state,
+            session_key,
+            "Accessibility.getFullAXTree",
+            json!({}),
+            timeout,
+        )
+        .await,
+        None,
+    )
+}
+
 pub(crate) async fn snapshot_page(state: &AppState, req: SnapshotRequest) -> Result<Value> {
     let limit = req.limit.clamp(1, 1000);
     // 先算窗口右端：两条路径（CDP / JS）都用它，越界或溢出在这里就失败。
@@ -43,20 +105,14 @@ pub(crate) async fn snapshot_page(state: &AppState, req: SnapshotRequest) -> Res
     )
     .await?;
     let timeout = secs(req.timeout.max(0.1));
-    let tabs = active_tabs(state, true).await;
-    let tab = tabs
-        .iter()
-        .find(|tab| tab.session_key == tab_id)
-        .cloned()
-        .ok_or_else(|| anyhow!("snapshot: tab {tab_id} is not active"))?;
-    let ax = cdp_call(
-        state,
-        &tab_id,
-        "Accessibility.getFullAXTree",
-        json!({}),
-        timeout,
-    )
-    .await;
+    // 不再 `select_tab → active_tabs（全表收集）→ find`。目标已经在上面
+    // 选定，这里直接按 key 取，少一次全量快照、也少一个「选中后列表又变了」的窗口。
+    let tab = active_tab_by_key(state, &tab_id).await?;
+    // AX 树与 `location.href` 在**同一次**往返里取回。旧实现用
+    // `active_tabs` 里的 `session.info.url`（driver 侧快照，可能是上一次 tabs 推送的
+    // 旧值）作为 `SnapshotCache.url`，于是同一份 AX 树配了一个滞后 URL：
+    // 页面导航后 `@e` 校验会认为 URL 没变（或变了），误判成 ref_expired / 不该重定位。
+    let (ax, live_url) = cdp_ax_tree_with_url(state, &tab_id, timeout).await;
     let ax = match ax {
         Ok(value) if value.ok => value,
         other => {
@@ -85,7 +141,7 @@ pub(crate) async fn snapshot_page(state: &AppState, req: SnapshotRequest) -> Res
     let mut builder = SnapshotBuilder::new(req.offset, limit, req.details);
     let tree = builder.build(nodes);
     let mut all_refs = builder.refs;
-    // 详情收集只在显式请求 `--details` 时执行。旧实现不看 `req.details`、
+    // C-02：详情收集只在显式请求 `--details` 时执行。旧实现不看 `req.details`、
     // 对窗口内全部元素无条件发起最多 25 批 `DOM.resolveNode + Runtime.callFunctionOn`
     // CDP 往返，结果只写进快照缓存的 `entry.dom` —— 而该字段唯一的消费点是
     // `attach_details_to_tree`（同样只在 `--details` 时调用），不带 `--details`
@@ -127,10 +183,29 @@ pub(crate) async fn snapshot_page(state: &AppState, req: SnapshotRequest) -> Res
     // returned 与 JS 路径同口径：树里实际带 ref 的节点数（fold_tree 之后）。
     let returned = count_tree_refs(&tree);
     let tree_truncated = returned < window_refs;
-    // `active_tabs` 返回的是完整 URL，直接用它做快照基准，不再额外发一次 location.href 往返。
-    let snapshot_url = tab.url.clone();
+    // 优先用同一次往返里读到的实时 `location.href`；只有它拿不到
+    // （旧扩展 / Runtime.evaluate 被页面策略拒绝）才回落到 driver 会话里的 URL，
+    // 并用 `url_source` 如实标注取的是哪一种，下游 `@e` 校验可按来源决定是否重定位。
+    let live_url_present = live_url.is_some();
+    let (snapshot_url, url_source) = match live_url {
+        Some(url) => (url, "live"),
+        None => (tab.url.clone(), "driver"),
+    };
     {
         let mut driver = state.driver.write().await;
+        // × 联动：把同一次往返读到的**实时** URL 回写会话。
+        //
+        // `write_back_relocated_selector`（cdp.rs）在用 `session.info.url` 与快照缓存的
+        // `expected_url` 做实时比对：只把 live URL 写进 `SnapshotCache` 而不回写
+        // `Session.info.url`，消费侧仍会拿滞后值比对，保护等于没做。
+        // `Session.info` 是会话侧唯一副本（`active_tabs` 每次都从它 clone），
+        // 因此这里更新它就是全局生效；只有确实拿到 live URL 时才写，避免用
+        // 回落值把已有值覆盖成同一个滞后值。
+        if live_url_present {
+            if let Some(session) = driver.sessions.get_mut(&tab_id) {
+                session.info.url = snapshot_url.clone();
+            }
+        }
         let generation = driver
             .snapshots
             .get(&tab_id)
@@ -140,7 +215,7 @@ pub(crate) async fn snapshot_page(state: &AppState, req: SnapshotRequest) -> Res
             tab_id.clone(),
             SnapshotCache {
                 generation,
-                url: snapshot_url,
+                url: snapshot_url.clone(),
                 refs: all_refs,
             },
         );
@@ -169,12 +244,15 @@ pub(crate) async fn snapshot_page(state: &AppState, req: SnapshotRequest) -> Res
     Ok(json!({
         "status": "success",
         "mode": "cdp",
-        // `@e` 的编号口径随快照引擎不同。CDP 只给可操作角色发引用
+        // C-04：`@e` 的编号口径随快照引擎不同。CDP 只给可操作角色发引用
         // （`ref_scheme=operable-only`），JS 回退给所有有名字的节点发引用
         // （`ref_scheme=all-named`）。两个引擎的 `@e5` 不保证指向同一元素，
         // 跨引擎复用引用前必须重新 snapshot。显式回传口径，调用方才有可能判断。
         "ref_scheme": "operable-only",
-        "url": tab.url,
+        // `url` 与 `SnapshotCache.url` 同源（优先实时 location.href），
+        // `url_source` 标明来源（live = 本次页面实时读取；driver = 回落到会话快照）。
+        "url": snapshot_url,
+        "url_source": url_source,
         "title": tab.title,
         "tab_id": tab.tab_id,
         "session_key": tab_id,
@@ -282,6 +360,10 @@ pub(crate) async fn page_op_via_extension(
         return Err(anyhow!("pageOp({op}): 扩展没有返回 value，页面脚本未执行"));
     };
     // wait 的「未命中」是正常结果（ok:false + matched:false），不能当成命令失败。
+    // 判据必须是「带 matched 字段」而不是「op == wait」：challenge 的
+    // `action=wait`（现在回 ok:false + cleared:false + matched:false）也走这条
+    // 通道，只有无 matched 的 ok:false 才代表页面脚本/通道真的坏了。别收窄成按 op 判断，
+    // 否则 challenge 超时会被误报成通道错误，daemon 侧就攒不出 first_blocking_at。
     let has_match_field = payload.get("matched").is_some();
     if !has_match_field && payload.get("ok").and_then(Value::as_bool) == Some(false) {
         return Err(anyhow!(
@@ -297,14 +379,17 @@ pub(crate) async fn page_op_via_extension(
 
 /// 把会话的 `tab_id` 转成扩展协议里的数字 `tabId`。
 ///
-/// 空字符串是历史合法值（表示"这条命令不需要 tabId"），保持 0；
+/// **空串返回 `Err(session_gone)`**（历史上曾返回 `Ok(0)`，与本函数自己的
+/// 「必须 > 0」校验自相矛盾）。真正不需要 tabId 的路径（`exec` 等）在更上层
+/// 就不调用本函数；只要调用到这里，空 tab_id 一定是会话记录坏了。
 /// 非空但解析不出正整数的**不能**静默降级成 0——扩展会回 "tabId is required"，
 /// 用户看到的归因变成"扩展要求 tabId"，而不是"本地会话的 tab_id 坏了"。
 pub(crate) fn parse_tab_id(raw: &str) -> Result<i64> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        // 以前返回 Ok(0)，与本函数「必须 > 0」的校验自相矛盾，
-        // 上游还会把错误码误导成「扩展报 tabId 必填」（P3）。
+        // 空串 = 会话记录已失效（扩展重载 / 标签关闭后 tab_id 丢了）。
+        // 报「会话的 tab_id 为空」并由上游映射成 session_gone，而不是让扩展报
+        // 「tabId 必填」——后者会把本地状态问题归因到扩展协议上。
         return Err(anyhow!(
             "会话的 tab_id 为空：会话可能已断开，请 refresh 或重新 open"
         ));
@@ -385,7 +470,7 @@ pub(crate) async fn snapshot_via_js(state: &AppState, req: &SnapshotRequest) -> 
         "offset": offset,
         "limit": probe,
         "interactiveOnly": req.interactive_only,
-        // 接通页面侧 skipGeneric 开关。None 序列化成 null，页面脚本
+        // X-15：接通页面侧 skipGeneric 开关。None 序列化成 null，页面脚本
         // `opts.skipGeneric !== false` 判定为 true（保持默认跳过 generic），
         // 请求体显式带 skipGeneric:false 时保留 generic 角色节点。
         "skipGeneric": req.skip_generic
@@ -593,7 +678,7 @@ pub(crate) async fn snapshot_via_js(state: &AppState, req: &SnapshotRequest) -> 
     let has_more = more_batches || tree_truncated;
     // 旧版页面脚本只能回到前 1000 条：`end >= 1000` 时下一页必然取不到数据，
     // 不给 next_offset（否则调用方会一路翻到报错）。新版脚本认 offset，不受此限。
-    // 边界保护：第一页（offset==0）时 ref 编号无法区分「支持 offset 的新脚本」
+    // C-06 边界保护：第一页（offset==0）时 ref 编号无法区分「支持 offset 的新脚本」
     // 与「永远从文档开头取的旧脚本」——两者首个 ref 都是 @e1。旧实现无条件豁免
     // offset==0（`offset_supported` 恒真），于是旧脚本页面上 total 恰好被 1000 封顶时
     // 也给出 `next_offset`，调用方跟进后必然在 `snapshot_items_base_offset` 处报
@@ -640,10 +725,10 @@ pub(crate) async fn snapshot_via_js(state: &AppState, req: &SnapshotRequest) -> 
     if !details_state.is_null() {
         pagination["details"] = details_state;
     }
-    Ok(json!({
+    let mut out = json!({
         "status": "success",
         "mode": "js",
-        // 把页面脚本声明的引用口径透出来。JS 回退给所有有名字的节点发 `@e`，
+        // C-04：把页面脚本声明的引用口径透出来。JS 回退给所有有名字的节点发 `@e`，
         // 与 CDP 的 `operable-only` 不是同一套编号；调用方跨引擎复用引用前必须重拍。
         "ref_scheme": payload
             .get("ref_scheme")
@@ -655,7 +740,76 @@ pub(crate) async fn snapshot_via_js(state: &AppState, req: &SnapshotRequest) -> 
         "session_key": session_key,
         "tree": tree,
         "pagination": pagination
-    }))
+    });
+    // 页面脚本现在会声明 shadow DOM / iframe 的覆盖范围。这些字段必须
+    // 原样透传，否则 daemon 侧看起来仍是「已扫描全部」，调用方无法知道
+    // shadow 内元素到底可不可达。只在脚本确实给出时补，保持旧回包形状不变。
+    if let Some(object) = out.as_object_mut() {
+        for key in [
+            "scope",
+            "frame_count",
+            "shadow_mode",
+            "shadow_roots",
+            "shadow_skipped",
+            "shadow_closed_unreachable",
+        ] {
+            if let Some(value) = payload.get(key) {
+                object.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+    // 只回字段不够——调用方要能直接看出「哪些内容没覆盖到、下一步怎么办」。
+    // 这些提示与 pagination.hint 分开（分页提示讲的是条目窗口，这里是覆盖范围）。
+    let frame_count = out.get("frame_count").and_then(Value::as_u64).unwrap_or(0);
+    let shadow_skipped = out
+        .get("shadow_skipped")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let closed_shadow = out
+        .get("shadow_closed_unreachable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let declared_scope = out.get("scope").is_some();
+    let mut coverage: Vec<String> = Vec::new();
+    if frame_count > 0 {
+        coverage.push(format!(
+            "有 {frame_count} 个 iframe/frame 未被扫描（JS 快照只覆盖主框架）：改用 CDP 快照，或按 frameId 逐 frame 注入"
+        ));
+    }
+    if shadow_skipped > 0 {
+        coverage.push(format!(
+            "有 {shadow_skipped} 个 open shadow root 被跳过（shadow_mode=off 或超过 roots/depth 上限）：调大上限后重拍，或改用 CDP（pierce）"
+        ));
+    }
+    if closed_shadow {
+        // ext-page 已把页面脚本的判据收窄成 `shadow_mode=auto && shadow_roots>0`：
+        // 它表示「页面确实用了 open shadow root，因此可能还有枚举不到的 closed root」，
+        // 不再是「任何 auto 页面都 true」。文案据此区分两种情形，仍保留「可能」——
+        // 页面 JS 无法枚举 closed root，只能提示改用 CDP pierce。
+        let shadow_roots = out.get("shadow_roots").and_then(Value::as_u64).unwrap_or(0);
+        if shadow_roots > 0 {
+            coverage.push(format!(
+                "页面有 {shadow_roots} 个 open shadow root，且可能还有 closed root（页面 JS 不可达）：涉及 closed 内容时走 CDP pierce"
+            ));
+        } else {
+            coverage.push(
+                "疑似存在 closed shadow root（页面 JS 不可达）：需要时走 CDP pierce".to_string(),
+            );
+        }
+    }
+    if let Some(object) = out.as_object_mut() {
+        if coverage.is_empty() {
+            // 脚本明确声明过覆盖范围且没有任何缺口：回 true，调用方不必靠「字段缺失」
+            // 去推断（旧版脚本不声明 scope，此时保持不回该字段，形状不变）。
+            if declared_scope {
+                object.insert("coverage_complete".to_string(), json!(true));
+            }
+        } else {
+            object.insert("coverage_complete".to_string(), json!(false));
+            object.insert("coverage_hint".to_string(), json!(coverage.join("；")));
+        }
+    }
+    Ok(out)
 }
 
 pub(crate) struct SnapshotBuilder {

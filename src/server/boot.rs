@@ -100,7 +100,7 @@ pub async fn run_daemon() -> Result<()> {
         ext_restart_seq: Arc::new(Mutex::new(HashMap::new())),
         cleanup_done: Arc::new(AtomicBool::new(false)),
         ext_warnings: Arc::new(Mutex::new(Vec::new())),
-        // 幂等回放缓存与 A1-09 迟到结果暂存：新字段所有构造点都必须补齐。
+        // 幂等回放缓存与 迟到结果暂存：新字段所有构造点都必须补齐。
         idempotency: Arc::new(Mutex::new(HashMap::new())),
         late_results: Arc::new(Mutex::new(HashMap::new())),
     };
@@ -188,7 +188,7 @@ pub(crate) fn build_api_router(state: AppState) -> Router {
         .route("/profile-label", post(set_profile_label))
         .route("/scan", post(scan))
         .route("/exec", post(exec))
-        // A1-09：迟到结果查询端点，5 分钟内可凭 exec_id 取回超时命令的真实结果。
+        // 迟到结果查询端点，5 分钟内可凭 exec_id 取回超时命令的真实结果。
         .route("/exec-result/:exec_id", get(exec_result))
         .route("/read", post(read_page))
         .route("/inject", post(inject))
@@ -232,19 +232,24 @@ pub(crate) fn build_api_router(state: AppState) -> Router {
         .route("/batch", post(batch_steps))
         .route("/multi", post(multi))
         .route("/shutdown", post(shutdown))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            require_api_access,
-        ))
-        // POST 幂等回放：位于 token 校验之内（未授权请求不进缓存）、
-        // 路由之外（能拦下所有 POST 并回放）。layer 后加的在外层，
-        // 实际顺序：track_inflight → require_api_access → idempotency_replay → 路由。
+        // POST 幂等回放：**先加 = 内层**。
+        // axum 的 `Router::layer` 是「后加的在外层」，所以请求链是
+        // agent_context → track_inflight → require_api_access → idempotency_replay → 路由。
+        // 旧实现先加 `require_api_access`、后加本中间件，实际链变成
+        // track_inflight → idempotency_replay → require_api_access：未授权请求先占位/写缓存，
+        // 401 被当成可回放结果以 200 返回，CLI 的「token 失效重发一次」因此永远失败，
+        // 本地进程也能用任意 key 污染缓存并落盘。
         .layer(middleware::from_fn_with_state(
             state.clone(),
             idempotency_replay,
         ))
-        // 放在 `require_api_access` 之后 = 更外层：401/403 也算「在途」，
-        // 且请求结束时统一续期 `last_activity`（长请求靠这条续期，否则会被空闲自杀腰斩）。
+        // token 校验：位于幂等缓存之外，401/403 直接短路，既不会占位也不会进缓存。
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_api_access,
+        ))
+        // 最外层：401/403 也算「在途」（请求离开时计数一定归零），
+        // 但只有非鉴权失败才续期 `last_activity`（见 `track_inflight`）。
         .layer(middleware::from_fn_with_state(
             state.clone(),
             track_inflight,
@@ -259,7 +264,7 @@ pub(crate) fn build_api_router(state: AppState) -> Router {
 
 /// `x-agent-browser-agent` 的合法形态：1..=80 个 `[A-Za-z0-9._:-]`。
 ///
-/// 与 CLI 侧清洗规则一致（另一半在 CLI）。**不合法不是"清洗"而是忽略**：
+/// 与 CLI 侧清洗规则一致（的另一半在 CLI）。**不合法不是"清洗"而是忽略**：
 /// 清洗会把 `客服`、`运维` 都塌缩成空串再落到 `default`，两个不同智能体共享
 /// 同一个默认标签页，`cleanup` 互相关对方页面，且看起来一切正常。
 pub(crate) fn is_valid_agent_id(value: &str) -> bool {
@@ -280,7 +285,7 @@ pub(crate) fn is_valid_agent_id(value: &str) -> bool {
 /// **把身份绑定到凭证持有者**：
 /// 1. header 形态不合法 → 忽略并回落 `default`；
 /// 2. 只有请求同时带上了有效的 API token（与 `require_api_access` 同一套校验，
-///    含 Origin 白名单与恒定时间比较）才承认这个 header。
+///    含 Host / Origin 白名单与恒定时间比较）才承认这个 header。
 ///
 /// 这**不是**密码学签名，也没有 per-agent 凭证：同一个用户下的进程仍可读取
 /// `~/.atb/api-token` 后冒用任意 `agent` 名（Windows 上该文件的 ACL 尤其弱）。
@@ -337,9 +342,9 @@ pub(crate) struct InflightGuard {
 
 impl InflightGuard {
     /// 计数 +1 与守卫创建必须是同一步：若先递增、再 `.await` 取锁，请求在取锁期间
-    /// 被取消，就只留下「计数 +1、守卫从未创建」的泄漏，daemon 再也不会空闲退出（A1-01）。
+    /// 被取消，就只留下「计数 +1、守卫从未创建」的泄漏，daemon 再也不会空闲退出。
     ///
-    /// / S1-03：旧实现只在「0→1」那一刻记录起点，于是 (a) 这条请求离场后
+    /// A-02 / ：旧实现只在「0→1」那一刻记录起点，于是 (a) 这条请求离场后
     /// 时间戳仍滞留，下一条长请求会在 `since` 已经很旧时被提前判死；(b) 0→1 之后、
     /// 写入起点之前还有个 await 窗口，期间 monitor 看到的是上一条请求留下的旧值。
     /// 现在起点改成「**每条**请求进入时由 `track_inflight` 刷新」，acquire 不再承担
@@ -372,27 +377,35 @@ pub(crate) async fn track_inflight(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    // / S1-03：起点语义固定为「最近一次有请求进来的时刻」，**每条**请求都刷新，
+    // A-02 / ：起点语义固定为「最近一次有请求进来的时刻」，**每条**请求都刷新，
     // 不再只在 0→1 时写。由此：
     // - 多条持续重叠的健康请求会不断续期，不会因为「最早那条请求的陈旧时间戳」
-    //   在卡死阈值后被误杀；
+    //   在卡死阈值后被误杀（A-02）；
     // - 反过来「`inflight > 0` 且这个时刻已经超过阈值」就意味着阈值时间内
     //   一条新请求都没进来——这才是真的挂了。
     //
-    // 顺序很关键：**先刷新起点、再入计数**（S1-03）。写起点要 await 拿锁，若放在
+    // 顺序很关键：**先刷新起点、再入计数**。写起点要 await 拿锁，若放在
     // 「计数 +1」之后，请求恰好在这段 await 里被取消，就会留下「计数说在途、起点却还是
     // 上一条请求」的窗口——monitor 拿旧时间戳一算就把它判成卡死。放在计数之前，
     // 被取消时只是白刷新一次时间戳（这条请求没计入 inflight，monitor 不会看它），
     // 窗口彻底消失。
     *state.inflight_since.lock().await = Some(Instant::now());
-    // 计数 +1 与守卫创建必须是同一步（A1-01）：即使后续 await 期间请求被取消，
+    // 计数 +1 与守卫创建必须是同一步：即使后续 await 期间请求被取消，
     // 守卫也已在栈上，Drop 会把计数减回去。
     let _guard = InflightGuard::acquire(&state);
     // 必须先把响应接住再收尾，不能 early return。
     let response = next.run(request).await;
     // 续期：请求「结束」时刷新活跃时间。请求进行中由 `inflight` 挡住空闲自杀，
     // 这里保证结束后空闲计时从头算，不会刚跑完长命令就立刻自退。
-    *state.last_activity.lock().await = Instant::now();
+    //
+    // 401/403 不是业务活动，而是「鉴权失败」。旧实现无条件续期，于是
+    // 一个还拿着旧 token 的进程（daemon 重启轮换 token 后的 CLI、或本地扫描脚本）
+    // 每次轮询都能把空闲计时清零，daemon 永不空闲退出，扩展长期挂着「已连接」。
+    // 5xx 仍然续期：那是真的跑了业务逻辑并失败了，属于活动。
+    let status = response.status();
+    if status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN {
+        *state.last_activity.lock().await = Instant::now();
+    }
     response
 }
 
@@ -443,10 +456,37 @@ pub(crate) fn constant_time_eq(left: &str, right: &str) -> bool {
     diff == 0
 }
 
+/// 校验 HTTP API 的访问凭证：`Host` 白名单 → `Origin` 白名单 → API token。
+///
+/// 顺序有讲究：前两项是「这条请求是不是发给本机 daemon 的」，最后一项才是身份。
+/// 任意一项失败都返回结构化 `(status, error_code, message)`，由调用方拼 JSON。
+///
+/// 只校验 `Origin` 挡不住 **DNS rebinding**——攻击者把 `evil.example` 解析到
+/// 127.0.0.1 后，浏览器发出的 `Host` 就是攻击者域名（`Origin` 也会带，但 Host 是
+/// 更底层的判据，且 `Origin` 可能缺失）。现在 `Host` 的**主机名**必须是
+/// `127.0.0.1` / `localhost` / `[::1]` / `::1`（大小写不敏感）；带端口时只校验
+/// 端口是合法 `u16`（不要求等于 [`API_PORT`]——测试与临时实例会 bind 随机端口，
+/// 而端口并不改变 DNS rebinding 的攻击面）。
+///
+/// `Host` 缺失时**放行**并记一条 warning：HTTP/1.1 客户端与浏览器一定带 `Host`，
+/// 裸 TCP 探测（本仓库集成测试）不带；把缺失当失败只会打挂本地工具，
+/// 挡不住任何真实攻击。扩展的 WS 走 `build_ws_router`，不经过这里。
 pub(crate) fn validate_api_access(
     headers: &HeaderMap,
     expected_token: &str,
 ) -> std::result::Result<(), (StatusCode, &'static str, &'static str)> {
+    match headers.get(axum::http::header::HOST) {
+        Some(host) if host.to_str().map(api_host_allowed).unwrap_or(false) => {}
+        Some(_) => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "host_not_allowed",
+                "Only loopback hosts (127.0.0.1 / localhost / [::1]) may access the local API",
+            ));
+        }
+        // 缺失：放行 + 只提示一次。
+        None => warn_missing_host(),
+    }
     if let Some(origin) = headers.get(ORIGIN) {
         let allowed = origin
             .to_str()
@@ -474,8 +514,57 @@ pub(crate) fn validate_api_access(
     Ok(())
 }
 
-pub(crate) fn build_ws_router(state: AppState) -> Router {
-    Router::new().route("/", get(ws_handler)).with_state(state)
+/// `Host` 主机名是否属于回环。
+///
+/// 只比主机名：`127.0.0.1:18767`、`localhost`、`[::1]:18767`、`::1` 都通过；
+/// `evil.example`（DNS rebinding 的典型形态）、`127.0.0.1:abc` 一律拒绝。
+fn api_host_allowed(value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    let (host, port) = split_host_port(value);
+    let loopback = matches!(
+        host.to_ascii_lowercase().as_str(),
+        "127.0.0.1" | "localhost" | "[::1]" | "::1"
+    );
+    if !loopback {
+        return false;
+    }
+    // 带端口时只做语法校验：端口本身不改变攻击面，而测试/临时实例会 bind 随机端口。
+    match port {
+        None => true,
+        Some(port) => port.parse::<u16>().is_ok(),
+    }
+}
+
+/// 拆 `host[:port]`，兼容 IPv6 方括号形式；裸 IPv6（`::1`）按「无端口」处理。
+fn split_host_port(value: &str) -> (&str, Option<&str>) {
+    if let Some(rest) = value.strip_prefix('[') {
+        return match rest.find(']') {
+            // +2 = 前缀 '[' 与被找回的 ']'
+            Some(end) => {
+                let host = &value[..end + 2];
+                (host, rest[end + 1..].strip_prefix(':'))
+            }
+            None => (value, None),
+        };
+    }
+    match value.rsplit_once(':') {
+        // 只有「唯一一个冒号」才是 ip:port；`::1` 这种裸 IPv6 不拆。
+        Some((host, port)) if !host.contains(':') => (host, Some(port)),
+        _ => (value, None),
+    }
+}
+
+/// 缺少 `Host` 时只提示一次（的放行分支）。
+fn warn_missing_host() {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "HTTP API: 请求缺少 Host 头，已放行（仅本机回环；浏览器与 DNS rebinding 一定带 Host）；后续同类不再提示"
+        );
+    }
 }
 
 pub(crate) async fn run_ws_server(state: AppState) -> Result<()> {
@@ -542,7 +631,7 @@ pub(crate) async fn monitor_idle_shutdown(state: AppState) {
         // 会让 inflight 永远 >0，daemon 再也退不出去。超过阈值就当作卡死放行，
         // 并明确打一行日志（含已挂时长），免得用户以为 daemon 行为诡异。
         //
-        // 这里的 `since` 是「最近一次有请求进来的时刻」：持续重叠的健康请求会
+        // 这里的 `since` 是「最近一次有请求进来的时刻」（A-02）：持续重叠的健康请求会
         // 一直把它刷新到现在，所以不会被「最早那条请求的陈旧时间戳」误杀。
         if state.inflight.load(Ordering::Relaxed) > 0 {
             let since = *state.inflight_since.lock().await;
@@ -562,7 +651,7 @@ pub(crate) async fn monitor_idle_shutdown(state: AppState) {
                 state.inflight.load(Ordering::Relaxed)
             );
             // 不能落入下面的 idle 判定：其它请求会不断刷新 `last_activity`，
-            // 那样只会每 5s 重打一条「允许退出」却永远不退出（A1-05）。
+            // 那样只会每 5s 重打一条「允许退出」却永远不退出。
             cleanup_on_shutdown(&state).await;
             let _ = state.shutdown.send(());
             break;
@@ -570,7 +659,7 @@ pub(crate) async fn monitor_idle_shutdown(state: AppState) {
         // 后台异步任务运行期间不允许退出，否则用户提交的长时间任务会被腰斩。
         // 但 job 也可能卡死（页面脚本不返回、扩展失联），此时只看「有 running job」
         // 会让 daemon 永不退出——HTTP 在途有 `max_inflight_stall` 兜底，job 也要有
-        // 对称的保护（A1-07）。
+        // 对称的保护。
         let (running_jobs, oldest_running) = running_jobs_snapshot(&state).await;
         if running_jobs > 0 {
             if let Some(stalled_for) = oldest_running {
@@ -631,6 +720,12 @@ pub(crate) async fn monitor_idle_shutdown(state: AppState) {
 ///
 /// 用 `started_at.unwrap_or(created_at)`：job 从提交到真正开跑之间 status 已经是
 /// Running，但 started_at 还没写，此时按 created_at 计不会把它误判成刚启动。
+///
+/// **不能用 `secs`**。`secs` 走的是 `preflight::clamp_timeout_seconds`，
+/// 那是给「命令超时参数」用的护栏，上限 3600s；在这里它会把已运行时长**钳到 3600s**，
+/// 而卡死阈值 `max_inflight_stall` 是 ≥3900s，于是 `stalled_for >= stall_limit`
+/// 永远不成立——job 卡死分支形同虚设，daemon 永不退出。
+/// 这里要的是「多老了」这个事实，用不饱和的 `try_from_secs_f64`。
 pub(crate) async fn running_jobs_snapshot(state: &AppState) -> (usize, Option<Duration>) {
     let store = state.jobs.lock().await;
     let now = epoch_secs();
@@ -640,6 +735,47 @@ pub(crate) async fn running_jobs_snapshot(state: &AppState) -> (usize, Option<Du
         count += 1;
         oldest = oldest.min(job.started_at.unwrap_or(job.created_at));
     }
-    let age = (count > 0 && oldest.is_finite()).then(|| secs((now - oldest).max(0.0)));
+    let age = (count > 0 && oldest.is_finite()).then(|| {
+        // NaN / 无穷不可能出现（上面已判 finite），兜底成 0 也不会 panic。
+        Duration::try_from_secs_f64((now - oldest).max(0.0)).unwrap_or(Duration::ZERO)
+    });
     (count, age)
+}
+
+pub(crate) fn build_ws_router(state: AppState) -> Router {
+    Router::new().route("/", get(ws_handler)).with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 主机名必须是回环；端口只校验语法；缺 Host 放行。
+    #[test]
+    fn host_header_must_resolve_to_loopback() {
+        for ok in [
+            "127.0.0.1:18767",
+            "127.0.0.1:0",
+            "127.0.0.1",
+            "localhost:18767",
+            " LOCALHOST ",
+            "[::1]:18767",
+            "[::1]",
+            "::1",
+        ] {
+            assert!(api_host_allowed(ok), "{ok} 应被接受");
+        }
+        for bad in [
+            "evil.example",
+            "evil.example:18767",
+            "localhost.evil.example:18767",
+            "127.0.0.1:abc",
+            "127.0.0.1:99999",
+            "0.0.0.0:18767",
+            "example.com",
+            "",
+        ] {
+            assert!(!api_host_allowed(bad), "{bad} 应被拒绝");
+        }
+    }
 }

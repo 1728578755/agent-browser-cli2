@@ -20,7 +20,14 @@ pub(crate) struct ScanRequest {
     pub(crate) timeout: Option<f64>,
 }
 
+/// `/exec` 请求体。
+///
+/// `deny_unknown_fields`：字段名写错（`waitTimeout` vs `wait_timeout`）
+/// 以前会被静默忽略，命令照常成功、参数却没生效。这里只对 daemon 内部请求 DTO
+/// 收紧；CLI 与实际字段严格一致。对外兼容用的宽松 DTO（`ScanRequest` 等
+/// 带大量可选字段、会被旧脚本直接打 HTTP 的）保持宽松。
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ExecRequest {
     #[serde(default)]
     pub(crate) script: String,
@@ -129,12 +136,13 @@ pub(crate) struct SnapshotRequest {
     /// 只保留可操作元素（按钮/链接/输入框等），显著缩小大树。
     #[serde(default)]
     pub(crate) interactive_only: bool,
-    /// 页面侧 `page_snapshot.js` 的 `skipGeneric` 开关（JS 侧默认 true，
-    /// 跳过 generic 角色节点）。以前 daemon 从不下发、CLI 也无对应 flag，
-    /// 属于「不可达配置」；这里接通 daemon 侧（HTTP 请求体可直接带
-    /// `skipGeneric:false` 保留 generic 节点，用于调试无障碍树）。CLI flag
-    /// 需改 cmd 侧，不在本轮范围。CDP 路径不受影响（AX 树本就不产 generic 引用）。
-    #[serde(default)]
+    /// X-15：页面侧 `page_snapshot.js` 的 `skipGeneric` 开关（JS 侧默认 true，
+    /// 跳过 generic 角色节点）。入站字段是 snake_case `skip_generic`
+    /// （兼容 camelCase `skipGeneric`）；下发给页面脚本时才叫 `skipGeneric`。
+    /// 以前 daemon 从不下发、CLI 也无对应 flag，属于「不可达配置」；
+    /// 这里接通 daemon 侧（HTTP 请求体带 `skip_generic:false` 保留 generic 节点）。
+    /// CLI flag 需改 cmd 侧，不在本轮范围。CDP 路径不受影响。
+    #[serde(default, alias = "skipGeneric")]
     pub(crate) skip_generic: Option<bool>,
     /// 返回节点上限，超出截断（默认 0 表示不限制）。
     #[serde(default)]
@@ -144,6 +152,7 @@ pub(crate) struct SnapshotRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct TargetActionRequest {
     pub(crate) target: String,
     pub(crate) switch_tab_id: Option<String>,
@@ -162,6 +171,7 @@ pub(crate) struct TargetActionRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct FillRequest {
     pub(crate) target: String,
     #[serde(default)]
@@ -188,6 +198,7 @@ pub(crate) struct FillRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SendKeysRequest {
     #[serde(default)]
     pub(crate) frame_id: Option<i64>,
@@ -324,6 +335,7 @@ pub(crate) struct TabRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct NetworkListRequest {
     pub(crate) switch_tab_id: Option<String>,
     pub(crate) browser: Option<String>,
@@ -334,6 +346,7 @@ pub(crate) struct NetworkListRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct NetworkDetailRequest {
     pub(crate) switch_tab_id: Option<String>,
     pub(crate) browser: Option<String>,
@@ -342,6 +355,7 @@ pub(crate) struct NetworkDetailRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ConsoleListRequest {
     pub(crate) switch_tab_id: Option<String>,
     pub(crate) browser: Option<String>,
@@ -489,6 +503,7 @@ pub(crate) struct FindRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ActionRequest {
     pub(crate) op: String,
     pub(crate) target: Option<Value>,
@@ -502,6 +517,7 @@ pub(crate) struct ActionRequest {
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct WaitRequest {
     pub(crate) js: Option<String>,
     pub(crate) selector: Option<String>,
@@ -520,6 +536,7 @@ pub(crate) struct WaitRequest {
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct InjectRequest {
     /// run | persist | remove | list
     pub(crate) action: Option<String>,

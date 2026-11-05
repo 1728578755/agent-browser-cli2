@@ -259,3 +259,62 @@ test('background.js registers the navigation and debugger listeners when the API
   assert.equal(lists.debuggerEvents.length, 1, '应当注册一个 debugger.onEvent 监听器');
   assert.equal(lists.debuggerDetach.length, 1, '应当注册一个 debugger.onDetach 监听器');
 });
+
+// 只查「监听器注册了几个」不够——注册了但一触发就抛错/产生未处理
+// Promise rejection，扩展在真实页面里同样会失效，而测试全绿。这里给每个已注册
+// 的监听器喂一次典型事件，并捕获整轮里的 unhandledRejection。
+test('each registered extension listener survives a typical event without throwing ', async () => {
+  const source = await readFile(backgroundPath, 'utf8');
+  const { context, lists, dynamicRuleCalls } = createBackgroundContext();
+
+  vm.runInContext(source, context, { filename: backgroundPath.pathname });
+  await flushMicrotasks();
+
+  assert.equal(lists.onCommitted.length, 1, '应先注册 webNavigation.onCommitted');
+  assert.equal(lists.debuggerEvents.length, 1, '应先注册 debugger.onEvent');
+  assert.equal(lists.debuggerDetach.length, 1, '应先注册 debugger.onDetach');
+  assert.ok(lists.onMessage.length >= 1, '应先注册 runtime.onMessage');
+
+  const rejections = [];
+  const onRejection = (reason) => rejections.push(reason);
+  process.on('unhandledRejection', onRejection);
+  try {
+    assert.doesNotThrow(() => {
+      lists.onCommitted[0]({ tabId: 1, frameId: 0, url: 'https://example.com/page' });
+    }, 'onCommitted 不应同步抛错');
+    await flushMicrotasks();
+
+    assert.doesNotThrow(() => {
+      lists.debuggerEvents[0]({ tabId: 1 }, 'Network.responseReceived', {
+        requestId: 'req-1',
+        response: { url: 'https://example.com/api', status: 200, headers: {} },
+      });
+    }, 'debugger.onEvent 不应同步抛错');
+    await flushMicrotasks();
+
+    assert.doesNotThrow(() => {
+      lists.debuggerDetach[0]({ tabId: 1 }, 'target_closed');
+    }, 'debugger.onDetach 不应同步抛错');
+    await flushMicrotasks();
+
+    // onMessage 的 status 是纯读路径，不依赖标签页；用它验证监听器入口。
+    await new Promise((resolve) => {
+      let settled = false;
+      const done = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+      const returned = lists.onMessage[0]({ cmd: 'status' }, {}, done);
+      if (returned && typeof returned.then === 'function') returned.then(done, done);
+      setTimeout(done, 100);
+    });
+    await flushMicrotasks();
+  } finally {
+    process.off('unhandledRejection', onRejection);
+  }
+
+  assert.deepEqual(rejections, [], '监听器不应留下未处理的 Promise rejection');
+  // 副作用守卫：这些普通事件不应偷偷重新安装被移除的 CSP 规则。
+  assert.ok(dynamicRuleCalls.every((update) => !('addRules' in update)), '不应重新安装 CSP 规则');
+});

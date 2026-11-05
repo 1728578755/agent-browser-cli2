@@ -10,12 +10,14 @@
 //   node scripts/e2e.mjs                 # 跑全部场景
 //   node scripts/e2e.mjs --only=scrape   # 只跑名字包含 scrape 的场景
 //   node scripts/e2e.mjs --keep          # 保留 os.tmpdir() 里的临时文件（排障用）
+//   ATB_E2E=smoke node scripts/e2e.mjs   # 只跑 3 个核心场景（CI 用，省时间）
 //   ATB_E2E_BIN=/path/to/atb node scripts/e2e.mjs
 //
 // 退出码：0 = 全部 PASS（SKIP 不算失败）；1 = 有 FAIL；2 = 前置条件不满足（daemon 未运行等）。
 
 import { execFile } from 'node:child_process';
 import { createServer } from 'node:http';
+import { createConnection } from 'node:net';
 import {
   closeSync,
   existsSync,
@@ -42,8 +44,16 @@ const AGENT = process.env.ATB_E2E_AGENT || `atb-e2e-${process.pid}`;
 
 const ONLY = (process.argv.find((arg) => arg.startsWith('--only=')) || '').slice('--only='.length);
 const KEEP = process.argv.includes('--keep');
+// CI 只需要守住主链路，全量场景留给本地 / 发布前手动跑。
+const SMOKE = String(process.env.ATB_E2E || '').toLowerCase() === 'smoke';
+const SMOKE_NAMES = ['basic-flow', 'screenshot', 'spa-wait'];
 
-const TMP_DIR = mkdtempSync(join(tmpdir(), 'atb-e2e-'));
+// 临时目录延迟创建：前置条件不满足时直接退出，不该在 os.tmpdir 里留垃圾。
+let TMP_DIR = null;
+function ensureTmpDir() {
+  if (!TMP_DIR) TMP_DIR = mkdtempSync(join(tmpdir(), 'atb-e2e-'));
+  return TMP_DIR;
+}
 
 // ---------------------------------------------------------------------------
 // 断言与输出
@@ -232,7 +242,7 @@ function makeContext(base, checks) {
   return {
     checks,
     url: (name) => `${base}/${name}`,
-    tmp: (name) => join(TMP_DIR, name),
+    tmp: (name) => join(ensureTmpDir(), name),
     opened,
     atb,
     /** 打开一个受控页面并把 tab_id 记下来；返回 null 表示要先断言的失败。 */
@@ -467,6 +477,21 @@ function printPrerequisites(reason) {
   console.error('');
 }
 
+/** 探测端口是否有人 LISTEN（不判断是谁）——用来区分「daemon 没起来」和「端口被占」。 */
+function probePort(port, timeout = 1500) {
+  return new Promise((resolve) => {
+    const socket = createConnection({ port, host: '127.0.0.1' });
+    const finish = (state) => {
+      socket.destroy();
+      resolve(state);
+    };
+    socket.setTimeout(timeout);
+    socket.once('connect', () => finish('open'));
+    socket.once('timeout', () => finish('timeout'));
+    socket.once('error', () => finish('closed'));
+  });
+}
+
 /** 返回 null 表示前置条件 OK，否则返回退出码。 */
 async function preflight() {
   if (!existsSync(BIN)) {
@@ -479,15 +504,52 @@ async function preflight() {
     printPrerequisites(`atb status 没有输出可解析的 JSON（exit=${status.code}）：${short(status.stdout || status.stderr)}`);
     return 2;
   }
-  if (json.running !== true || status.code !== 0) {
+  if (json.running !== true) {
     const summary = json.summary || json.error_code || `exit=${status.code}`;
     printPrerequisites(`daemon 未就绪（${summary}）`);
     return 2;
   }
+
+  // 扩展必须真的连上。旧实现写成 `!connected && activeTabs === 0`，于是只要浏览器里
+  // 还开着一个页面（active_tabs 是上一次连接的残留计数）就放行，随后每个场景都在
+  // 「扩展没连上」上失败 20 次——比直接报前置条件不满足难读得多。
+  //
+  // active_tabs 只用于报错信息、不再作为放行条件：本脚本自己会 open 页面，
+  // 一个标签页都没有不影响跑（`atb status` 会因此 ok:false/summary=no_active_tabs，
+  // 那是「当前没有页面」而不是「跑不了」，所以下面单独放行这个 summary）。
   const connected = Boolean(json.connection && json.connection.extension_connected);
   const activeTabs = Number((json.connection && json.connection.active_tabs) || 0);
-  if (!connected && activeTabs === 0) {
-    printPrerequisites('daemon 在跑，但扩展没有连上（connection.extension_connected=false）');
+  if (!connected) {
+    printPrerequisites(
+      `daemon 在跑，但扩展没有连上（extension_connected=false，active_tabs=${activeTabs}，` +
+        `summary=${json.summary || `exit=${status.code}`}）。` +
+        '浏览器里打开 http/https 页面并确认扩展已启用后重试',
+    );
+    return 2;
+  }
+
+  // 扩展仍在跑旧版本时，e2e 会以「新 API 不存在」的形式失败，看起来像 daemon 的 bug。
+  // status 的 extension.stale 是明确信号：false 才是「磁盘上的版本已在浏览器里生效」。
+  const extensionStale = json.extension && json.extension.stale;
+  if (extensionStale !== false) {
+    const bundled = json.extension && json.extension.bundled_version;
+    const connectedVersions = json.extension && json.extension.connected_versions;
+    printPrerequisites(
+      `浏览器里的扩展版本不是磁盘上的最新版（extension.stale=${String(extensionStale)}，` +
+        `bundled=${bundled ?? '?'}，connected=${JSON.stringify(connectedVersions ?? [])}）。` +
+        '打开 chrome://extensions 对本扩展点「重新加载」后重试',
+    );
+    return 2;
+  }
+
+  // daemon 说自己在跑，但 API 端口连不上：多半是残留进程/端口冲突，早点说清楚。
+  const apiPort = Number((json.ports && json.ports.api && (json.ports.api.listening ?? json.ports.api.port)) || 18767);
+  const portState = await probePort(apiPort);
+  if (portState !== 'open') {
+    printPrerequisites(
+      `daemon 报告 running:true，但 ${apiPort} 端口无法连接（${portState}）：可能是残留 daemon 或端口被占用，` +
+        '先 `atb restart --force` 再重试',
+    );
     return 2;
   }
   return null;
@@ -500,7 +562,9 @@ async function preflight() {
 async function main() {
   const selected = ONLY
     ? SCENARIOS.filter((scenario) => scenario.name.includes(ONLY))
-    : SCENARIOS;
+    : SMOKE
+      ? SCENARIOS.filter((scenario) => SMOKE_NAMES.includes(scenario.name))
+      : SCENARIOS;
   if (selected.length === 0) {
     console.error(`✗ --only=${ONLY} 没有匹配任何场景`);
     console.error(`  可用场景：${SCENARIOS.map((scenario) => scenario.name).join(', ')}`);
@@ -513,10 +577,10 @@ async function main() {
   const { server, base } = await startServer();
   const summary = [];
   try {
-    console.log(`atb e2e：${selected.length} 个场景，页面根 ${base}`);
+    console.log(`atb e2e：${selected.length} 个场景${SMOKE ? '（ATB_E2E=smoke）' : ''}，页面根 ${base}`);
     console.log(`binary: ${BIN}`);
     console.log(`agent:  ${AGENT}`);
-    console.log(`tmpdir: ${TMP_DIR}`);
+    console.log(`tmpdir: ${ensureTmpDir()}`);
     console.log('');
 
     for (const scenario of selected) {
@@ -554,9 +618,9 @@ async function main() {
       console.log(`cleanup：未完成（exit=${cleanup.code}）${short(cleanup.stdout || cleanup.stderr)}`);
     }
     server.close();
-    if (!KEEP) {
+    if (!KEEP && TMP_DIR) {
       rmSync(TMP_DIR, { recursive: true, force: true });
-    } else {
+    } else if (TMP_DIR) {
       console.log(`临时文件保留在 ${TMP_DIR}`);
     }
   }

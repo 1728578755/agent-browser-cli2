@@ -18,7 +18,8 @@ pub(crate) const TARGET_HELP: &str = "\
   atb <命令> --dry-run   只解析目标、校验参数，输出计划，不动页面
 
 退出码:
-  0 成功   1 执行失败   2 命令写错（选择器/JS/参数/目标）   3 等待超时
+  0 成功   1 执行失败（含普通 wait / challenge 超时）   2 命令写错（选择器/JS/参数/目标）
+  3 仅 job wait / download-wait 等待超时
   4 结果未知：POST 可能已执行但响应丢失（重试前先用 --idempotency-key 或查询）
 
 多智能体（互不影响默认标签页）:
@@ -390,7 +391,7 @@ pub(crate) struct SnapshotArgs {
     #[arg(long = "max-nodes", default_value_t = 0)]
     pub(crate) max_nodes: usize,
     /// 保留无障碍树里的 generic 容器节点（默认跳过：它们既不可点也没有引用价值，
-    /// 只会把 @e 编号撑大）。调试无障碍树结构时才需要
+    /// 只会把 @e 编号撑大）。调试无障碍树结构时才需要（X-15）
     #[arg(long = "no-skip-generic")]
     pub(crate) no_skip_generic: bool,
     #[arg(long, default_value_t = 30.0)]
@@ -507,8 +508,8 @@ pub(crate) struct ScreenshotArgs {
     pub(crate) quality: Option<u8>,
     #[arg(long)]
     pub(crate) full_page: bool,
-    /// 整页截图的高度上限（设备像素）。仅在「页面禁止调试器注入、走拼图回落」时生效，
-    /// 默认 20000；超出会截断并在结果里标 truncated。
+    /// 限制输出高度（设备像素），默认 20000。CDP 主路径与拼图回落均生效；
+    /// 超出部分截断并在结果里回 `truncated:true`。
     #[arg(long)]
     pub(crate) max_height: Option<u32>,
     #[arg(long, default_value_t = 30.0)]
@@ -533,7 +534,8 @@ pub(crate) struct SavePdfArgs {
     pub(crate) scale: f64,
     #[arg(long = "no-print-background")]
     pub(crate) no_print_background: bool,
-    /// 图片型 PDF 回落时整页拼图的高度上限（设备像素），默认 20000。
+    /// 限制输出高度（设备像素），默认 20000。CDP 主路径与图片型 PDF 回落均生效；
+    /// 超出部分截断并在结果里回 truncated:true。
     #[arg(long)]
     pub(crate) max_height: Option<u32>,
     #[arg(long, default_value_t = 30.0)]

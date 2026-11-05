@@ -4,11 +4,11 @@
 
 ## 支持版本
 
-只有最新 minor 接受安全修复。当前线是 `0.7.x`，最新版 `0.7.1`。
+只有最新 minor 接受安全修复。当前线是 `0.7.x`，最新版 `0.7.2`。
 
 - 报告前先升级到最新 `0.7.x`，旧补丁版的问题可能在当前版已修复。
 - `0.6.x` 及更早不再接受安全修复。
-- 扩展版本需与 CLI 配套（当前扩展 `5.2.9`，消息协议 `4`）。
+- 扩展版本需与 CLI 配套（当前扩展 `5.3.0`，消息协议 `4`）。
 
 ## 报告漏洞
 
@@ -26,7 +26,7 @@
 | 运行 atb 的本机用户 | 可信 | 你能读 `~/.atb`、能改配置，本工具不防你 |
 | 同机其他进程与其他系统用户 | 不完全可信 | 能读文件、能占端口、能发本地 HTTP 请求，取决于系统权限 |
 | 被操作的页面内容 | 不可信 | 页面脚本可探测、干扰、伪造你看到的内容 |
-| 扩展与 daemon 之间的连接 | 本机回环 WebSocket | 无 TLS，默认只校验「对端是某个 Chrome 扩展」 |
+| 扩展与 daemon 之间的连接 | 本机回环 WebSocket | 无 TLS；四档信任模式（`compat` 默认 / `whitelist` / `token` / `both`），默认档只校验请求形状并在握手回包里带告警头 |
 
 前提：攻击者若已能在本机以你的身份执行代码，atb 不是防线。它能放大这种访问（读登录态、驱动浏览器），但不能阻止它。
 
@@ -34,10 +34,10 @@
 
 攻击面：
 
-- `127.0.0.1:18765`：扩展接入的 WebSocket，默认「装了扩展就能连」。
-- `127.0.0.1:18767`：CLI 调 daemon 的 HTTP API，需要 `api-token`。
-- `~/.atb/api-token`：文件权限 0600；Windows 上另用 `icacls` 收紧。
-- `~/.atb/ws-trust.json`：白名单与握手 token，可选。
+- `127.0.0.1:18765`：扩展接入的 WebSocket，默认「装了扩展就能连」（`ATB_WS_TRUST_MODE=compat`）。
+- `127.0.0.1:18767`：CLI 调 daemon 的 HTTP API，需要 `api-token`；`Host` 头只接受回环名（`127.0.0.1` / `localhost` / `[::1]`），其余返回 403 `host_not_allowed`。
+- `~/.atb/api-token`：文件权限 0600；Windows 上在写入前收紧 ACL（去继承 + 移除 Everyone / Users 等宽松 ACE + 当前用户 SID 授权）。
+- `~/.atb/ws-trust.json`：白名单与握手 token，可选；权限与 `api-token` 同等收紧（Unix 0600、Windows `icacls`，先收紧再写入）。
 - `chrome.debugger`：attach 后能读写该标签页的网络与控制台。
 - `<all_urls>` 注入：内容脚本在所有帧运行。
 - 页面脚本执行：`exec` / `inject` 在页面上下文执行任意 JS。
@@ -56,6 +56,34 @@
 
 以上取舍是公开的、有意的。不要把「配置了 token」理解成安全边界，它只覆盖一个方向。
 
+### WebSocket 信任模式（`ATB_WS_TRUST_MODE`）
+
+| 档位 | 握手校验 | 适用 | 风险 |
+| --- | --- | --- | --- |
+| `compat`（默认） | 不校验身份，只保证协议形状；回包带 `x-atb-ws-trust-mode: compat` 与 `x-atb-ws-security-warning` | 单机、单人、装好即用 | 同机任何进程都能连 18765 并接管扩展；`Origin` 是自断言，可伪造 |
+| `whitelist` | 扩展 ID 必须在 `trust-extension` 白名单内，缺配置或不在名单一律拒绝（`ws_whitelist_not_configured` / `ws_untrusted_extension`） | 多扩展共存、想限定来源 | 扩展 ID 可由扩展包决定，仍挡不住能读配置的本机进程 |
+| `token` | 握手必须带匹配的 `ws-trust.json` token（常量时间比较；`ws_token_not_configured` / `ws_token_invalid`） | 共用机器、最小改动 | 扩展侧只能证明「知道 token」，无法证明对端是真 daemon |
+| `both` | 白名单 + token 同时校验 | 共用机器 / 安全敏感 | 需同时维护两份配置 |
+
+切档：
+
+```bash
+atb trust-extension <extensionId>            # 加白名单
+atb trust-extension --token <value>          # 设置/轮换握手 token
+ATB_WS_TRUST_MODE=both atb restart           # 重启后生效（daemon 读环境变量）
+```
+
+`whitelist` / `token` / `both` 都是 fail-closed：配置缺失或校验失败直接拒绝握手，不会退回 `compat`。`trust-extension --clear` / `--clear-token` 清空配置后，请同时把 `ATB_WS_TRUST_MODE` 改回 `compat`，否则 daemon 会持续拒绝所有连接。
+
+### HTTP API 的两个前提
+
+- 只接受回环 `Host`：`127.0.0.1` / `localhost` / `[::1]` / `::1`（大小写不敏感）。这是对 DNS rebinding 的纵深防御，不替代 `api-token`。
+- `api-token` 仍然必需：`/ping` 是唯一免鉴权端点，其余请求都要 `x-atb-api-token`；未授权的 POST 进不到幂等中间件，不会留下缓存或落盘记录。
+
+### 幂等记录的落盘口径
+
+`~/.atb/idempotency.jsonl` 默认 `ATB_IDEMPOTENCY_PERSIST=redacted`：只写 `{key, scope, at, status}`，**不写响应体**，因此不会把页面正文、Cookie 或网络响应带进日志目录。`full` 才会写入响应体（单条 256KB 上限，60 秒 TTL），`off` 完全不落盘。升级前旧版本写入的带 body 行仍可回放，但新写入的 `redacted` 行只用于审计、不参与回放。
+
 ## 加固清单
 
 日常：
@@ -66,11 +94,13 @@
 
 处理敏感账号时：
 
-- `atb trust-extension <extensionId>` 限定扩展白名单，`--token <value>` 要求握手带 token；两者可同时生效。
+- `atb trust-extension <extensionId>` 限定扩展白名单，`--token <value>` 要求握手带 token；两者同时生效需显式设 `ATB_WS_TRUST_MODE=both` 并 `atb restart`（只配置不切档仍按 `compat` 放行）。
 - 设 `ATB_NO_DEBUGGER=1`，彻底禁止 attach；需要 CDP 的命令会返回替代方案。
 - 用专用的 Chrome Profile，避免日常登录态与自动化任务混在一起。
 - 不要在不可信页面执行来源不明的脚本：`exec` / `inject` 拿到的代码会在页面里跑。
-- 检查 `~/.atb` 及其文件的权限，确认只有本人可读。
+- 检查 `~/.atb` 及其文件的权限，确认只有本人可读：目录 0700、`daemon.log` 0600、`api-token` / `ws-trust.json` 0600（Windows 走 ACL）。
+- 扩展 popup 默认把 Cookie 值渲染成 `•••`，点「显示值」后 5 秒内需二次确认；「复制 cookies」写入剪贴板后 30 秒自动清除（`clipboardTtlSec` 可在 popup 里调到 30–300 秒）。共用机器上不要跳过这一步直接复制。
+- 幂等落盘保持默认 `redacted`；只有确实需要审计响应体时再用 `ATB_IDEMPOTENCY_PERSIST=full`，并把它当作「会写敏感数据」对待。
 
 多人共用一台机器：
 
@@ -97,6 +127,7 @@
 - 挑战页未通过、验证码未被破解导致的超时。
 - 浏览器顶部出现调试横幅（attach 的既定行为，可用 `ATB_NO_DEBUGGER=1` 规避）。
 - 同机进程在扩展断开、daemon 空闲退出后抢占端口（已知取舍，见上表）。
+- `ATB_WS_TRUST_MODE=compat`（默认）下，同机进程伪造 `Origin` 连入 18765：这是默认档的已知取舍，要闭合必须切 `both`（白名单 + token），仅切 `whitelist` 或仅设 token 都留有余地。
 - 共用系统账号时多个 atb 实例互相影响配置与端口。
 
 ## English summary
@@ -109,4 +140,8 @@ The local user is trusted; other local processes and page content are not. Traff
 
 Known trade-offs: one-way `trust-extension`, a port window after the extension disconnects and the daemon idles out, no daemon authentication by the extension, `chrome.debugger` attach, `<all_urls>` injection, readable cookies, and challenge handling that interacts with the widget, lets the agent click by coordinates as a fallback, and hands over to a human only when needed — without bypassing access control.
 
-Do not treat `atb stop` as a security boundary: it frees 18765 while the extension keeps reconnecting. Disable the extension or close the browser to close the window, or keep the daemon running to hold the port. Keep versions matched, and use `trust-extension` plus `ATB_NO_DEBUGGER=1` for sensitive work.
+WebSocket trust has four modes via `ATB_WS_TRUST_MODE`: `compat` (default; shape-only, warning header), `whitelist`, `token`, and `both` (whitelist + token, fail-closed). `compat` accepts a forged `Origin` from any local process by design; switch to `both` to close that. The HTTP API only accepts loopback `Host` headers and still requires `api-token`.
+
+Idempotency records default to `redacted` (key/scope/time/status only, no response body); `full` is opt-in. `daemon.log` is 0600 in a 0700 directory, `ws-trust.json` gets the same ACL treatment as `api-token`, clipboard copies are cleared after 30 seconds, and the popup masks cookie values until you reveal them.
+
+Do not treat `atb stop` as a security boundary: it frees 18765 while the extension keeps reconnecting. Disable the extension or close the browser to close the window, or keep the daemon running to hold the port. Keep versions matched, and use `trust-extension` with `ATB_WS_TRUST_MODE=both` plus `ATB_NO_DEBUGGER=1` for sensitive work.

@@ -1,5 +1,14 @@
 use super::*;
 
+/// 页面内容是否被 `page_data::truncate_output`（`html::smart_truncate`）截断。
+///
+/// `get_html` 的三条降级路径与主路径现在都统一走 `truncate_output`，截断时会在末尾
+/// 追加 `" [TRUNCATED]"`。这里以**标记**为口径，不用字节数去猜：
+/// `String::len()` 是字节、预算却是字符数，中文页会提前/滞后判定。
+pub(crate) fn content_is_truncated(content: &str) -> bool {
+    content.trim_end().ends_with(" [TRUNCATED]")
+}
+
 pub(crate) async fn scan_page(
     state: &AppState,
     tabs_only: bool,
@@ -57,11 +66,19 @@ pub(crate) async fn scan_page(
             .map_err(|_| timeout_error())??;
             let page = page_payload(payload, "page");
             let page = page.get("page").cloned().unwrap_or(Value::Null);
-            result["content"] = json!(page.get("text").and_then(Value::as_str).unwrap_or_default());
+            let text = page
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            // 快通道由页面侧 `page_read` 按 maxChars 截断并自带 `truncated` 标记；
+            // 保险起见再认一次末尾标记，两条口径取并集。
+            let truncated = page.get("truncated").and_then(Value::as_bool) == Some(true)
+                || content_is_truncated(&text);
+            result["content"] = json!(text);
             result["metadata"]["mode"] = json!("fast");
             result["metadata"]["fast"] = page.get("stats").cloned().unwrap_or(Value::Null);
-            result["metadata"]["truncated"] =
-                page.get("truncated").cloned().unwrap_or(Value::Bool(false));
+            result["metadata"]["truncated"] = json!(truncated);
         } else {
             let node_budget = max_nodes.unwrap_or(8_000);
             let content = tokio::time::timeout(
@@ -78,12 +95,25 @@ pub(crate) async fn scan_page(
             )
             .await
             .map_err(|_| timeout_error())??;
+            // `get_html` 现在所有返回点都会按 maxchars 截断并追加标记，
+            // 这里按标记回报真实值（旧实现固定 false / 干脆没有这个字段）。
+            let truncated = content_is_truncated(&content);
             result["content"] = Value::String(content);
             result["metadata"]["mode"] = json!(if text_only { "text" } else { "html" });
             result["metadata"]["node_budget"] = json!(node_budget);
+            result["metadata"]["truncated"] = json!(truncated);
         }
     }
     Ok(result)
+}
+
+/// 单次观察保留的样本条数上限。
+///
+/// 计数是无界的（`changed` / `added` …），但**样本数组**必须有上限：旧实现把每条
+/// `MutationRecord` 原样 push 进数组，长观察（几十分钟的 SPA）会一直涨到标签页 OOM。
+/// 值域 `1..=500`，默认 50；超出的条数只进 `overflow` 计数。
+fn monitor_sample_limit() -> usize {
+    crate::settings::env_usize_clamped("ATB_MONITOR_SAMPLES", 50, 1, 500)
 }
 
 /// 把用户脚本包进「MutationObserver 记录 + 执行」的一次注入里。
@@ -95,13 +125,41 @@ pub(crate) fn wrap_with_mutation_watch(script: &str) -> String {
     format!(
         r#"(async () => {{
   const __abcSource = {source};
-  const __abcWatch = {{ changed: 0, added: 0, removed: 0, attributes: 0, text: 0, samples: [] }};
-  let __abcObserver = null;
-  // 回调必须自己累积记录：脚本里的 await 会让微任务先跑，
+  // 只保留计数与少量样本：回调里直接累加，绝不把 MutationRecord 原样
+  // 存进数组——长观察会把标签页内存吃干净。samples 只留前 N 条用于诊断，
+  // 其余条数进 overflow，保证输出口径不丢。
+  const __abcSampleLimit = {sample_limit};
+  const __abcWatch = {{ changed: 0, added: 0, removed: 0, attributes: 0, text: 0, samples: [], overflow: 0 }};
+  // 回调必须自己累积：脚本里的 await 会让微任务先跑，
   // 回调消费掉记录后 takeRecords() 就只剩空数组。
-  const __abcRecords = [];
+  const __abcConsume = function (list) {{
+    for (const __abcRecord of list) {{
+      __abcWatch.changed += 1;
+      if (__abcRecord.type === 'childList') {{
+        __abcWatch.added += __abcRecord.addedNodes.length;
+        __abcWatch.removed += __abcRecord.removedNodes.length;
+      }} else if (__abcRecord.type === 'attributes') {{
+        __abcWatch.attributes += 1;
+      }} else if (__abcRecord.type === 'characterData') {{
+        __abcWatch.text += 1;
+      }}
+      if (__abcWatch.samples.length < __abcSampleLimit) {{
+        const __abcTarget = __abcRecord.target && __abcRecord.target.nodeType === 1
+          ? (__abcRecord.target.tagName.toLowerCase() + (__abcRecord.target.id ? '#' + __abcRecord.target.id : ''))
+          : String((__abcRecord.target && __abcRecord.target.nodeName) || '').toLowerCase();
+        const __abcAdded = __abcRecord.addedNodes && __abcRecord.addedNodes[0];
+        const __abcDetail = __abcAdded
+          ? ('+' + (__abcAdded.nodeType === 1 ? __abcAdded.tagName.toLowerCase() : '#text'))
+          : (__abcRecord.attributeName || '');
+        __abcWatch.samples.push({{ type: __abcRecord.type, target: __abcTarget, detail: __abcDetail }});
+      }} else {{
+        __abcWatch.overflow += 1;
+      }}
+    }}
+  }};
+  let __abcObserver = null;
   try {{
-    __abcObserver = new MutationObserver((list) => {{ for (const item of list) __abcRecords.push(item); }});
+    __abcObserver = new MutationObserver(__abcConsume);
     __abcObserver.observe(document.documentElement || document, {{
       childList: true, subtree: true, attributes: true, characterData: true
     }});
@@ -140,34 +198,14 @@ pub(crate) fn wrap_with_mutation_watch(script: &str) -> String {
     __abcError = (e && e.message) ? e.message : String(e);
   }} finally {{
     if (__abcObserver) {{
-      const pending = __abcObserver.takeRecords();
+      __abcConsume(__abcObserver.takeRecords());
       __abcObserver.disconnect();
-      for (const record of __abcRecords.concat(pending)) {{
-        __abcWatch.changed += 1;
-        if (record.type === 'childList') {{
-          __abcWatch.added += record.addedNodes.length;
-          __abcWatch.removed += record.removedNodes.length;
-        }} else if (record.type === 'attributes') {{
-          __abcWatch.attributes += 1;
-        }} else if (record.type === 'characterData') {{
-          __abcWatch.text += 1;
-        }}
-        if (__abcWatch.samples.length < 8) {{
-          const target = record.target && record.target.nodeType === 1
-            ? (record.target.tagName.toLowerCase() + (record.target.id ? '#' + record.target.id : ''))
-            : String((record.target && record.target.nodeName) || '').toLowerCase();
-          const added = record.addedNodes && record.addedNodes[0];
-          const detail = added
-            ? ('+' + (added.nodeType === 1 ? added.tagName.toLowerCase() : '#text'))
-            : (record.attributeName || '');
-          __abcWatch.samples.push({{ type: record.type, target: target, detail: detail }});
-        }}
-      }}
     }}
   }}
   if (__abcError) return {{ __abc_watch: __abcWatch, error: __abcError }};
   return {{ __abc_watch: __abcWatch, result: __abcResult }};
-}})()"#
+}})()"#,
+        sample_limit = monitor_sample_limit()
     )
 }
 
@@ -204,19 +242,47 @@ pub(crate) fn monitor_start_script(monitor_id: &str) -> String {
 const ID = {monitor_id};
 const prev = window[KEY];
 if (prev && prev.observer) {{ try {{ prev.observer.disconnect(); }} catch (_) {{}} }}
-const state = {{ changed: 0, added: 0, removed: 0, attributes: 0, text: 0, samples: [] }};
-const records = [];
+// 计数在回调里累加、样本只留前 N 条：不保留任何 MutationRecord，
+// 观察多久都只占 O(1) 内存。
+const LIMIT = {sample_limit};
+const state = {{ changed: 0, added: 0, removed: 0, attributes: 0, text: 0, samples: [], overflow: 0 }};
+const consume = function (list) {{
+  for (const record of list) {{
+    state.changed += 1;
+    if (record.type === 'childList') {{
+      state.added += record.addedNodes.length;
+      state.removed += record.removedNodes.length;
+    }} else if (record.type === 'attributes') {{
+      state.attributes += 1;
+    }} else if (record.type === 'characterData') {{
+      state.text += 1;
+    }}
+    if (state.samples.length < LIMIT) {{
+      const target = record.target && record.target.nodeType === 1
+        ? (record.target.tagName.toLowerCase() + (record.target.id ? '#' + record.target.id : ''))
+        : String((record.target && record.target.nodeName) || '').toLowerCase();
+      const added = record.addedNodes && record.addedNodes[0];
+      const detail = added
+        ? ('+' + (added.nodeType === 1 ? added.tagName.toLowerCase() : '#text'))
+        : (record.attributeName || '');
+      state.samples.push({{ type: record.type, target: target, detail: detail }});
+    }} else {{
+      state.overflow += 1;
+    }}
+  }}
+}};
 let observer = null;
 try {{
-  observer = new MutationObserver(function (list) {{ for (const item of list) records.push(item); }});
+  observer = new MutationObserver(consume);
   observer.observe(document.documentElement || document, {{
     childList: true, subtree: true, attributes: true, characterData: true
   }});
 }} catch (_) {{ observer = null; }}
 if (!observer) return {{ status: 'unsupported' }};
-window[KEY] = {{ id: ID, observer: observer, state: state, records: records }};
+window[KEY] = {{ id: ID, observer: observer, state: state, consume: consume }};
 return {{ status: 'watching' }};"#,
-        monitor_id = serde_json::to_string(monitor_id).unwrap_or_else(|_| "\"\"".to_string())
+        monitor_id = serde_json::to_string(monitor_id).unwrap_or_else(|_| "\"\"".to_string()),
+        sample_limit = monitor_sample_limit()
     )
 }
 
@@ -233,31 +299,13 @@ const entry = window[KEY];
 if (!entry) return {{ status: 'navigated' }};
 if (entry.id !== ID) return {{ status: 'superseded' }};
 window[KEY] = null;
-const state = entry.state || {{ changed: 0, added: 0, removed: 0, attributes: 0, text: 0, samples: [] }};
+const state = entry.state || {{ changed: 0, added: 0, removed: 0, attributes: 0, text: 0, samples: [], overflow: 0 }};
 if (entry.observer) {{
-  const pending = entry.observer.takeRecords();
-  entry.observer.disconnect();
-  for (const record of (entry.records || []).concat(pending)) {{
-    state.changed += 1;
-    if (record.type === 'childList') {{
-      state.added += record.addedNodes.length;
-      state.removed += record.removedNodes.length;
-    }} else if (record.type === 'attributes') {{
-      state.attributes += 1;
-    }} else if (record.type === 'characterData') {{
-      state.text += 1;
-    }}
-    if (state.samples.length < 8) {{
-      const target = record.target && record.target.nodeType === 1
-        ? (record.target.tagName.toLowerCase() + (record.target.id ? '#' + record.target.id : ''))
-        : String((record.target && record.target.nodeName) || '').toLowerCase();
-      const added = record.addedNodes && record.addedNodes[0];
-      const detail = added
-        ? ('+' + (added.nodeType === 1 ? added.tagName.toLowerCase() : '#text'))
-        : (record.attributeName || '');
-      state.samples.push({{ type: record.type, target: target, detail: detail }});
-    }}
+  // 还没跑回调的尾部记录也要计入（回调负责累加，这里不再遍历原始记录）。
+  if (typeof entry.consume === 'function') {{
+    try {{ entry.consume(entry.observer.takeRecords()); }} catch (_) {{}}
   }}
+  entry.observer.disconnect();
 }}
 return {{ status: 'ok', watch: state }};"#,
         monitor_id = serde_json::to_string(monitor_id).unwrap_or_else(|_| "\"\"".to_string())

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot};
 
 /// daemon ↔ CLI 的 API 协议版本。
@@ -184,7 +184,16 @@ pub struct DriverState {
     /// 与 key **同生共死**：设置走 [`DriverState::set_preferred_default_session`]、
     /// 清理走 [`DriverState::clear_preferred_default_session`]，任何一处漏写都会让
     /// 这份记忆变成永不过期的脏数据（默认目标再也建立不起来）。
+    ///
+    /// TTL 判定已改用下面的单调时刻，本字段只作为**兼容旧值/测试**的
+    /// 回退来源（外部按 unix 秒直接写入时仍能按非负年龄判过期）。
     pub preferred_default_session_at: Option<f64>,
+    /// 登记时刻的单调时钟版本。
+    ///
+    /// 系统时钟回拨时 unix 秒差会变成负数，旧判据 `now - at < TTL` 会把一条
+    /// 早已过期的记忆判成「永远有效」。`Instant` 不受墙钟调整影响，是本进程内
+    /// 唯一可信的时间来源；它只在进程内存活，正好符合这份记忆的语义。
+    pub(crate) preferred_default_session_at_instant: Option<Instant>,
     /// 每个 browser:profile 的 net 配置（含页面规则与网络层规则），跨标签共享。
     pub net_hooks: HashMap<String, Value>,
 }
@@ -195,19 +204,29 @@ pub struct DriverState {
 /// 的记忆永久卡住默认目标的自动建立（`should_set_default_session` 见到 preferred
 /// 就不再改选）。
 pub const PREFERRED_DEFAULT_TTL: f64 = 6.0 * 3600.0;
+/// 同上，`Duration` 形式（给单调时钟判据用）。
+const PREFERRED_DEFAULT_TTL_DURATION: Duration = Duration::from_secs(6 * 3600);
 
 impl DriverState {
     /// 当前仍然有效的「待生效默认目标」。
     ///
     /// 过期的记忆在这里**只当作不存在**，不清理字段（`&self` 清不了）：清理由
     /// [`Self::expire_preferred_default_session`] 在快照入口做一次。
+    ///
+    /// 判据：
+    /// 1. key 与登记时刻**同生共死**——key 有值但没有任何时间戳时视为无效，
+    ///    不再把「字段被直接写坏」的旧值当成永久有效；
+    /// 2. 优先用单调时钟 `Instant`：系统时钟回拨不会让 TTL 失效；
+    /// 3. 只有单调时刻缺失（旧值/测试直接写 unix 秒）才退回 unix 秒，
+    ///    且要求 `age >= 0`——负年龄（时钟回拨造成的「未来时间戳」）按过期处理。
     pub fn preferred_default_session(&self) -> Option<&str> {
         let key = self.preferred_default_session_key.as_deref()?;
-        match self.preferred_default_session_at {
-            // 没有时间戳：兼容直接写字段的旧值/测试。生产路径上每个写点都会写时间戳。
-            None => Some(key),
-            Some(at) => (now_unix_secs() - at < PREFERRED_DEFAULT_TTL).then_some(key),
+        if let Some(at) = self.preferred_default_session_at_instant {
+            return (at.elapsed() < PREFERRED_DEFAULT_TTL_DURATION).then_some(key);
         }
+        let at = self.preferred_default_session_at?;
+        let age = now_unix_secs() - at;
+        (0.0..PREFERRED_DEFAULT_TTL).contains(&age).then_some(key)
     }
 
     /// 记忆**已经过期**就清掉，返回是否真的清理了。
@@ -226,12 +245,14 @@ impl DriverState {
     pub fn set_preferred_default_session(&mut self, session_key: String) {
         self.preferred_default_session_key = Some(session_key);
         self.preferred_default_session_at = Some(now_unix_secs());
+        self.preferred_default_session_at_instant = Some(Instant::now());
     }
 
     /// 清掉记忆：key 与时间戳一起清，避免残留时间戳污染下一次设置。
     pub fn clear_preferred_default_session(&mut self) {
         self.preferred_default_session_key = None;
         self.preferred_default_session_at = None;
+        self.preferred_default_session_at_instant = None;
     }
 }
 
@@ -317,7 +338,7 @@ pub enum WsIncoming {
         /// 扩展自检发现的问题（`queryTabs` / `tabGroups` / `restartSeq` 之类异常）。
         ///
         /// 扩展在 `connectWS` 的 finally 块里会发这个数组，但 daemon 侧长期没有建模，
-        /// serde 直接丢弃 —— 用户看不到「为什么这次上报的 tabs 是空的」。
+        /// serde 直接丢弃 —— 用户看不到「为什么这次上报的 tabs 是空的」（R-19）。
         #[serde(default)]
         warnings: Vec<Value>,
         #[serde(default, deserialize_with = "deserialize_ext_tabs")]
@@ -383,7 +404,7 @@ pub struct ExtTab {
 ///
 /// 派生实现会把任意 JSON 收进 `Value`，于是对象/数组类型的 id 会被
 /// `Value::to_string()` 变成 `{"a":1}` 这种伪 id，混进会话表后按 id 查找永远对不上
-/// （R1-11）。调用方（`Vec<ExtTab>` 的逐条 `from_value`）会把 Err 当成「丢掉这条」。
+/// 。调用方（`Vec<ExtTab>` 的逐条 `from_value`）会把 Err 当成「丢掉这条」。
 impl<'de> Deserialize<'de> for ExtTab {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -437,7 +458,7 @@ impl ExtTab {
             Value::Number(number) => number.to_string(),
             // `ExtTab` 的 Deserialize 只放行字符串 / 整数 id，走到这里是 bug。
             // 不再用 `other.to_string()` 造伪 id：宁可给空串，也不让
-            // `{"a":1}` / `true` 之类变成会话 key 的一部分（R1-11）。
+            // `{"a":1}` / `true` 之类变成会话 key 的一部分。
             other => {
                 debug_assert!(false, "invalid tab id survived deserialization: {other}");
                 String::new()
@@ -470,7 +491,7 @@ pub fn make_session_key(browser_id: &str, profile_id: &str, tab_id: &str) -> Str
 /// `tabs` 字段的反序列化：逐个校验，`id` 类型不合法的标签**直接丢弃**。
 ///
 /// 放在反序列化阶段而不是调用点，是因为 `tabs` 由扩展推送（不可信输入），而丢弃
-/// 必须在「进会话表之前」发生；这样即使调用方忘了过滤，也不会出现伪 id（R1-11）。
+/// 必须在「进会话表之前」发生；这样即使调用方忘了过滤，也不会出现伪 id。
 fn deserialize_ext_tabs<'de, D>(deserializer: D) -> Result<Vec<ExtTab>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -514,7 +535,7 @@ mod tests {
         let WsIncoming::ExtReady { tabs, .. } = message else {
             panic!("expected ext_ready");
         };
-        // 只有字符串和整数 id 的标签留下，其余直接丢弃（R1-11）。
+        // 只有字符串和整数 id 的标签留下，其余直接丢弃。
         assert_eq!(tabs.len(), 2);
         assert_eq!(tabs[0].id, json!("abc"));
         assert_eq!(tabs[1].id, json!(42));
@@ -546,5 +567,53 @@ mod tests {
             panic!("expected tabs_update");
         };
         assert_eq!(tabs.len(), 1);
+    }
+
+    /// key 与时间戳必须同生共死——只有 key、没有时间戳的记忆视为无效。
+    #[test]
+    fn preferred_default_requires_a_timestamp() {
+        let mut driver = DriverState {
+            preferred_default_session_key: Some("k".to_string()),
+            ..DriverState::default()
+        };
+        assert!(
+            driver.preferred_default_session().is_none(),
+            "缺时间戳的 key 不能当作「永远有效」"
+        );
+        assert!(driver.expire_preferred_default_session());
+        assert!(driver.preferred_default_session_key.is_none());
+        assert!(driver.preferred_default_session_at.is_none());
+        assert!(driver.preferred_default_session_at_instant.is_none());
+    }
+
+    /// unix 秒回退判据要求年龄非负——时钟回拨造成的「未来时间戳」
+    /// 必须按过期处理，不能变成永不过期。
+    #[test]
+    fn preferred_default_rejects_negative_age_after_clock_rollback() {
+        let mut driver = DriverState {
+            preferred_default_session_key: Some("k".to_string()),
+            preferred_default_session_at: Some(now_unix_secs() + 3600.0),
+            ..DriverState::default()
+        };
+        assert!(
+            driver.preferred_default_session().is_none(),
+            "登记时刻在未来（时钟回拨）时必须过期"
+        );
+        assert!(driver.expire_preferred_default_session());
+    }
+
+    /// 正常设置走单调时钟，读取有效；清除时三个字段一起清。
+    #[test]
+    fn preferred_default_uses_monotonic_clock() {
+        let mut driver = DriverState::default();
+        driver.set_preferred_default_session("k".to_string());
+        assert!(
+            driver.preferred_default_session_at_instant.is_some(),
+            "设置时必须写单调时刻"
+        );
+        assert_eq!(driver.preferred_default_session(), Some("k"));
+        driver.clear_preferred_default_session();
+        assert!(driver.preferred_default_session().is_none());
+        assert!(driver.preferred_default_session_at_instant.is_none());
     }
 }

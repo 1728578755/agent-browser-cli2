@@ -90,6 +90,31 @@ pub fn resolve_open_target(
     }
 
     if let Some(scheme) = explicit_scheme(input) {
+        // `scheme:数字` 有两种可能：真的 scheme（`tel:110`）或省略了 `//` 的
+        // `host:port`（`localhost:3000` / `example.com:8080`）。旧实现把两者都
+        // 塞进 `looks_like_host_port`，导致 `tel:123` 被改写成 `https://tel:123`，
+        // 而 `example.com:99999` 报 unsupported_scheme。
+        if let Some((_, rest)) = input.split_once(':') {
+            if !rest.is_empty() && rest.bytes().all(|byte| byte.is_ascii_digit()) {
+                if rest.parse::<u16>().is_err() {
+                    return Err(OpenTargetError::new(
+                        "invalid_port",
+                        format!("Port out of range: {rest}"),
+                        json!({ "open_target": input, "port": rest }),
+                    ));
+                }
+                // 端口合法，但前缀必须真的像主机（localhost / IP / 含点 / 带括号），
+                // 否则 `tel:123` 这类就是 scheme:数字，不能静默改写成 HTTP URL。
+                if !looks_like_host_name(&scheme) {
+                    return Err(OpenTargetError::new(
+                        "unsupported_scheme",
+                        format!("Unsupported Open Target scheme: {scheme}"),
+                        json!({ "scheme": scheme, "supported_schemes": ["http", "https", "file"] }),
+                    ));
+                }
+                return resolve_implicit_web(input);
+            }
+        }
         return match scheme.as_str() {
             "http" | "https" => resolve_explicit_web(input, &scheme),
             "file" => resolve_file_url(input),
@@ -290,13 +315,8 @@ fn host_defaults_to_http(host: Host<&str>) -> bool {
 }
 
 fn resolve_file_url(input: &str) -> Result<ResolvedOpenTarget, OpenTargetError> {
-    if !input.to_ascii_lowercase().starts_with("file://") {
-        return Err(OpenTargetError::new(
-            "invalid_file_url",
-            "Relative file URLs are not supported; pass a relative filesystem path instead",
-            json!({ "open_target": input }),
-        ));
-    }
+    // 先解析再判绝对性：`file:/path` 在浏览器里等价于
+    // `file:///path`，旧实现只认 `file://` 前缀，把绝对路径误报成「Relative file URLs」。
     let mut parsed = Url::parse(input).map_err(|err| {
         OpenTargetError::new(
             "invalid_file_url",
@@ -304,6 +324,23 @@ fn resolve_file_url(input: &str) -> Result<ResolvedOpenTarget, OpenTargetError> 
             json!({ "open_target": input }),
         )
     })?;
+    if !parsed.scheme().eq_ignore_ascii_case("file") {
+        return Err(OpenTargetError::new(
+            "invalid_file_url",
+            format!("Not a file URL: {}", parsed.scheme()),
+            json!({ "open_target": input, "scheme": parsed.scheme() }),
+        ));
+    }
+    // Unix 上 file URL 的 path 必须以 `/` 开头；`file:demo.html` 这类交给
+    // `to_file_path()` 会得到相对路径，统一在这里给出与旧行为一致的错误。
+    #[cfg(not(windows))]
+    if parsed.host_str().unwrap_or_default().is_empty() && !parsed.path().starts_with('/') {
+        return Err(OpenTargetError::new(
+            "invalid_file_url",
+            "Relative file URLs are not supported; pass a relative filesystem path instead",
+            json!({ "open_target": input }),
+        ));
+    }
     if !parsed.username().is_empty() || parsed.password().is_some() || parsed.port().is_some() {
         return Err(OpenTargetError::new(
             "invalid_file_url",
@@ -313,12 +350,21 @@ fn resolve_file_url(input: &str) -> Result<ResolvedOpenTarget, OpenTargetError> 
     }
 
     let host = parsed.host_str().unwrap_or_default().to_string();
-    #[cfg(not(windows))]
-    if !host.is_empty() && !host.eq_ignore_ascii_case("localhost") {
+    // file://host/... 在 Unix 上映射到 `//host/...`，在 Windows 上映射到 UNC 路径
+    // `\\host\share\...`，访问即触发 SMB 外连。除空 host / localhost 外
+    // 一律拒绝，除非用户用 `ATB_FILE_HOSTS=host1,host2` 显式信任。
+    if !file_host_allowed(&host) {
         return Err(OpenTargetError::new(
             "unsupported_file_host",
-            format!("File URL host is not supported on this platform: {host}"),
-            json!({ "open_target": input, "host": host, "host_platform": std::env::consts::OS }),
+            format!(
+                "File URL host is not in the allowlist: {host}；如确需访问，设置 ATB_FILE_HOSTS={host}"
+            ),
+            json!({
+                "open_target": input,
+                "host": host,
+                "host_platform": std::env::consts::OS,
+                "file_hosts_env": "ATB_FILE_HOSTS",
+            }),
         ));
     }
     if host.eq_ignore_ascii_case("localhost") {
@@ -350,6 +396,18 @@ fn resolve_file_url(input: &str) -> Result<ResolvedOpenTarget, OpenTargetError> 
         ));
     }
     resolve_local_path(path, input, query.as_deref(), fragment.as_deref())
+}
+
+/// file URL 的 host 是否允许（空 / localhost / `ATB_FILE_HOSTS` 逗号白名单）。
+fn file_host_allowed(host: &str) -> bool {
+    if host.is_empty() || host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    crate::settings::env_string("ATB_FILE_HOSTS", "")
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .any(|entry| entry.eq_ignore_ascii_case(host))
 }
 
 fn resolve_path_input(
@@ -423,13 +481,6 @@ fn resolve_local_path(
             json!({ "open_target": input, "resolved_path": path }),
         )
     })?;
-    if canonical.to_str().is_none() {
-        return Err(OpenTargetError::new(
-            "non_utf8_local_resource",
-            "Local Resource path cannot be represented as UTF-8",
-            json!({ "open_target": input }),
-        ));
-    }
     let metadata = fs::metadata(&canonical).map_err(|err| {
         OpenTargetError::new(
             "local_resource_not_found",
@@ -471,7 +522,9 @@ fn resolve_local_path(
 
 fn expand_current_user_home(input: &str) -> Result<PathBuf, OpenTargetError> {
     if input == "~" || input.starts_with("~/") || (cfg!(windows) && input.starts_with("~\\")) {
-        let home = dirs::home_dir().ok_or_else(|| {
+        // 统一走 config::home_dir：配置目录、`~` 展开、daemon cwd
+        // 必须用同一个 `dirs::home_dir()`，否则 Windows Git-Bash / WSL 下会分叉。
+        let home = crate::config::home_dir().ok_or_else(|| {
             OpenTargetError::new(
                 "home_directory_unavailable",
                 "Could not determine the current user's home directory",
@@ -499,6 +552,18 @@ fn explicit_scheme(input: &str) -> Option<String> {
 
 fn looks_like_host_port(input: &str) -> bool {
     explicit_port(input).is_some()
+}
+
+/// `scheme:数字` 里的前缀是否像主机名（决定它能不能被当作 `host:port`）。
+///
+/// 只认 localhost、IP 字面量、带点号的域名/主机名。单标签主机（`printer:631`）
+/// 与真正的 scheme（`tel:123`）无法区分，按报告要求保守处理：不自动改写，用户可写
+/// `http://printer:631`。
+fn looks_like_host_name(prefix: &str) -> bool {
+    prefix.eq_ignore_ascii_case("localhost")
+        || prefix.parse::<std::net::IpAddr>().is_ok()
+        || (prefix.starts_with('[') && prefix.ends_with(']'))
+        || prefix.contains('.')
 }
 
 fn explicit_port(input: &str) -> Option<u16> {
@@ -699,6 +764,44 @@ mod tests {
     fn relative_file_urls_are_rejected() {
         let err = resolve_open_target("file:demo.html", None).unwrap_err();
         assert_eq!(err.code, "invalid_file_url");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absolute_file_url_without_double_slash_is_accepted() {
+        // `file:/path`（单斜杠）是合法的绝对 file URL，旧实现误报成相对 URL。
+        let dir = temp_dir();
+        let file = dir.join("demo.html");
+        fs::write(&file, "ok").unwrap();
+        let input = format!("file:{}", file.display());
+        let resolved = resolve_open_target(&input, None).unwrap();
+        assert!(resolved.navigation_url.starts_with("file://"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn file_url_with_remote_host_is_rejected_by_default() {
+        // 非空 host 会触发 UNC/SMB 外连，默认必须拒绝。
+        let err = resolve_open_target("file://server/share/demo.html", None).unwrap_err();
+        assert_eq!(err.code, "unsupported_file_host");
+        assert_eq!(
+            err.details.get("file_hosts_env").and_then(Value::as_str),
+            Some("ATB_FILE_HOSTS")
+        );
+    }
+
+    #[test]
+    fn numeric_scheme_is_not_rewritten_to_http() {
+        // `tel:123` 是 scheme:数字，不是 host:port；旧实现会改写成 https://tel:123。
+        let err = resolve_open_target("tel:123", None).unwrap_err();
+        assert_eq!(err.code, "unsupported_scheme");
+        // 端口超出 u16 时报 invalid_port，并带上原始 port 值。
+        let err = resolve_open_target("example.com:99999", None).unwrap_err();
+        assert_eq!(err.code, "invalid_port");
+        assert_eq!(
+            err.details.get("port").and_then(Value::as_str),
+            Some("99999")
+        );
     }
 
     #[test]

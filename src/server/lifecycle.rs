@@ -119,7 +119,7 @@ pub(crate) async fn shutdown(State(state): State<AppState>) -> Json<Value> {
 pub(crate) async fn cleanup_on_shutdown(state: &AppState) -> Value {
     // 幂等：idle / inflight-stall / job-stall 都是「先 cleanup 再 send(shutdown)」，
     // graceful_shutdown 闭包与 `/shutdown` handler 还会再调一次。第二遍没有意义，
-    // 而且会把扩展侧刚重建的调试/拦截状态再清一遍（A1-06）。
+    // 而且会把扩展侧刚重建的调试/拦截状态再清一遍。
     if state.cleanup_done.swap(true, Ordering::SeqCst) {
         return json!({ "skipped": true, "reason": "already_cleaned" });
     }
@@ -135,15 +135,22 @@ pub(crate) async fn cleanup_on_shutdown(state: &AppState) -> Value {
         driver.snapshots.clear();
         (snapshot_count, sessions)
     };
-    let (pending_count, active_exec_count) = {
+    let (pending_count, active_exec_count, pending) = {
         let mut execs = state.execs.lock().await;
         let pending_count = execs.pending.len();
         let active_exec_count = execs.active.len();
-        execs.pending.clear();
+        // 不能只 `clear` —— 那会让在途命令的 oneshot 发送端随条目一起
+        // 被丢弃，调用方只看到泛化的 RecvError/超时，既不知道「是 daemon 关机」，
+        // 也无法据此决定重试。drain 后逐个补一条结构化错误再丢弃。
+        let pending: Vec<crate::protocol::PendingExec> =
+            execs.pending.drain().map(|(_, pending)| pending).collect();
         execs.active.clear();
         execs.acked.clear();
-        (pending_count, active_exec_count)
+        (pending_count, active_exec_count, pending)
     };
+    for item in pending {
+        let _ = item.tx.send(Err(daemon_shutdown_error()));
+    }
 
     let mut plugin_results = Vec::new();
     for (session_key, tab_id, sender) in sessions {
@@ -176,6 +183,7 @@ pub(crate) async fn cleanup_on_shutdown(state: &AppState) -> Value {
         let total = store.jobs.len();
         let finished_at = epoch_secs();
         let mut aborted = 0;
+        let mut abort_ids: Vec<String> = Vec::new();
         for job in store.jobs.values_mut() {
             if job.status.is_running() {
                 aborted += 1;
@@ -183,11 +191,19 @@ pub(crate) async fn cleanup_on_shutdown(state: &AppState) -> Value {
                 job.finished_at = Some(finished_at);
                 // 终态标记：任务协程可能在清理之后才醒来，`run.rs` 的回写路径用
                 // `JobRecord::is_aborted_by_shutdown`（按这个 code 判断）保住 Failed，
-                // 不会把「daemon 已清理」覆盖成 Succeeded（S1-07）。
+                // 不会把「daemon 已清理」覆盖成 Succeeded。
                 job.error = Some(json!({
                     "code": "daemon_shutdown",
                     "message": "daemon 在任务完成前退出"
                 }));
+                abort_ids.push(job.id.clone());
+            }
+        }
+        // 标记终态还不够——协程还在跑就会继续占用标签/浏览器，甚至
+        // 在清理之后把动作发出去。登记过的 abort 句柄在这里真正终止它。
+        for id in abort_ids {
+            if let Some(handle) = store.aborts.remove(&id) {
+                handle.abort();
             }
         }
         (total, aborted)
@@ -207,4 +223,20 @@ pub(crate) async fn cleanup_on_shutdown(state: &AppState) -> Value {
             "sent": plugin_results
         }
     })
+}
+
+/// 关机清理给在途命令的结构化错误。
+///
+/// 用 JSON 字符串承载 `error_code`/`retryable`/`hint`：exec 的 oneshot 只传
+/// `anyhow::Error`，CLI 侧会尝试把消息当 JSON 解析（与 `extension_disconnected`
+/// 路径同一约定），这样调用方知道「是 daemon 关机，不是命令失败」。
+fn daemon_shutdown_error() -> anyhow::Error {
+    anyhow!(json!({
+        "ok": false,
+        "error": "daemon_shutdown: daemon 在命令完成前退出，命令结果未知",
+        "error_code": "daemon_shutdown",
+        "retryable": true,
+        "hint": "daemon 已退出（空闲回收 / 升级 / 手动 stop）；先 atb status 确认已恢复，重发时带上 --idempotency-key 避免重复执行"
+    })
+    .to_string())
 }

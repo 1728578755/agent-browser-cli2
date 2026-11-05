@@ -15,8 +15,10 @@ use clap::{Args, Parser, Subcommand};
 ///
 /// JS 缺省时用内置脚本取 `{title, url, text(正文前 9000 字)}`，
 /// 9000 字的上限是为了单行结果不撑爆 Agent 上下文。
+/// `String.prototype.slice` 按 UTF-16 code unit 截断，9000 处正好落在代理对
+/// 中间时会切出半个 emoji（JSON 里变成替换字符）。用扩展运算符按 code point 切。
 const DEFAULT_SCRAPE_SCRIPT: &str =
-    "return {title:document.title,url:location.href,text:document.body.innerText.slice(0,9000)}";
+    "return {title:document.title,url:location.href,text:[...document.body.innerText].slice(0,9000).join('')}";
 
 /// 失败重试的退避序列（秒）：第 1/2/3 轮前分别等 3s/5s/7s，超出后沿用 7s。
 const RETRY_BACKOFF_SECS: [u64; 3] = [3, 5, 7];
@@ -25,12 +27,31 @@ const RETRY_BACKOFF_SECS: [u64; 3] = [3, 5, 7];
 ///
 /// 0 会让 `chunks(0)` panic；过大的值等于让 daemon 一次性开出几百个标签页（浏览器
 /// 直接卡死）。两者都是调用方写错了参数，必须在本地以退出码 2 拒绝。
-const MAX_PARALLEL: usize = 32;
+pub(crate) const MAX_PARALLEL: usize = 32;
 
 /// 读 URL 列表：`--urls` 是存在的文件就按行读（行内支持逗号分隔），
 /// 否则按逗号分隔的列表解析；统一去重保序，空项丢弃。
+///
+/// 不存在的文件路径以前会被静默当成「逗号分隔的 URL 列表」，于是一个
+/// 拼错的 `urls.txt` 只会得到「没有解析到任何 URL」或更糟——把路径字符串当成
+/// 一个 URL 去打开。现在只要输入像路径（有扩展名或路径分隔符、且不含 scheme），
+/// `!is_file()` 就直接报 `file_not_found`（exit 2）。
 fn read_url_list(raw: &str) -> Result<Vec<String>> {
-    let path = Path::new(raw.trim());
+    let trimmed = raw.trim();
+    let path = Path::new(trimmed);
+    let has_scheme = trimmed.contains("://")
+        || trimmed.to_ascii_lowercase().starts_with("data:")
+        || trimmed.to_ascii_lowercase().starts_with("blob:")
+        || trimmed.to_ascii_lowercase().starts_with("file:");
+    let looks_like_path = !has_scheme
+        && (trimmed.contains('/') || trimmed.contains('\\') || path.extension().is_some());
+    if !path.is_file() && looks_like_path {
+        return Err(usage_failure(
+            "file_not_found",
+            format!("--urls 指向的文件不存在: {trimmed}"),
+            "确认路径存在（相对路径按当前工作目录解析）；也可以直接传逗号分隔的 URL 列表，例如 --urls 'https://a.com,https://b.com'",
+        ));
+    }
     let text = if path.is_file() {
         fs::read_to_string(path)
             .with_context(|| format!("读取 URL 文件失败: {}", path.display()))?
@@ -100,9 +121,13 @@ impl OpenTabGuard {
     }
 
     /// 关闭当前记录的所有标签页，返回失败数（已清空列表，不会重复关）。
+    ///
+    /// 用 `mem::take` 把 id 列表整体取走再逐条关——这样无论主流程显式调用
+    /// 还是 panic 时 `Drop` 兜底调用，都不会对同一批 id 二次 `/close`。
     fn close_all(&mut self) -> usize {
+        let tabs = std::mem::take(&mut self.tabs);
         let mut failed = 0usize;
-        for tab in self.tabs.drain(..) {
+        for tab in tabs {
             let ok = request(
                 "POST",
                 "/close",
@@ -153,7 +178,7 @@ impl UrlResult {
     }
 
     fn to_json(&self, url: &str) -> Value {
-        json!({
+        let mut value = json!({
             "url": url,
             "tab_id": self.tab_id.clone(),
             "ok": self.ok,
@@ -161,7 +186,15 @@ impl UrlResult {
             "error": self.error.clone(),
             "elapsed_ms": self.elapsed_ms,
             "attempts": self.attempts,
-        })
+            // 结果未知在每一行里都是显式字段，而不是只靠顶层汇总。
+            "outcome_unknown": self.outcome_unknown,
+        });
+        if self.outcome_unknown {
+            // 与 daemon / http 层同一形状：error_code 让下游 `is_outcome_unknown`
+            // 与退出码映射都能命中。
+            value["error_code"] = json!("outcome_unknown");
+        }
+        value
     }
 }
 
@@ -201,11 +234,19 @@ fn exec_batch(
                     scope.spawn(move || {
                         let (value, elapsed_ms) = exec_on_tab(tab_id, script, timeout)
                             .unwrap_or_else(|err| {
+                                // `/exec` 的传输层 Err 以前标成 unexpected_error，
+                                // 绕过了 outcome_unknown 通道 → 上层按「可重试」再跑一次脚本，
+                                // 可能造成二次点击/提交。这里统一成结果未知形状。
                                 (
                                     json!({
                                         "ok": false,
-                                        "error": err.to_string(),
-                                        "error_code": "unexpected_error"
+                                        "outcome_unknown": true,
+                                        "outcome": "unknown",
+                                        "error_code": "outcome_unknown",
+                                        "error": format!(
+                                            "exec 请求失败，但脚本可能已执行（结果未知）: {err}"
+                                        ),
+                                        "hint": "不要自动重试动作类脚本；先用 tabs 复查页面状态",
                                     }),
                                     0,
                                 )
@@ -221,7 +262,13 @@ fn exec_batch(
                         (
                             String::new(),
                             String::new(),
-                            json!({ "ok": false, "error": "执行线程异常退出" }),
+                            json!({
+                                "ok": false,
+                                "outcome_unknown": true,
+                                "outcome": "unknown",
+                                "error_code": "outcome_unknown",
+                                "error": "执行线程异常退出（脚本可能已执行，结果未知）",
+                            }),
                             0,
                         )
                     })
@@ -239,31 +286,78 @@ fn exec_batch(
 // （三层嵌套元组写在签名里确实难读）。
 type OpenedTab = (String, String);
 
-/// 返回：
-/// - `opened`：打开成功、可以执行脚本的标签页；
-/// - `failed`：打开失败但**可重试**的 URL → 错误文案；
-/// - `unknown`：结果未知的 URL（请求可能已到达 daemon，重放会重复开页）→ 不重试；
-/// - `batch_unknown`：整个 `/open` 请求本身结果未知（此时无法区分哪些 URL 开了）。
-fn opened_tabs(response: &Value) -> (Vec<OpenedTab>, Vec<OpenedTab>, Vec<String>) {
+/// 把 `/open` 回包里的一个条目映射回**请求 URL**。
+///
+/// 回包里的 `url` 是**实际页面 URL**（重定向后），与 `--urls` 的请求串不同。
+/// 以前优先拿它当匹配键，`https://example.com` 被重定向到 `https://example.com/`
+/// 后就会被判成「没打开」而反复重试。现在严格按 `target`/`input`（请求串）取键；
+/// 其次按 `index` 对齐请求顺序；`url` 只作最后兜底。
+fn requested_url_for(item: &Value, actual: &str, requested: &[String]) -> Option<String> {
+    for key in ["target", "input"] {
+        if let Some(value) = item
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Some(value.to_string());
+        }
+    }
+    // 多目标回包带 index，直接对齐输入顺序（最可靠）。
+    if let Some(index) = item.get("index").and_then(Value::as_u64) {
+        if let Some(url) = requested.get(index as usize) {
+            return Some(url.clone());
+        }
+    }
+    // 单目标：请求只有一个 URL，回包条目天然对应它。
+    if requested.len() == 1 {
+        return Some(requested[0].clone());
+    }
+    if !actual.is_empty() {
+        // 重定向后的地址也可能与某个请求串前缀匹配，按容错匹配兜底。
+        if let Some(url) = requested
+            .iter()
+            .find(|url| url.as_str() == actual || url_matches(actual, url))
+        {
+            return Some(url.to_string());
+        }
+        // 实在对不上时保留实际 URL 作展示，不丢结果。
+        return Some(actual.to_string());
+    }
+    None
+}
+
+/// 解析一批 `/open` 回包。返回（只列真实存在的 3 个返回值；整批未知由
+/// 调用处用 `is_outcome_unknown(response)` 判定，不属于本函数）：
+/// - `opened`：打开成功、可以执行脚本的标签页（键是**请求 URL**）；
+/// - `failed`：打开失败但**可重试**的请求 URL → 错误文案；
+/// - `unknown`：结果未知的请求 URL（请求可能已到达 daemon，重放会重复开页）→ 不重试。
+fn opened_tabs(
+    response: &Value,
+    requested: &[String],
+) -> (Vec<OpenedTab>, Vec<OpenedTab>, Vec<String>) {
     let mut opened: Vec<(String, String)> = Vec::new();
     let mut failed: Vec<(String, String)> = Vec::new();
     let mut unknown: Vec<String> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // daemon 的 `/open` 回包字段是 `targets[]`，条目里 URL 键叫 `url`；旧版本
-    // 用的是 `tabs[]` + `target`。两种都读，否则一次「字段改名」就会让 scrape
-    // 认为「open 未返回该目标」并重试 4 次、把页面留在浏览器里（实测泄漏 4 个标签）。
+    // `tabs[]` 是 daemon 逐目标的结果，带 `target`（请求串）与 `index`；`targets[]`
+    // 只有实际 `url`（重定向后），只能兜底。两条都读，但优先能对齐请求串的那份。
     let items = response
-        .get("targets")
+        .get("tabs")
         .and_then(Value::as_array)
-        .or_else(|| response.get("tabs").and_then(Value::as_array))
+        .or_else(|| response.get("targets").and_then(Value::as_array))
         .or_else(|| response.get("results").and_then(Value::as_array));
     for tab in items.into_iter().flatten() {
-        let url = ["url", "target", "input"]
-            .iter()
-            .find_map(|key| tab.get(*key).and_then(Value::as_str))
+        let actual = tab
+            .get("url")
+            .and_then(Value::as_str)
             .unwrap_or_default()
+            .trim()
             .to_string();
-        if url.is_empty() || !seen.insert(url.clone()) {
+        let Some(url) = requested_url_for(tab, &actual, requested) else {
+            continue;
+        };
+        if !seen.insert(url.clone()) {
             continue;
         }
         let ok = tab.get("ok").and_then(Value::as_bool).unwrap_or(false);
@@ -285,6 +379,54 @@ fn opened_tabs(response: &Value) -> (Vec<OpenedTab>, Vec<OpenedTab>, Vec<String>
         }
     }
     (opened, failed, unknown)
+}
+
+/// 打开 scrape 输出文件，按 `ATB_IO_OVERWRITE` 策略处理已存在文件。
+///
+/// 旧实现 `File::create` 无条件截断：`--urls` 写错一次就把上次的抓取结果清空，
+/// 且没有任何确认/备份。现在：
+/// - `backup`（默认）：旧文件先改名 `<name>.<ts>.bak`，再新建；
+/// - `force`：直接截断覆盖（旧行为，脚本化场景）；
+/// - `ask`：存在即报 `output_exists`（exit 2），要用户显式处理；
+/// - `append`：追加写。
+fn open_scrape_output(path: &Path) -> Result<fs::File> {
+    let mode = crate::settings::io_overwrite();
+    let exists = path.exists();
+    if exists && mode == "ask" {
+        return Err(usage_failure(
+            "output_exists",
+            format!("输出文件已存在: {}", path.display()),
+            "换一个 --out 路径，或设 ATB_IO_OVERWRITE=backup / force 后重试",
+        ));
+    }
+    if exists && mode == "backup" {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis())
+            .unwrap_or(0);
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("out.jsonl");
+        let backup = path.with_file_name(format!("{name}.{stamp}.bak"));
+        fs::rename(path, &backup).with_context(|| {
+            format!(
+                "备份旧输出文件失败: {} -> {}",
+                path.display(),
+                backup.display()
+            )
+        })?;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.create(true).write(true);
+    if mode == "append" {
+        options.append(true);
+    } else {
+        options.truncate(true);
+    }
+    options
+        .open(path)
+        .with_context(|| format!("创建输出文件失败: {}", path.display()))
 }
 
 pub(crate) fn cmd_scrape(args: ScrapeArgs, is_async: bool) -> Result<()> {
@@ -338,8 +480,7 @@ pub(crate) fn cmd_scrape(args: ScrapeArgs, is_async: bool) -> Result<()> {
     }
     // scrape 是页面操作类命令：daemon 不在就自动拉起（与 open/exec 一致）。
     ensure_server()?;
-    let mut writer =
-        fs::File::create(&out_path).with_context(|| format!("创建输出文件失败: {}", out_path))?;
+    let mut writer = open_scrape_output(Path::new(&out_path))?;
 
     let total = urls.len();
     let mut pending: Vec<String> = urls.clone();
@@ -376,17 +517,28 @@ pub(crate) fn cmd_scrape(args: ScrapeArgs, is_async: bool) -> Result<()> {
             if let Some(group) = &args.group_title {
                 payload["group_title"] = json!(group);
             }
-            let response = request("POST", "/open", Some(payload), args.timeout + 20.0)
-                .unwrap_or_else(|err| {
-                    json!({
-                        "ok": false,
-                        "error": err.to_string(),
-                        "error_code": "unexpected_error",
-                        "tabs": []
-                    })
-                });
+            let response = request(
+                "POST",
+                "/open",
+                Some(payload),
+                http_budget(args.timeout + 10.0),
+            )
+            .unwrap_or_else(|err| {
+                // 传输层 Err 以前标成 unexpected_error（可重试），会让整批
+                // URL 进下一轮——首次可能已经打开了标签页，重试就是重复开页 + 泄漏。
+                // 统一成 outcome_unknown，交给 `batch_unknown` 分支逐条记录、不重试。
+                json!({
+                    "ok": false,
+                    "outcome_unknown": true,
+                    "outcome": "unknown",
+                    "error_code": "outcome_unknown",
+                    "error": format!("open 请求失败，但标签页可能已打开（结果未知）: {err}"),
+                    "hint": "不要自动重试；先用 atb tabs 复查是否已打开",
+                    "tabs": []
+                })
+            });
             let batch_unknown = is_outcome_unknown(&response);
-            let (opened, failed, unknown) = opened_tabs(&response);
+            let (opened, failed, unknown) = opened_tabs(&response, batch);
             // 整个 /open 结果未知：不知道哪些页已经打开，一律不重试，逐条记一条未知记录。
             if batch_unknown {
                 for url in batch {
@@ -493,6 +645,7 @@ pub(crate) fn cmd_scrape(args: ScrapeArgs, is_async: bool) -> Result<()> {
                     writeln!(writer, "{}", entry.to_json(&url))
                         .with_context(|| format!("写出结果失败: {}", out_path))?;
                     writer.flush().ok();
+                    written.insert(url.clone());
                 }
                 let unknown_now = unknown && !ok;
                 // 成功的 URL 已经是最终结果（不会再重试）：立刻落盘，进程被中断时
@@ -514,6 +667,9 @@ pub(crate) fn cmd_scrape(args: ScrapeArgs, is_async: bool) -> Result<()> {
         }
         pending = next_round;
     }
+    // 主流程显式清理（正常路径每批已关，这里兜底收尾）。`close_all` 用
+    // `mem::take` 取走 id 列表，Drop 里的 panic 兜底不会二次关闭同一批标签页。
+    close_failed += guard.close_all();
     // 默认模式：每个 URL 只写一条最终记录（失败也只一条）。
     let mut success = 0usize;
     let mut failed = 0usize;
@@ -543,19 +699,41 @@ pub(crate) fn cmd_scrape(args: ScrapeArgs, is_async: bool) -> Result<()> {
         }
     } else {
         for url in &urls {
-            match results.get(url) {
-                Some(entry) if entry.ok => success += 1,
-                Some(entry) => {
+            let entry = results.get(url).cloned();
+            match entry.as_ref() {
+                Some(item) if item.ok => success += 1,
+                Some(item) => {
                     failed += 1;
-                    if entry.outcome_unknown {
+                    if item.outcome_unknown {
                         unknown_count += 1;
                     }
                 }
                 None => failed += 1,
             }
+            // `--record-attempts` 以前只写执行过 /exec 的 URL，打开阶段就
+            // 失败的 URL 一行都没有，调用方甚至不知道它被尝试过。收尾时对没有
+            // 任何输出行的 URL 补一条最终记录。
+            if written.contains(url) {
+                continue;
+            }
+            let row = entry.unwrap_or_else(|| {
+                let mut missing = UrlResult::new();
+                missing.error = json!("未执行（参数或调度异常）");
+                missing
+            });
+            writeln!(writer, "{}", row.to_json(url))
+                .with_context(|| format!("写出结果失败: {}", out_path))?;
+            writer.flush().ok();
+            written.insert(url.clone());
         }
     }
-    let ok = failed == 0 && close_failed == 0;
+    // 标签关闭失败不该让整批抓取报失败——`ok` 只看抓取结果，
+    // `close_failed` 单独作为警告字段（warnings + hint），调用方自行决定是否清理。
+    let ok = failed == 0;
+    let mut warnings: Vec<String> = Vec::new();
+    if close_failed > 0 {
+        warnings.push(format!("close_failed:{close_failed}"));
+    }
     let mut summary = json!({
         "ok": ok,
         "total": total,
@@ -563,14 +741,19 @@ pub(crate) fn cmd_scrape(args: ScrapeArgs, is_async: bool) -> Result<()> {
         "failed": failed,
         "retried": retried,
         "close_failed": close_failed,
+        "warnings": warnings,
         "outcome_unknown": unknown_count,
         "out": out_path,
-        "hint": if ok { Value::Null } else if unknown_count > 0 {
-            json!("有 URL 的结果未知（请求可能已执行），已停止对它们的重试；先 atb tabs 复查或人工核对输出，再决定是否重跑")
+        "hint": if failed > 0 {
+            if unknown_count > 0 {
+                json!("有 URL 的结果未知（请求可能已执行），已停止对它们的重试；先 atb tabs 复查或人工核对输出，再决定是否重跑")
+            } else {
+                json!("失败的 URL 没有可用数据行（打开失败的没有行，执行失败的行 ok:false）；失败原因见 atb logs，可单独重跑这批 URL")
+            }
         } else if close_failed > 0 {
-            json!("有标签页关闭失败，可能残留后台页；用 atb tabs 查看后用 close 清理")
+            json!("抓取结果全部成功，但有标签页关闭失败，可能残留后台页；用 atb tabs 查看后用 close 清理")
         } else {
-            json!("失败的 URL 没有可用数据行（打开失败的没有行，执行失败的行 ok:false）；失败原因见 atb logs，可单独重跑这批 URL")
+            Value::Null
         },
     });
     if unknown_count > 0 {

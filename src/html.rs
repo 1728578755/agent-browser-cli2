@@ -49,7 +49,7 @@ pub fn js_page_stealth() -> &'static str {
 /// 输入 HTML 的字节上限。
 ///
 /// 超过这个量级就不再交给 html5ever：8MB+ 的文档既可能是几百万层嵌套，也可能是
-/// 生成式页面吐出来的巨型内联脚本，解析出来的 DOM 本身就能把内存和栈吃满（R1-01）。
+/// 生成式页面吐出来的巨型内联脚本，解析出来的 DOM 本身就能把内存和栈吃满。
 /// 降级成纯文本仍然可用，且成本只是 O(n) 的字节扫描，不会有栈深度问题。
 const MAX_HTML_INPUT_BYTES: usize = 8 * 1024 * 1024;
 
@@ -73,7 +73,7 @@ pub fn optimize_html_for_tokens(html: &str) -> String {
         // 超限**不继续优化**：直接给纯文本降级结果，并显式标注原因。
         //
         // 丢弃前必须先迭代拆链：`RcDom` 的节点是 `Rc<Node>`，直接让它离开作用域会沿
-        // children 递归析构，深链/宽树都可能把栈打爆（R1-01 的同一类问题）。
+        // children 递归析构，深链/宽树都可能把栈打爆（的同一类问题）。
         discard_subtree(&dom.document);
         return format!("[html nodes > 200k] {}", strip_tags(html));
     }
@@ -106,19 +106,122 @@ fn count_nodes(root: &Handle) -> usize {
 
 /// 超限输入的降级：只保留标签外的文本。
 ///
-/// 不解析 DOM、不递归，栈深度恒定为 1；也不做实体解码（降级路径只要求「可读」）。
+/// 不解析 DOM、不递归，栈深度恒定为 1。
+///
+/// 旧实现只做「< 到 > 之间一律丢弃」，于是 `<script>` / `<style>` /
+/// `<textarea>` 的**内容**被原样当成正文，注释内容也会混进来；同时不解码实体。
+/// 现在用同一条 O(n) 扫描跳过这些元素的整段内容与注释，并解码常见实体。
+/// 仍然不建 DOM：降级路径的定位是「超限时还能读」，不是「精确还原」。
 fn strip_tags(html: &str) -> String {
+    let chars: Vec<char> = html.chars().collect();
+    let len = chars.len();
     let mut out = String::with_capacity(html.len() / 8);
-    let mut in_tag = false;
-    for ch in html.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' if in_tag => in_tag = false,
-            _ if !in_tag => out.push(ch),
-            _ => {}
+    let mut i = 0usize;
+    while i < len {
+        // 注释整段丢弃（包括 `<!-- -->` 里的文字）。
+        if starts_with_ignore_case(&chars, i, "<!--") {
+            i += 4;
+            while i < len && !starts_with_ignore_case(&chars, i, "-->") {
+                i += 1;
+            }
+            i = (i + 3).min(len);
+            continue;
+        }
+        if chars[i] != '<' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        // 读标签名（跳过 `<`、空白与可选的 `/`）。
+        let mut j = i + 1;
+        while j < len && chars[j].is_whitespace() {
+            j += 1;
+        }
+        let closing = chars.get(j) == Some(&'/');
+        if closing {
+            j += 1;
+            while j < len && chars[j].is_whitespace() {
+                j += 1;
+            }
+        }
+        let name_start = j;
+        while j < len && (chars[j].is_ascii_alphanumeric() || matches!(chars[j], '-' | ':')) {
+            j += 1;
+        }
+        let name: String = chars[name_start..j]
+            .iter()
+            .collect::<String>()
+            .to_ascii_lowercase();
+        // 找到本标签的 `>`（属性值里的 `>` 不算）。
+        let mut k = j;
+        let mut quote: Option<char> = None;
+        while k < len {
+            let ch = chars[k];
+            match quote {
+                Some(q) => {
+                    if ch == q {
+                        quote = None;
+                    }
+                }
+                None => {
+                    if ch == '"' || ch == '\'' {
+                        quote = Some(ch);
+                    } else if ch == '>' {
+                        break;
+                    }
+                }
+            }
+            k += 1;
+        }
+        let after_tag = (k + 1).min(len);
+        // script / style / textarea：连内容一起跳过，直到对应的闭合标签。
+        if !closing && matches!(name.as_str(), "script" | "style" | "textarea") {
+            let close = format!("</{name}");
+            i = after_tag;
+            while i < len && !starts_with_ignore_case(&chars, i, &close) {
+                i += 1;
+            }
+            if i < len {
+                while i < len && chars[i] != '>' {
+                    i += 1;
+                }
+                i = (i + 1).min(len);
+            }
+            continue;
+        }
+        // 普通标签：丢弃标签本身，补一个空格避免相邻词粘连。
+        if !out.ends_with(char::is_whitespace) {
+            out.push(' ');
+        }
+        i = after_tag;
+    }
+    decode_entities(out.trim())
+}
+
+/// 大小写不敏感的前缀匹配（输入已转成 `Vec<char>`，按字符比较避免字节边界问题）。
+fn starts_with_ignore_case(chars: &[char], at: usize, needle: &str) -> bool {
+    for (idx, expected) in (at..).zip(needle.chars()) {
+        let Some(actual) = chars.get(idx) else {
+            return false;
+        };
+        if !actual.eq_ignore_ascii_case(&expected) {
+            return false;
         }
     }
-    out.trim().to_string()
+    true
+}
+
+/// 解码降级路径里最常见的 HTML 实体。
+///
+/// `&amp;` 必须最后处理，否则 `&amp;lt;` 会被解成 `<`（二次解码）。
+fn decode_entities(text: &str) -> String {
+    text.replace("&nbsp;", " ")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
 }
 
 /// DOM 递归下钻的深度上限。
@@ -129,16 +232,45 @@ fn strip_tags(html: &str) -> String {
 /// - 命中阈值时只丢弃该节点的子树，不改变其余输出，正常页面的产物与之前逐字节一致。
 const MAX_DOM_DEPTH: usize = 512;
 
-fn clean_node(handle: &Handle) {
-    clean_node_at(handle, 0);
+/// 是否保留 `<script>` / `<style>` 的内容。
+///
+/// 默认 `false`：这两个元素的子树对「页面内容理解」没有价值，却经常占掉
+/// 优化后 HTML 的大半 token。需要调试页面脚本时用 `ATB_HTML_KEEP_SCRIPTS=on` 打开。
+fn keep_scripts() -> bool {
+    crate::settings::env_bool("ATB_HTML_KEEP_SCRIPTS", false)
 }
 
-fn clean_node_at(handle: &Handle, depth: usize) {
+/// 这个节点是否应该整棵丢弃。
+///
+/// - 注释：纯噪音；
+/// - `noscript` / `template`：要么是给无 JS 环境的重复文案，要么是未实例化的模板；
+/// - `script` / `style`：默认丢，`ATB_HTML_KEEP_SCRIPTS=on` 时保留。
+fn should_drop_subtree(handle: &Handle, keep_scripts: bool) -> bool {
+    match &handle.data {
+        NodeData::Comment { .. } => true,
+        NodeData::Element { name, .. } => {
+            let tag = name.local.as_ref();
+            tag.eq_ignore_ascii_case("noscript")
+                || tag.eq_ignore_ascii_case("template")
+                || (!keep_scripts
+                    && (tag.eq_ignore_ascii_case("script") || tag.eq_ignore_ascii_case("style")))
+        }
+        _ => false,
+    }
+}
+
+fn clean_node(handle: &Handle) {
+    // 环境变量每次清理只读一次：按节点读会在几十万节点的页面上变成 O(n) 次 env 查找。
+    let keep = keep_scripts();
+    clean_node_at(handle, 0, keep);
+}
+
+fn clean_node_at(handle: &Handle, depth: usize, keep: bool) {
     if depth >= MAX_DOM_DEPTH {
         // 极端嵌套（恶意/生成式 DOM）：停止下钻，保留该层节点本身但丢弃子树，避免进程 panic。
         //
         // 不能直接 `children.borrow_mut().clear()`：清空会把整棵子树交给 `Rc` 递归析构，
-        // 10k+ 层的深链照样把栈打爆（R1-01）。改成分批摘链 + 迭代 drop，每层 Drop 时
+        // 10k+ 层的深链照样把栈打爆。改成分批摘链 + 迭代 drop，每层 Drop 时
         // 它的 children 已经是空的，析构深度恒为 O(1)。
         discard_subtree(handle);
         return;
@@ -157,7 +289,7 @@ fn clean_node_at(handle: &Handle, depth: usize) {
             });
             for attr in attrs.iter_mut() {
                 // 阈值与截断必须同一口径（都按字符）：`len()` 是字节数，中文属性值
-                // 会被提前截断成半截观感（R1-02）。
+                // 会被提前截断成半截观感。
                 if attr.value.chars().count() > 100 {
                     let short: String = attr.value.chars().take(50).collect();
                     attr.value.clear();
@@ -218,7 +350,7 @@ fn clean_node_at(handle: &Handle, depth: usize) {
             let key = attr.name.local.as_ref();
             let value = attr.value.to_string();
             // 全部按字符计数：UTF-8 下 `len()` 是字节数，和 `chars().take()` 混用会让
-            // 中文 URL / 属性值在没超阈值时就被替换成占位符（R1-02）。
+            // 中文 URL / 属性值在没超阈值时就被替换成占位符。
             let value_chars = value.chars().count();
             if key == "src" {
                 if value.starts_with("data:") {
@@ -244,16 +376,29 @@ fn clean_node_at(handle: &Handle, depth: usize) {
             }
         }
     }
+    // 先迭代摘链再丢弃，避免深子树在 Drop 时递归爆栈（与 同一口径）。
     let children = handle.children.borrow().clone();
+    let mut drop_any = false;
     for child in children {
-        clean_node_at(&child, depth + 1);
+        if should_drop_subtree(&child, keep) {
+            discard_subtree(&child);
+            drop_any = true;
+            continue;
+        }
+        clean_node_at(&child, depth + 1, keep);
+    }
+    if drop_any {
+        handle
+            .children
+            .borrow_mut()
+            .retain(|child| !should_drop_subtree(child, keep));
     }
 }
 
 /// 迭代拆链：把 `handle` 的整棵子树拆散后丢弃。
 ///
 /// 关键点是**先把自己的 children 摘空，再让节点被 drop**：这样 `Rc<Node>` 归零时
-/// `Node::drop` 只会析构一个空的 `Vec<Handle>`，不会再沿深链递归（R1-01）。
+/// `Node::drop` 只会析构一个空的 `Vec<Handle>`，不会再沿深链递归。
 fn discard_subtree(handle: &Handle) {
     let mut pending: Vec<Handle> = handle.children.borrow_mut().drain(..).collect();
     while let Some(node) = pending.pop() {
@@ -314,7 +459,7 @@ mod tests {
 
     #[test]
     fn oversized_input_degrades_without_parsing() {
-        // 超过 8MB 的输入必须走降级路径：不解析、不 panic，且返回体量很小（R1-01）。
+        // 超过 8MB 的输入必须走降级路径：不解析、不 panic，且返回体量很小。
         let html = "<div>".repeat(MAX_HTML_INPUT_BYTES / 5 + 1);
         assert!(html.len() > MAX_HTML_INPUT_BYTES);
         let out = optimize_html_for_tokens(&html);
@@ -360,6 +505,38 @@ mod tests {
         let out = optimize_html_for_tokens(&html);
         assert!(out.contains("deep"));
         assert!(out.matches("<div>").count() <= MAX_DOM_DEPTH + 2);
+    }
+
+    #[test]
+    fn degraded_text_skips_script_style_and_comments() {
+        // 降级路径不能把脚本 / 样式 / 注释内容当成正文。
+        let html = "<p>hello</p><!-- secret --><script>alert('x')</script><style>.a{color:red}</style><p>world</p>";
+        let out = strip_tags(html);
+        assert!(out.contains("hello"), "{out}");
+        assert!(out.contains("world"), "{out}");
+        assert!(!out.contains("alert"), "{out}");
+        assert!(!out.contains("color:red"), "{out}");
+        assert!(!out.contains("secret"), "{out}");
+    }
+
+    #[test]
+    fn degraded_text_decodes_common_entities() {
+        // 至少解码 &amp; &lt; &gt; &quot; &#39; &nbsp;。
+        let out = strip_tags("<p>a&amp;b&nbsp;&lt;c&gt;&quot;d&#39;e</p>");
+        assert_eq!(out, "a&b <c>\"d'e");
+    }
+
+    #[test]
+    fn optimize_drops_script_and_style_subtrees() {
+        // 正常解析路径也要丢弃 script/style/注释，而不是只清属性。
+        let html =
+            "<div>keep<script>var x = 1;</script><style>.a{}</style><!--c--><p>body</p></div>";
+        let out = optimize_html_for_tokens(html);
+        assert!(out.contains("keep"), "{out}");
+        assert!(out.contains("body"), "{out}");
+        assert!(!out.contains("var x"), "{out}");
+        assert!(!out.contains(".a{}"), "{out}");
+        assert!(!out.contains("<!--"), "{out}");
     }
 
     #[test]

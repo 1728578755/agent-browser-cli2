@@ -13,7 +13,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const CLI = process.env.ABC_CLI || path.join(ROOT, "target", "release", "atb.exe");
+const CLI = process.env.ABC_CLI || path.join(ROOT, "target", "release", process.platform === "win32" ? "atb.exe" : "atb");
 const KEEP = process.argv.includes("--keep");
 const argOf = (name) => {
   const at = process.argv.indexOf(name);

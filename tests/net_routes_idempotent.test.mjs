@@ -281,18 +281,25 @@ for (const [action, label] of [
   check(`net ${label} 分支下发的是规则数组`, bad.length === 0, bad.map((c) => (c.args || []).join(' | ')).join(' ; '));
 }
 
-// 3) 死代码 / 旧字段不该被捡回来（「腰带」）。
+// 3) 死代码 / 旧字段不该被捡回来（的「腰带」）。
 // 真正的行为断言在 mock_extension 的 6c2（走真 daemon 看 change 形状）；
 // 这里只做低成本的静态兜底，防止整页 HTML 对比那套实现复活。
+//
+// 必须先去注释再断言。解释「为什么不要 top_change」的注释、以及
+// monitor.rs 里描述旧实现的注释都含这个词，不去注释会把说明文字判成回归。
+const stripComments = (text) =>
+  text
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/(^|[^:"'\\])\/\/[^\n]*/g, '$1');
 const html = readFileSync(join(HERE, '..', 'src', 'html.rs'), 'utf8');
 check(
   'src/html.rs 不再有 fn changed_elements',
-  !/\bfn\s+changed_elements\b/.test(html),
+  !/\bfn\s+changed_elements\b/.test(stripComments(html)),
   '旧的「动作前后整页 HTML 对比」实现被恢复了？',
 );
 check(
   'src/server 不再产出 top_change 字段',
-  !/"top_change"/.test(source),
+  !/["']top_change["']\s*:/.test(stripComments(source)),
   'top_change 回传原始 HTML 片段，是回归点',
 );
 

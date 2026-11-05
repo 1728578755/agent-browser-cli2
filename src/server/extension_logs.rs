@@ -4,8 +4,26 @@ use super::*;
 ///
 /// 只有「调用方没有自己的超时语义」的简单控制命令（cookies / frames /
 /// network 启停）才用它兜底；pageOp 等长命令一律传调用方的 timeout，
-/// 否则 `snapshot --timeout 300` 落到 CSP 回退通道上会被硬编码的 30s 截断。
+/// 否则 `snapshot --timeout 300` 落到 CSP 回退通道上会被硬编码的 30s 截断（C-13）。
 pub(crate) const DEFAULT_EXTENSION_CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// payload 形状摘要：用于「扩展回了非对象」时的报错。
+///
+/// 只带类型与一两个规模数字，不带内容——这里往往就是异常值本身，原样回显
+/// 会把一个几 MB 的字符串塞进错误消息。
+fn payload_shape(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Bool(_) => "bool".to_string(),
+        Value::Number(_) => "number".to_string(),
+        Value::String(text) => format!("string(len={})", text.chars().count()),
+        Value::Array(items) => format!("array(len={})", items.len()),
+        Value::Object(map) => {
+            let keys: Vec<&str> = map.keys().take(6).map(String::as_str).collect();
+            format!("object(keys={})", keys.join(","))
+        }
+    }
+}
 
 pub(crate) async fn extension_control(
     state: &AppState,
@@ -32,7 +50,27 @@ pub(crate) async fn extension_control(
     .await
     .map_err(|err| anyhow!(humanize_extension_error(&err.to_string())))?;
     let value = response.data.or(response.result).unwrap_or(Value::Null);
-    if value.get("ok").and_then(Value::as_bool) == Some(false) {
+    // `cookies` 等命令的合法回包就是数组：数组没有 ok/error 字段，
+    // 不能按「非对象 = 异常」处理，否则会把正常结果判成 invalid payload。
+    if value.is_array() {
+        return Ok(value);
+    }
+    // 非对象 payload 一律判错：旧实现只在 `ok===false` 时报错，
+    // 扩展返回 null / 数组 / 纯字符串时被当成成功，调用方拿着 `Value::Null`
+    // 继续往下走，最终表现成「命令成功但没有结果」。
+    if !value.is_object() {
+        return Err(anyhow!(
+            "invalid extension payload: {command} 返回了 {}，期望对象 {{ok, ...}}",
+            payload_shape(&value)
+        ));
+    }
+    // 判错条件同时看 `error` 字段：有些扩展命令用 `{ok:true, error:"..."}`
+    // 表示「命令跑了但内部失败」，只认 `ok===false` 会把这类失败吞掉。
+    let has_error = value
+        .get("error")
+        .map(|error| !error.is_null())
+        .unwrap_or(false);
+    if value.get("ok").and_then(Value::as_bool) == Some(false) || has_error {
         let raw = value
             .get("error")
             .and_then(Value::as_str)
@@ -66,11 +104,36 @@ pub(crate) fn humanize_extension_error(raw: &str) -> String {
     text
 }
 
+/// `network_list` / `console_list` 的 limit 钳制。
+///
+/// 扩展侧对 `limit` 只有 `Math.max(1, ...)` 一级保护，daemon 以前原样透传，
+/// 于是 `--limit 1000000` 会让扩展把整份缓冲序列化回来。这里统一夹到 `[1, 500]`，
+/// 并把实际值回报（仿 `clamped_note`），避免「我设的值没生效」。
+fn clamp_debug_list_limit(requested: usize) -> (usize, Option<Value>) {
+    let applied = requested.clamp(1, 500);
+    let note = (applied != requested).then(|| {
+        json!({
+            "field": "limit",
+            "requested": requested,
+            "applied": applied,
+            "min": 1,
+            "max": 500,
+        })
+    });
+    (applied, note)
+}
+
+/// 捕获缓冲的条目上限：让扩展侧有一个确定的内存上界。
+fn capture_max_entries(env: &str) -> usize {
+    crate::settings::env_usize_clamped(env, 5000, 100, 100_000)
+}
+
 pub(crate) async fn network_start(
     State(state): State<AppState>,
     Json(req): Json<TabRequest>,
 ) -> Json<Value> {
     touch(&state).await;
+    let max_entries = capture_max_entries("ATB_NET_MAX_ENTRIES");
     let result = async {
         let tab_id = select_tab(
             &state,
@@ -81,15 +144,17 @@ pub(crate) async fn network_start(
             &state,
             &tab_id,
             "networkStart",
-            json!({}),
+            // max_entries：扩展侧按此上限裁剪缓冲；idempotent：已在运行时只更新配置，
+            // 不重置已捕获的条目（重复 start 以前会把缓冲清空）。
+            json!({ "max_entries": max_entries, "idempotent": true }),
             DEFAULT_EXTENSION_CONTROL_TIMEOUT,
         )
         .await
     }
     .await;
     Json(match result {
-        Ok(value) => json!({ "ok": true, "result": value }),
-        Err(err) => json!({ "ok": false, "error": err.to_string() }),
+        Ok(value) => json!({ "ok": true, "result": value, "max_entries": max_entries }),
+        Err(err) => json!({ "ok": false, "error": err.to_string(), "max_entries": max_entries }),
     })
 }
 
@@ -98,6 +163,7 @@ pub(crate) async fn network_list(
     Json(req): Json<NetworkListRequest>,
 ) -> Json<Value> {
     touch(&state).await;
+    let (limit, clamped) = clamp_debug_list_limit(req.limit);
     let result = async {
         let tab_id = select_tab(
             &state,
@@ -108,15 +174,27 @@ pub(crate) async fn network_list(
             &state,
             &tab_id,
             "networkList",
-            json!({ "filter": req.filter, "limit": req.limit }),
+            json!({ "filter": req.filter, "limit": limit }),
             DEFAULT_EXTENSION_CONTROL_TIMEOUT,
         )
         .await
     }
     .await;
     Json(match result {
-        Ok(value) => json!({ "ok": true, "result": value }),
-        Err(err) => json!({ "ok": false, "error": err.to_string() }),
+        Ok(value) => {
+            let mut out = json!({ "ok": true, "result": value, "limit": limit });
+            if let Some(note) = clamped {
+                out["clamped"] = note;
+            }
+            out
+        }
+        Err(err) => {
+            let mut out = json!({ "ok": false, "error": err.to_string(), "limit": limit });
+            if let Some(note) = clamped {
+                out["clamped"] = note;
+            }
+            out
+        }
     })
 }
 
@@ -206,6 +284,7 @@ pub(crate) async fn console_start(
     Json(req): Json<TabRequest>,
 ) -> Json<Value> {
     touch(&state).await;
+    let max_entries = capture_max_entries("ATB_CONSOLE_MAX_ENTRIES");
     let result = async {
         let tab_id = select_tab(
             &state,
@@ -216,15 +295,16 @@ pub(crate) async fn console_start(
             &state,
             &tab_id,
             "consoleStart",
-            json!({}),
+            // 同 network_start：给缓冲一个上界，并让重复 start 只更新配置。
+            json!({ "max_entries": max_entries, "idempotent": true }),
             DEFAULT_EXTENSION_CONTROL_TIMEOUT,
         )
         .await
     }
     .await;
     Json(match result {
-        Ok(value) => json!({ "ok": true, "result": value }),
-        Err(err) => json!({ "ok": false, "error": err.to_string() }),
+        Ok(value) => json!({ "ok": true, "result": value, "max_entries": max_entries }),
+        Err(err) => json!({ "ok": false, "error": err.to_string(), "max_entries": max_entries }),
     })
 }
 
@@ -233,6 +313,7 @@ pub(crate) async fn console_list(
     Json(req): Json<ConsoleListRequest>,
 ) -> Json<Value> {
     touch(&state).await;
+    let (limit, clamped) = clamp_debug_list_limit(req.limit);
     let result = async {
         let tab_id = select_tab(
             &state,
@@ -243,15 +324,27 @@ pub(crate) async fn console_list(
             &state,
             &tab_id,
             "consoleList",
-            json!({ "level": req.level, "limit": req.limit }),
+            json!({ "level": req.level, "limit": limit }),
             DEFAULT_EXTENSION_CONTROL_TIMEOUT,
         )
         .await
     }
     .await;
     Json(match result {
-        Ok(value) => json!({ "ok": true, "result": value }),
-        Err(err) => json!({ "ok": false, "error": err.to_string() }),
+        Ok(value) => {
+            let mut out = json!({ "ok": true, "result": value, "limit": limit });
+            if let Some(note) = clamped {
+                out["clamped"] = note;
+            }
+            out
+        }
+        Err(err) => {
+            let mut out = json!({ "ok": false, "error": err.to_string(), "limit": limit });
+            if let Some(note) = clamped {
+                out["clamped"] = note;
+            }
+            out
+        }
     })
 }
 

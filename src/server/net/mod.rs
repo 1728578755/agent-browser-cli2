@@ -12,7 +12,18 @@
 
 use super::*;
 
+/// `net` 请求体。
+///
+/// **入站线协议是 snake_case**（`parse_json` / `debug_pass` / `max_chars` …）：
+/// daemon 的 HTTP 请求体由本 crate 的 CLI 构造，字段名与这里一致。下发给页面脚本
+/// / 扩展时才转成 camelCase（`parseJson` / `debugPass` / `maxChars`），两套命名
+/// 不要混用。
+///
+/// `deny_unknown_fields`：字段名写错（例如把 `parse_json` 写成 `parseJson`
+/// 之外的第三种拼法）以前会被静默忽略，命令看起来成功但参数没生效。这里只对
+/// **内部请求 DTO** 收紧；易混字段另外挂了 camelCase alias，所以两种写法都收。
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct NetRequest {
     /// fetch | hook | log | route | unroute | routes | reset
     pub(crate) action: Option<String>,
@@ -21,18 +32,23 @@ pub(crate) struct NetRequest {
     pub(crate) headers: Option<Value>,
     pub(crate) body: Option<Value>,
     /// 响应体上限（字符）与返回形式 text | base64
+    #[serde(default, alias = "maxChars")]
     pub(crate) max_chars: Option<usize>,
+    #[serde(default, alias = "responseType")]
     pub(crate) response_type: Option<String>,
     /// fetch 的凭据模式：include（默认）/ omit / same-origin。
-    /// 页面脚本早就读 `opts.credentials`，但 CLI 侧一直没有下发通道。
+    /// 页面脚本早就读 `opts.credentials`，但 CLI 侧一直没有下发通道（X-15）。
     #[serde(default)]
     pub(crate) credentials: Option<String>,
     /// fetch 是否把 JSON 响应体解析成对象（页面默认 true）。
-    /// 线协议键名是 camelCase `parseJson`。
+    /// 入站字段是 snake_case `parse_json`（兼容 camelCase `parseJson`）；
+    /// 下发给页面脚本时才叫 `parseJson` —— 页面读的是那个名字。
     #[serde(default, alias = "parseJson")]
     pub(crate) parse_json: Option<bool>,
     /// hook 选项
+    #[serde(default, alias = "captureBodies")]
     pub(crate) capture_bodies: Option<bool>,
+    #[serde(default, alias = "maxLog")]
     pub(crate) max_log: Option<usize>,
     /// log / unroute 的过滤条件
     #[serde(rename = "match")]
@@ -45,8 +61,9 @@ pub(crate) struct NetRequest {
     /// 对 `log` 动作还接受 `both`（合并页面侧与扩展侧，缺省行为）。
     pub(crate) engine: Option<String>,
     /// log：是否记录被规则放行（pass）的请求，供排查「为什么没命中 mock」。
-    /// 线协议字段是 camelCase `debugPass`，扩展侧读的就是这个名字。
-    #[serde(default)]
+    /// 入站字段是 snake_case `debug_pass`（兼容 camelCase `debugPass`）；
+    /// 下发给扩展时才叫 `debugPass` —— 扩展侧读的就是那个名字。
+    #[serde(default, alias = "debugPass")]
     pub(crate) debug_pass: Option<bool>,
     /// hook 是否持久化（导航后自动重装）
     #[serde(default)]
@@ -96,7 +113,7 @@ pub(crate) async fn net_value(state: &AppState, req: NetRequest) -> Result<Value
             return Err(anyhow!("net: 未知 engine {engine}（可选 page / cdp）"));
         }
         // cdp 引擎只实现 route / mock / unroute；其它 action 实际走页面注入。
-        // 以前放行后仍回报 engine:"cdp"，语义与结果都对不上。
+        // 以前放行后仍回报 engine:"cdp"，语义与结果都对不上（B-07）。
         if engine == "cdp" && !matches!(action.as_str(), "route" | "mock" | "unroute") {
             return Err(anyhow!(
                 "net {action}: --engine cdp 只支持 route / mock / unroute（该 action 只支持页面引擎，请去掉 --engine cdp）"
@@ -117,7 +134,7 @@ pub(crate) async fn net_value(state: &AppState, req: NetRequest) -> Result<Value
     }
     if let Some(headers) = req.headers.clone().filter(|value| !value.is_null()) {
         let object = if let Some(text) = headers.as_str() {
-            // 解析失败不能再静默变 `{}`：请求会少一堆头，用户却看到成功。
+            // 解析失败不能再静默变 `{}`：请求会少一堆头，用户却看到成功（B-06）。
             serde_json::from_str::<Value>(text).map_err(|err| {
                 let preview: String = text.chars().take(120).collect();
                 anyhow!("net: --headers 不是合法的 JSON（{preview}）：{err}")
@@ -130,7 +147,7 @@ pub(crate) async fn net_value(state: &AppState, req: NetRequest) -> Result<Value
     if let Some(body) = req.body.clone().filter(|value| !value.is_null()) {
         opts["body"] = body;
     }
-    // fetch 的两个页面侧开关：页面脚本读的是 `credentials` / `parseJson`，
+    // fetch 的两个页面侧开关（X-15）：页面脚本读的是 `credentials` / `parseJson`，
     // 不传时不覆盖页面默认值（include / true）。
     if action == "fetch" {
         if let Some(credentials) = req.credentials.as_deref() {
@@ -177,7 +194,7 @@ pub(crate) async fn net_value(state: &AppState, req: NetRequest) -> Result<Value
     if let Some(rule) = req.rule.clone().filter(|value| !value.is_null()) {
         let rule = if let Some(text) = rule.as_str() {
             // 解析失败必须直接报错：以前写入 Value::Null，键存在但值为空，
-            // 既绕过了下面的必填校验，又把错误推迟到 cdp 引擎。
+            // 既绕过了下面的必填校验，又把错误推迟到 cdp 引擎（B-06）。
             serde_json::from_str::<Value>(text).map_err(|err| {
                 let preview: String = text.chars().take(120).collect();
                 anyhow!("net: --rule 不是合法的 JSON（{preview}）：{err}")
@@ -185,6 +202,8 @@ pub(crate) async fn net_value(state: &AppState, req: NetRequest) -> Result<Value
         } else {
             rule
         };
+        // 规则在进入任何引擎之前统一校验：body 大小/类型、规则条数。
+        validate_net_rule(&action, &rule)?;
         opts["rule"] = rule;
     }
     if action == "fetch"
@@ -266,7 +285,7 @@ pub(crate) async fn net_value(state: &AppState, req: NetRequest) -> Result<Value
         let rebuild = config.get("cdpRebuildRequired").and_then(Value::as_bool) == Some(true);
         if cdp_enabled || rebuild {
             // 下发失败不能静默：旧实现 `if let Ok(value)` 吞错，`applied` 保持 null，
-            // 调用方分不清「没有规则要下发」和「扩展根本没收到」。
+            // 调用方分不清「没有规则要下发」和「扩展根本没收到」（B-11）。
             applied = match net_cdp_broadcast(
                 state,
                 &profile_key,
@@ -465,6 +484,7 @@ pub(crate) async fn net_value(state: &AppState, req: NetRequest) -> Result<Value
     // log 要合并页面侧与 CDP 侧两份记录，页面侧先多取一些，合并排序后再截断，
     // 否则会先被页面脚本按 limit 砍掉一半，合并结果不完整。
     let log_limit = req.limit.unwrap_or(50).clamp(1, 500);
+    let mut cdp_debug_pass_sync: Option<Value> = None;
     if action == "log" {
         opts["limit"] = json!((log_limit * 2).min(500));
         // 线协议字段是 camelCase：扩展侧/CDP 日志读的是 `debugPass`。
@@ -477,11 +497,14 @@ pub(crate) async fn net_value(state: &AppState, req: NetRequest) -> Result<Value
         }
         // CDP 侧的 pass 计数由扩展的 per-tab 开关控制，必须在查 status 之前
         // 同步过去，否则 `net log --debug-pass` 打开后仍然一条 pass 都看不到。
-        if log_source != "page"
-            && req.debug_pass == Some(true)
-            && config.get("cdpEnabled").and_then(Value::as_bool) == Some(true)
-        {
-            net_cdp_set_debug_pass(state, &profile_key, &config, timeout).await;
+        //
+        // 每次都要下发**最终值**：旧实现只在 `--debug-pass` 为 true 时
+        // 同步，于是开关只能开不能关，pass 日志越积越多、也无法复位。
+        let debug_pass = req.debug_pass.unwrap_or(false);
+        if log_source != "page" && config.get("cdpEnabled").and_then(Value::as_bool) == Some(true) {
+            cdp_debug_pass_sync = Some(
+                net_cdp_set_debug_pass(state, &profile_key, &config, timeout, debug_pass).await,
+            );
         }
     }
     // 修改页面级规则的动作要下发到该 profile 的**每个**标签：配置按
@@ -526,8 +549,11 @@ pub(crate) async fn net_value(state: &AppState, req: NetRequest) -> Result<Value
     };
 
     // 持久化：记录配置，并把「页面脚本 + 当前规则」注册成 document_start 注入。
-    // matches 为空时不注册（fail-closed），并把原因带回给调用方。
+    // matches 为空时不注册（fail-closed），并把原因带回给调用方（B-10）。
     let mut persist_warning: Option<String> = None;
+    // 与 persist_warning 分开存：注册持久注入的 warning 会覆盖前者，
+    // 但「端口未保留」这条与注册成败无关，必须两段都能看到。
+    let mut match_warning: Option<String> = None;
     if action == "hook" && req.persist {
         // matches 收窄：显式 --match 就按它来；否则默认只覆盖当前页面所属站点，
         // 而不是给所有网站注册 content script。已有配置取并集，跨站点累积。
@@ -545,9 +571,16 @@ pub(crate) async fn net_value(state: &AppState, req: NetRequest) -> Result<Value
                         .collect()
                 })
                 .unwrap_or_default();
-            if let Some(pattern) = current_site_match_pattern(state, &session_key).await {
+            if let Some((pattern, port_warning)) =
+                current_site_match_pattern(state, &session_key).await
+            {
                 if !merged.contains(&pattern) {
                     merged.push(pattern);
+                }
+                // 端口无法写进 match pattern：如实告警，别让调用方以为
+                // `--persist` 只影响了当前端口。
+                if let Some(warning) = port_warning {
+                    match_warning = Some(warning);
                 }
             }
             // 不再退回 <all_urls>：提取不到站点就保持空列表，由下面跳过注册。
@@ -567,7 +600,7 @@ pub(crate) async fn net_value(state: &AppState, req: NetRequest) -> Result<Value
         config["matches"] = json!(matches);
         // 只有显式给了才覆盖。第二次 `net hook --persist` 通常只想刷新 matches，
         // 旧实现用 `unwrap_or(false)` / `unwrap_or(200)` 把已存的开关静默压回默认值，
-        // 用户看到的是「body 抓不到了 / 日志只剩 200 条」却找不到改过什么。
+        // 用户看到的是「body 抓不到了 / 日志只剩 200 条」却找不到改过什么（B-17）。
         match req.capture_bodies {
             Some(capture) => config["captureBodies"] = json!(capture),
             None => {
@@ -680,9 +713,24 @@ pub(crate) async fn net_value(state: &AppState, req: NetRequest) -> Result<Value
     if let Some(note) = clamped_note {
         result["clamped"] = note;
     }
+    // debugPass 同步失败不能静默：否则用户以为开关已经改过，日志口径却是旧的。
+    if let Some(sync) =
+        cdp_debug_pass_sync.filter(|value| value.get("ok").and_then(Value::as_bool) == Some(false))
+    {
+        result["cdp_debug_pass"] = sync;
+    }
     // 部分标签没收到规则时必须如实报出来：否则"当前标签成功了"会被读成全部生效。
     if !page_failures.is_empty() {
         result["page_failed"] = json!(page_failures);
+    }
+    if let Some(warning) = match_warning {
+        match persist_warning.as_mut() {
+            Some(existing) => {
+                existing.push('；');
+                existing.push_str(&warning);
+            }
+            None => persist_warning = Some(warning),
+        }
     }
     if let Some(warning) = persist_warning {
         result["warning"] = json!(warning);

@@ -74,10 +74,13 @@ atb scrape --urls urls.txt --js-file grab.js --out out.jsonl --group-title resea
 
 注意：
 
-- 输出是 JSONL：一行一个 URL，含 `{url, tab_id, ok, data, error, elapsed_ms}`。
+- 输出是 JSONL，一行一个 URL：`{url, tab_id, ok, data, error, elapsed_ms, attempts, outcome_unknown}`。
+  - `data` 是 `--js-file` 的返回值（缺省脚本给 `{title, url, text}`）；失败时 `error` 有值、`data` 为 null。
+  - `attempts` 是实际尝试次数；默认每个 URL 只写一条**最终**记录，加 `--record-attempts` 才逐次写。
+  - `outcome_unknown:true` 表示传输层没拿到回包（页面可能已打开、脚本可能已执行），该 URL 不重试，整批最终退出码 4。
 - `--js-file` 的脚本需 `return` 一个可 JSON 序列化的值；缺省返回 `{title, url, text}`。
 - 失败按 3s / 5s / 7s 退避重试，`--retry` 是轮数，不是总次数。
-- `--concurrency` 默认 4；没有强制上限，但并发越高标签与内存压力越大，重页面建议 4–6。
+- `--concurrency` 与 `--batch` 的值域都是 **1..=32**，越界直接退出码 2（不再静默 clamp）；默认 4，重页面建议 4–6，再高标签与内存压力会明显上升。
 
 ## 5. 多标签并发
 
@@ -146,9 +149,10 @@ atb download-wait --id <downloadId> --timeout 120
 
 注意：
 
-- `--dir` 是 Chrome 默认下载目录下的子目录，不是任意绝对路径。
-- `download-wait` 省略 `--id` 时等最近一条下载。
-- 下载由浏览器执行；磁盘满、权限不足或站点要求二次确认时会停在 `interrupted`。
+- `--dir` 是 Chrome 默认下载目录下的子目录，不是任意绝对路径；含 `..` 段会被拒绝。
+- `--filename` 会被净化：取 basename、去掉路径分隔符 / `..` / Windows 保留名 / 尾部点空格，超长截断但保留扩展名；回包 `filename_sanitized{requested,applied,changed,warnings}` 里能看到实际下发的名字。
+- `download-wait` 省略 `--id` 时自动认领本 agent 最近一条下载；设 `ATB_DOWNLOAD_AUTO_CLAIM=false` 后必须显式给 `--id`，否则返回 `download_id_required`。
+- 下载由浏览器执行；磁盘满、权限不足或站点要求二次确认时会停在 `interrupted`。超时可用 `ATB_DOWNLOAD_CANCEL_ON_TIMEOUT=1` 让 daemon 主动取消。
 
 ## 9. iframe 内操作
 

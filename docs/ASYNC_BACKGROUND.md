@@ -1,7 +1,7 @@
 # 后台运行与异步任务
 
 > 目标：让智能体在**不打断用户当前浏览**的前提下操作页面，并且不必阻塞等待长任务。
-> 本文描述本次改造后的行为、用法与边界。实现集中在 `src/server.rs`（任务队列、daemon 侧等待）、`src/cli.rs`（`--async` / `job`）、`assets/atb_bridge/*`（后台保活、降低页面开销）。
+> 本文描述其行为、用法与边界。实现集中在 `src/server/run.rs` / `src/server/state.rs` / `src/server/boot.rs`（任务队列、daemon 侧等待）、`src/cli/mod.rs` / `src/cli/cmd_pipeline.rs`（`--async` 分发、`job`）、`assets/atb_bridge/*`（后台保活、降低页面开销）。
 
 ---
 
@@ -55,7 +55,24 @@ atb open https://example.com --focus
 
 ## 3. 异步任务用法
 
-### 3.1 提交
+### 3.1 支持范围
+
+支持异步（提交后立刻返回 `job_id`）：
+
+`exec`、`read`、`find`、`scan`、`snapshot`、`cookies`、`frames`、`click`、`mouse-click`、`fill`、`send-keys`、`hover`、`select`、`check`、`scroll`、`upload`、`inject`、`wait`、`screenshot`、`save-pdf`。
+
+不支持异步，带 `--async` 一律 `unsupported_flag` + 退出码 2（清单与 `src/cli/mod.rs::reject_async_if_unsupported` 及各命令入口的 `reject_async_if_set` 一致）：
+
+| 类别 | 命令 |
+| --- | --- |
+| 路由 / 会话 | `open`、`close`、`cleanup`、`tabs`、`tabtree`、`browsers`、`lookup` |
+| 管道 / 批处理 | `run`、`batch`、`scrape`、`broadcast` |
+| 网络 / 下载 | `net`、`network`、`console`、`downloads`、`download`、`download-wait` |
+| 挑战 / 痕迹 | `challenge`、`stealth` |
+| 任务 / 运维 | `job`、`status`、`doctor`、`capabilities`、`logs`、`launch`、`restart`、`stop`、`daemon`、`set-extension-port`、`schema` |
+| 配置 | `profile-label`、`install-skill`、`trust-extension` |
+
+新增命令时要同步这两处：分发层的 `reject_async_if_unsupported`（跨命令族拒绝）与命令入口的 `reject_async_if_set`（单命令拒绝）；漏一处就是「flag 被静默吞掉」。
 
 ```bash
 atb --async exec 'return document.title'
@@ -74,8 +91,6 @@ atb --async screenshot --full-page --out /tmp/full.png
 }
 ```
 
-支持异步的操作：`exec`、`scan`、`snapshot`、`click`、`mouse-click`、`fill`、`send-keys`、`screenshot`、`save-pdf`。
-`open` / `close` / `tabs` 等路由类命令保持同步（本身很快，且需要立刻拿到 tab 标识）。
 
 ### 3.2 取结果
 
@@ -146,9 +161,28 @@ atb run steps.json
 
 ### 3.5 失败可编程与输出体积
 
-- `ok:false` → 退出码 `1`；`job wait` 超时 → 退出码 `3`；成功 → `0`。设置 `ATB_EXIT0=1` 可恢复旧的恒 0 行为。
+- 退出码：`0` 成功 / `1` 执行失败（含普通 `wait` 与 `challenge` 超时）/ `2` 命令写错（含 `--async` 不支持）/ `3` 仅 `job wait` 与 `download-wait` 超时 / `4` 结果未知（动作可能已执行，带同一 `--idempotency-key` 重发）/ `130` 任务被取消。
+- `ATB_EXIT0=1` 可恢复旧的「失败也返回 0」行为，仅在有脚本依赖旧行为时使用；`0` / `false` / 空串不再开启（旧实现只要设置就生效）。
 - 默认输出 **compact JSON**（单行）；需要人读时加 `--pretty`。
 - `tabs` 默认把 URL 截断到 80 字符，`tabs --full` 输出完整 URL；内部数据模型始终保留完整 URL。
+
+### 3.6 相关环境变量
+
+| 变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `ATB_AGENT` | 终端会话标识 → `default` | 调用方身份，异步任务在提交时捕获，不跟随 daemon 的当前默认 |
+| `ATB_HOME` | `~/.atb` | 配置目录；只影响配置与 token，不影响 `~` 展开 |
+| `ATB_IDLE_TTL` | 300 | 无扩展连接时的空闲退出秒数（有任务运行或扩展连着时不退） |
+| `ATB_MAX_RUNNING_JOBS` | 32 | 同时运行的 job 上限，硬淘汰前先 abort |
+| `ATB_EXIT0` | 关 | 恢复旧的恒 0 退出码，值须为 `1` / `true` |
+| `ATB_HTTP_SLACK_SEC` | 10 | CLI 计算 HTTP 超时时在业务超时上追加的余量 |
+| `ATB_WAIT_MAX_TOTAL_SEC` | 600 | `wait` / `--wait-js` 单条命令的总预算上限 |
+| `ATB_WAIT_MIN_INTERVAL_MS` | 50 | `wait --interval` 的最小值，防止 `interval=0` 忙轮询 |
+| `ATB_IDEMPOTENCY_PERSIST` | `redacted` | 幂等记录落盘档位：`redacted` / `full` / `off` |
+| `ATB_IDEMPOTENCY_FILE_MAX_MB` | 32 | `idempotency.jsonl` 运行期上限，超限后台压缩 |
+
+`ATB_AGENT` / `ATB_HOME` / `ATB_EXIT0` 的旧名（`AGENT_BROWSER_CLI_AGENT` 等）仍兼容，但新脚本请用 `ATB_*`。
+
 
 ---
 
@@ -170,7 +204,7 @@ while (Date.now() < deadline) {
 
 结果：后台标签页里 `--wait-js --wait-timeout 10` 往往只能轮询几次就超时，表现为"页面明明已经好了，但命令报 wait 超时"。
 
-改造后：页面只负责**回答一次判断**，循环交给 daemon：
+现在：页面只负责**回答一次判断**，循环交给 daemon：
 
 ```text
 daemon: 每 100ms 注入一次 wait_js → 读返回值 → 真值则返回
@@ -210,7 +244,7 @@ daemon: 每 100ms 注入一次 wait_js → 读返回值 → 真值则返回
 | `scan --text-only`（example.com，含 CLI 启动） | ≈ 480 ms |
 | 可见/隐藏标签页 `exec` 端到端 | 380 ~ 420 ms |
 
-解读：进程启动占 60% 左右，页面执行约 200 ms 主要来自 MV3 Service Worker 唤醒 + `chrome.scripting` 调度；隐藏标签页会被 Chrome 降优先级，但**不再因为定时器节流而超时**。后续优化方向见 [docs/FEATURE_STATUS.md](./FEATURE_STATUS.md) 的「下一步」。
+解读：进程启动占 60% 左右，页面执行约 200 ms 主要来自 MV3 Service Worker 唤醒 + `chrome.scripting` 调度；隐藏标签页会被 Chrome 降优先级，但**不再因为定时器节流而超时**。
 
 ---
 

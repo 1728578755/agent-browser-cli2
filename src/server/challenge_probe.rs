@@ -1,5 +1,71 @@
 use super::*;
 
+/// 挑战页标题特征（`open` 的「值不值得探一次」与 read 的
+/// `attach_challenge_if_blocked` 共用同一份列表）。
+///
+/// 两处曾经各写一份，`should_probe_challenge` 里还留着已声明移除的 "access denied"，
+/// 于是同一个 403 页在 open 与 read 两条路径上得到相反结论。
+pub(crate) const CHALLENGE_TITLE_HINTS: [&str; 12] = [
+    "just a moment",
+    "attention required",
+    "checking your browser",
+    "verifying you are human",
+    "one more step",
+    "请稍候",
+    "正在检查",
+    "正在验证",
+    "安全验证",
+    "人机验证",
+    "确认您是真人",
+    "请完成安全验证",
+];
+
+/// 诊断里最多保留多少条底层错误。
+///
+/// `ATB_DIAG_DEPTH` 的 `0` 表示「只保留一句归因」，不是完全静音：排障时
+/// 「没有任何错误」和「有错但被截断」必须可区分。
+fn diag_error_limit() -> usize {
+    crate::settings::diag_depth().max(1)
+}
+
+/// 把底层 `Err` 的原文限量收进 diag。
+///
+/// 旧实现把 `Err` 层层吞成 `false` / 空集合，上层只能看到
+/// "no challenge iframe" 这类结论，根因（attach 失败 / 回包缺失 / 超时）完全丢失。
+pub(crate) fn push_diag_error(
+    diag: &mut Vec<Value>,
+    step: &str,
+    reason: &str,
+    detail: &str,
+    node: Option<i64>,
+) {
+    if diag.len() >= diag_error_limit() {
+        return;
+    }
+    let mut entry = json!({
+        "step": step,
+        "reason": reason,
+        "error": truncate_text(detail, 240),
+    });
+    if let Some(node) = node {
+        entry["node"] = json!(node);
+    }
+    diag.push(entry);
+}
+
+/// 距截止时间还剩多少；归零返回 `None`（调用方负责把「预算耗尽」写进 diag）。
+///
+/// 单次 CDP 调用的超时必须在**每次调用前**按 deadline 重算，
+/// 不能在循环里复用同一个 `timeout`，否则 N 个 iframe 的最坏耗时是 N×timeout。
+pub(crate) fn deadline_left(deadline: Instant) -> Option<Duration> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        None
+    } else {
+        Some(left)
+    }
+}
+
 /// 只在「看起来像挑战页」时才多注入一次做精确识别。
 ///
 /// 正常页面不该为验证码检测多付一次往返；而 CF 拦截页的标题/正文特征很稳定，
@@ -19,17 +85,9 @@ pub(crate) async fn attach_challenge_if_blocked(state: &AppState, payload: &mut 
     // 这里的列表只决定「要不要多花一次往返去问页面脚本」，不用来下结论。
     // "access denied" 已移除：它是无数 403 页的通用标题，页面脚本侧也只当 suspected
     // （见 page_challenge.js 的 STRONG/WEAK 分档），留着只会让每个 403 页白付一次注入。
-    let title_hit = [
-        "just a moment",
-        "attention required",
-        "checking your browser",
-        "verifying you are human",
-        "请稍候",
-        "安全验证",
-        "人机验证",
-    ]
-    .iter()
-    .any(|needle| title.contains(needle));
+    let title_hit = CHALLENGE_TITLE_HINTS
+        .iter()
+        .any(|needle| title.contains(needle));
     let text_hit = text.chars().count() < 600 && {
         let lower = text.to_lowercase();
         [
@@ -53,7 +111,10 @@ pub(crate) async fn attach_challenge_if_blocked(state: &AppState, payload: &mut 
     if session_key.is_empty() {
         return;
     }
-    if let Ok(challenge) = challenge_page_call(
+    // 探测结果必须真的可判定才算「识别成功」。`challenge_page_call` 在
+    // 扩展未注入 / 页面脚本没有返回值时给 `Value::Null`，把它塞进 `challenge` 会让
+    // 调用方读成「没有挑战」——把根本没探到说成探到了。
+    match challenge_page_call(
         state,
         &session_key,
         json!({ "action": "status" }),
@@ -62,8 +123,28 @@ pub(crate) async fn attach_challenge_if_blocked(state: &AppState, payload: &mut 
     )
     .await
     {
-        if let Some(object) = payload.as_object_mut() {
-            object.insert("challenge".to_string(), challenge);
+        Ok(challenge) if challenge_status_usable(&challenge) => {
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("challenge".to_string(), challenge);
+            }
+        }
+        Ok(_) => {
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("challenge_probe_failed".to_string(), json!(true));
+                object.insert(
+                    "challenge_probe_error".to_string(),
+                    json!("页面 status 返回空载荷（扩展未注入 / 页面脚本未执行）"),
+                );
+            }
+        }
+        Err(err) => {
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("challenge_probe_failed".to_string(), json!(true));
+                object.insert(
+                    "challenge_probe_error".to_string(),
+                    json!(humanize_extension_error(&err.to_string())),
+                );
+            }
         }
     }
 }
@@ -81,20 +162,9 @@ pub(crate) fn should_probe_challenge(url: &str, title: &str) -> bool {
     if title.is_empty() {
         return true;
     }
-    const HINTS: [&str; 11] = [
-        "just a moment",
-        "attention required",
-        "checking your browser",
-        "verifying you are human",
-        "one more step",
-        "请稍候",
-        "正在检查",
-        "正在验证",
-        "安全验证",
-        "人机验证",
-        "access denied",
-    ];
-    HINTS.iter().any(|hint| title.contains(hint))
+    CHALLENGE_TITLE_HINTS
+        .iter()
+        .any(|hint| title.contains(hint))
 }
 
 /// open 之后的自动等待：识别一次，确认被拦才进入等待。
@@ -118,12 +188,12 @@ pub(crate) async fn auto_wait_challenge(
     let mut got: Option<Value> = None;
     // `--challenge-timeout` 是**总预算**，不是每个阶段各给一份。
     // 旧实现：solve_budget=0.8T、reload 再等最多 8s、被动等待又拿完整 T，
-    // 最坏 ≈1.8T+8s —— `--challenge-timeout 15` 实测能等 35~40s。
+    // 最坏 ≈1.8T+8s —— `--challenge-timeout 15` 实测能等 35~40s（B-06）。
     // 从现在起所有阶段都只从 `remaining()` 里取，绝不重新起算。
     let overall_deadline = Instant::now() + secs(timeout_secs.clamp(1.0, 600.0));
     let budget_left = || overall_deadline.saturating_duration_since(Instant::now());
     for attempt in 0..12 {
-        // C1-01：重试次数不能压过总预算。旧实现只在循环外算一次 deadline，
+        // 重试次数不能压过总预算。旧实现只在循环外算一次 deadline，
         // 循环里每次固定 8s，`--challenge-timeout 15` + 扩展挂死时这一小段
         // 最坏能等 12×8s —— 「识别」就把整条链路的预算吃光。
         let left = budget_left();
@@ -193,7 +263,7 @@ pub(crate) async fn auto_wait_challenge(
     // 文档还在 loading 时**不能**下结论。上面的重试最多只等 6×250ms≈1.5s，慢站点
     // （CF 边缘拥塞、大页面）超过这个时间还在 pending 很正常；而 pending 期间的
     // 「检测不到挑战」是假阴性，此时返回 cleared:true 会让 `open --challenge` 的
-    // 调用方以为已经进去了（，与函数内注释直接矛盾）。
+    // 调用方以为已经进去了（B-12，与函数内注释直接矛盾）。
     // 如实回 `cleared:false + reason:"still_loading"`，让调用方自己决定要不要再等。
     if status
         .get("pending")
@@ -240,22 +310,13 @@ pub(crate) async fn auto_wait_challenge(
     // 标签切成 active**，`--background` 也不例外：那个参数的本意是「开页面别打断我」，
     // 而不是「停在挑战页上永远过不去」。allowFocus:false 只切标签、不抢系统焦点。
     // 切不过去时挑战一定过不了（定时器被节流），必须把原因带回给调用方：
-    // 否则 open 只会报一句「等了 N 秒没清」，看不出是标签根本没激活（C1-08）。
+    // 否则 open 只会报一句「等了 N 秒没清」，看不出是标签根本没激活。
     let mut diag: Vec<Value> = Vec::new();
-    if let Err(err) = extension_control(
-        state,
-        session_key,
-        "tabs",
-        json!({ "method": "switch", "allowFocus": false }),
-        DEFAULT_EXTENSION_CONTROL_TIMEOUT,
-    )
-    .await
-    {
-        diag.push(json!({
-            "step": "activate-tab",
-            "error": humanize_extension_error(&err.to_string()),
-        }));
-    }
+    // 只有「确实被拦 + 该 tab 非 active」才切，且同窗口冷却；
+    // 不再每个求解器都无条件抢一次 active tab。
+    challenge_activate_tab(state, session_key, false, &mut diag).await;
+    // `activate` 只是 open 的「打开时是否前台」提示：挑战页无论是否 --background
+    // 都必须在前台跑定时器，是否真的需要切换由 challenge_activate_tab 判断。
     let _ = activate;
     // 先主动点一次验证码组件（带勾选框的 Turnstile 等只会等待是过不去的）。
     // 预算取总超时的 80%（上限 25s）：点完还要等它自己验证，Turnstile 常常要 5-20s
@@ -302,7 +363,7 @@ pub(crate) async fn auto_wait_challenge(
             )
             .await;
             // 等页面重新落定：status 不再是 pending 才算新挑战页就绪。
-            // 单次查询的超时同样取「本循环剩余」与「总预算剩余」的较小值（C1-01）：
+            // 单次查询的超时同样取「本循环剩余」与「总预算剩余」的较小值：
             // 旧实现固定 6s，reload 窗口只有 8s 时最后那次调用能把总预算顶穿。
             let reload_deadline = Instant::now() + Duration::from_secs(8).min(budget_left());
             while Instant::now() < reload_deadline {
@@ -446,10 +507,12 @@ pub(crate) const CHALLENGE_FRAME_HINTS: [&str; 9] = [
 
 /// 一个验证码 iframe 在页面视口里的几何。
 ///
-/// 只保留点击真正需要的字段（四边形 + 尺寸）：DOM nodeId 在拿到几何后就没用了，
-/// 留着会让人误以为后续还能拿它二次定位（页面一重排就失效）。
+/// `node_id` 只用于**组件签名**（同 URL 重载时 nodeId 会变，能识别出「换了一个
+/// 组件实例」），不参与坐标换算：页面一重排，nodeId 对应的位置就失效了。
 pub(crate) struct ChallengeFrame {
     pub(crate) url: String,
+    /// DOM nodeId（组件签名的一部分，见 `challenge_frame_signature`）。
+    pub(crate) node_id: i64,
     /// content box 四角（TL, TR, BR, BL），已包含 CSS transform 的效果。
     pub(crate) quad: [f64; 8],
     pub(crate) width: f64,
@@ -459,7 +522,7 @@ pub(crate) struct ChallengeFrame {
 impl ChallengeFrame {
     /// 局部坐标（iframe 内容坐标，CSS px）→ 页面视口坐标。
     ///
-    /// 不能简单相加：有的站点（如 nowsecure.nl 的测试页）给挑战 iframe 加 3D 旋转，
+    /// 不能简单相加：有的站点给挑战 iframe 加 3D 旋转，
     /// 纯加法点不到勾选框。这里用四角反推仿射基向量，旋转/缩放/斜切都能对上。
     pub(crate) fn to_screen(&self, lx: f64, ly: f64) -> (f64, f64) {
         let [x1, y1, x2, y2, _x3, _y3, x4, y4] = self.quad;
@@ -479,6 +542,44 @@ impl ChallengeFrame {
         };
         (x1 + u * ux + v * vx, y1 + u * uy + v * vy)
     }
+
+    /// 同 [`ChallengeFrame::to_screen`]，但把落在视口外的负坐标夹回 0。
+    ///
+    /// 用户给的点击坐标 / 组件内的落点都不该是负数：仿射变换后的负值只可能来自
+    /// 「组件被滚出视口 / 旋转后越界」。夹紧比把一个 -37px 的坐标直接发给 CDP 好 ——
+    /// 后者在部分 Chrome 版本上会被静默拒绝。返回 `(坐标, 是否夹紧)`，
+    /// 调用方把 `true` 写进 diag。
+    pub(crate) fn to_screen_clamped(&self, lx: f64, ly: f64) -> ((f64, f64), bool) {
+        let (sx, sy) = self.to_screen(lx, ly);
+        let cx = sx.max(0.0);
+        let cy = sy.max(0.0);
+        ((cx, cy), cx != sx || cy != sy)
+    }
+}
+
+/// 组件签名：识别「同一个组件」还是「换了一个实例」。
+///
+/// 旧实现只用 iframe URL：页面用同一个 URL 重新加载组件时签名不变，
+/// 求解器会把新组件当成旧的，验证期继续补点，把流程打回原点。
+/// nodeId 在文档重载 / 组件替换时都会变；quad 尺寸哈希覆盖「同一 node 被重排成
+/// 另一个醒目组件」的情况。targetId 拿不到（DOM node 与 Target 没有直接映射），
+/// nodeId 已覆盖它在本场景里的作用。
+pub(crate) fn challenge_frame_signature(frame: &ChallengeFrame) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for value in frame.quad {
+        // f64 不能直接 Hash：先量化到 0.1px，避免亚像素抖动被当成新组件。
+        ((value * 10.0).round() as i64).hash(&mut hasher);
+    }
+    frame.node_id.hash(&mut hasher);
+    frame.url.hash(&mut hasher);
+    format!(
+        "{}:{}:{}x{}:{:x}",
+        frame.node_id,
+        frame.url,
+        frame.width.round() as i64,
+        frame.height.round() as i64,
+        hasher.finish()
+    )
 }
 
 /// 取一个 iframe 元素「真正加载的文档 URL」。
@@ -486,24 +587,43 @@ impl ChallengeFrame {
 /// 不能只读 src 属性：CF 的挑战 iframe 常常先用 `srcdoc`/属性为空、再用 JS 赋
 /// `contentWindow.location` 或 `document.write` 填充，属性值读不到真实地址。
 /// describeNode(depth:0) 的 contentDocument.documentURL 是实际导航地址，更可靠。
+///
+/// 每次 CDP 调用前都按 `deadline` 重算剩余量；预算归零立刻返回空串
+/// （调用方会把它当成「这一帧没探到」，不再往下花时间）。
 pub(crate) async fn iframe_doc_url(
     state: &AppState,
     session_key: &str,
     node_id: i64,
-    timeout: Duration,
+    deadline: Instant,
+    diag: &mut Vec<Value>,
 ) -> String {
-    let described = cdp_call(
+    let left = match deadline_left(deadline) {
+        Some(left) => left,
+        None => {
+            push_diag_error(
+                diag,
+                "describeNode",
+                "deadline",
+                "iframe 探测预算耗尽",
+                Some(node_id),
+            );
+            return String::new();
+        }
+    };
+    match cdp_call(
         state,
         session_key,
         "DOM.describeNode",
         json!({ "nodeId": node_id, "depth": 0, "pierce": true }),
-        timeout,
+        left,
     )
-    .await;
-    if let Ok(result) = described {
-        if let Some(data) = result.data {
-            if let Some(url) = data
-                .pointer("/node/contentDocument/documentURL")
+    .await
+    {
+        Ok(result) => {
+            if let Some(url) = result
+                .data
+                .as_ref()
+                .and_then(|data| data.pointer("/node/contentDocument/documentURL"))
                 .and_then(Value::as_str)
             {
                 if !url.is_empty() {
@@ -511,18 +631,59 @@ pub(crate) async fn iframe_doc_url(
                 }
             }
         }
+        Err(err) => push_diag_error(
+            diag,
+            "describeNode",
+            "cdp_error",
+            &err.to_string(),
+            Some(node_id),
+        ),
     }
     // 退一步读属性（src / data-src）。
-    let attrs = cdp_call(
+    let left = match deadline_left(deadline) {
+        Some(left) => left,
+        None => {
+            push_diag_error(
+                diag,
+                "getAttributes",
+                "deadline",
+                "iframe 探测预算耗尽",
+                Some(node_id),
+            );
+            return String::new();
+        }
+    };
+    let attrs = match cdp_call(
         state,
         session_key,
         "DOM.getAttributes",
         json!({ "nodeId": node_id }),
-        timeout,
+        left,
     )
     .await
-    .ok()
-    .and_then(|result| result.data)
+    {
+        Ok(result) if result.ok => result.data,
+        Ok(result) => {
+            push_diag_error(
+                diag,
+                "getAttributes",
+                "cdp_rejected",
+                result.error.as_deref().unwrap_or("扩展未给出原因"),
+                Some(node_id),
+            );
+            None
+        }
+        Err(err) => {
+            push_diag_error(
+                diag,
+                "getAttributes",
+                "cdp_error",
+                &err.to_string(),
+                Some(node_id),
+            );
+            None
+        }
+    }
     .and_then(|data| data.get("attributes").and_then(Value::as_array).cloned())
     .unwrap_or_default();
     let mut src = String::new();
@@ -544,70 +705,63 @@ pub(crate) async fn iframe_doc_url(
 /// 换来的是不漏掉 shadow root 里的组件。
 ///
 /// 第二个返回值是成败标记：**查询本身失败**（CDP 附不上 / DOM 域不可用）
-/// 与「文档里真的没有 iframe」是两件事。旧实现把两种都返回空集合，求解器就把
-/// 「查不出来」当成「组件已被摘掉」= 点击被接收，然后整轮求解停手等一个永不到来的结论。
+/// 与「文档里真的没有 iframe」是两件事。
+///
+/// 旧实现先 `DOM.getDocument{depth:1}` 拿 rootId 做 querySelectorAll，
+/// 再 `DOM.getDocument{depth:-1}` 全量遍历，两次回包的 nodeId 属于**不同的前端节点
+/// 映射**，混用会把别的节点当 iframe。现在只做一次全量 getDocument，
+/// 所有 iframe 都从同一棵树里取。
 pub(crate) async fn collect_iframe_ids(
     state: &AppState,
     session_key: &str,
-    timeout: Duration,
+    deadline: Instant,
+    diag: &mut Vec<Value>,
 ) -> (Vec<i64>, bool) {
-    let mut ids: Vec<i64> = Vec::new();
-    // 至少有一次 DOM.getDocument 成功，才算「查过了」。
-    let mut queried = false;
-    if let Ok(result) = cdp_call(
-        state,
-        session_key,
-        "DOM.getDocument",
-        json!({ "depth": 1, "pierce": true }),
-        timeout,
-    )
-    .await
-    {
-        if let Some(root_id) = result
-            .data
-            .as_ref()
-            .and_then(|data| data.pointer("/root/nodeId"))
-            .and_then(Value::as_i64)
-        {
-            queried = true;
-            if let Ok(found) = cdp_call(
-                state,
-                session_key,
-                "DOM.querySelectorAll",
-                json!({ "nodeId": root_id, "selector": "iframe" }),
-                timeout,
-            )
-            .await
-            {
-                if let Some(list) = found
-                    .data
-                    .as_ref()
-                    .and_then(|data| data.get("nodeIds"))
-                    .and_then(Value::as_array)
-                {
-                    ids.extend(list.iter().filter_map(Value::as_i64));
-                }
-            }
-        }
-    }
-    // querySelectorAll 不穿 shadow root，补一遍 pierce 全量树。
-    if let Ok(result) = cdp_call(
+    let Some(left) = deadline_left(deadline) else {
+        push_diag_error(diag, "getDocument", "deadline", "iframe 探测预算耗尽", None);
+        return (Vec::new(), true);
+    };
+    match cdp_call(
         state,
         session_key,
         "DOM.getDocument",
         json!({ "depth": -1, "pierce": true }),
-        timeout,
+        left,
     )
     .await
     {
-        if let Some(root) = result.data.as_ref().and_then(|data| data.get("root")) {
-            queried = true;
+        Ok(result) if result.ok => {
+            let Some(root) = result.data.as_ref().and_then(|data| data.get("root")) else {
+                push_diag_error(
+                    diag,
+                    "getDocument",
+                    "invalid_response",
+                    "DOM.getDocument 回包缺少 root",
+                    None,
+                );
+                return (Vec::new(), true);
+            };
+            let mut ids = Vec::new();
             collect_iframe_nodes(root, &mut ids);
+            ids.sort_unstable();
+            ids.dedup();
+            (ids, false)
+        }
+        Ok(result) => {
+            push_diag_error(
+                diag,
+                "getDocument",
+                "cdp_rejected",
+                result.error.as_deref().unwrap_or("扩展未给出原因"),
+                None,
+            );
+            (Vec::new(), true)
+        }
+        Err(err) => {
+            push_diag_error(diag, "getDocument", "cdp_error", &err.to_string(), None);
+            (Vec::new(), true)
         }
     }
-    ids.sort_unstable();
-    ids.dedup();
-    (ids, !queried)
 }
 
 /// 从 pierce 过的 DOM 树里收集 iframe 的 nodeId（含 shadow root 内部）。
@@ -654,31 +808,80 @@ pub(crate) fn is_foreign_extension_frame_error(message: &str) -> bool {
         || message.contains("内嵌了其他扩展")
 }
 
+/// 摘除其它扩展 iframe 的结果。
+///
+/// `SkippedUnknownOwnId` 表示「拿不到本扩展 id，因此一个都没删」：
+/// 这与「摘了 0 个」必须可区分，调用方要据此换回落通道。
+pub(crate) enum StripFramesOutcome {
+    Stripped(u64),
+    SkippedUnknownOwnId,
+}
+
+/// 本扩展的 id：优先用 `ATB_EXTENSION_ID`，否则取当前 WS 连接握手时的扩展 id。
+///
+/// 自己注入的 iframe 同样以 `chrome-extension://<own-id>` 开头，必须白名单放行；
+/// 取不到就不删（见 `strip_foreign_extension_frames`）。
+async fn own_extension_id(state: &AppState, session_key: &str) -> Option<String> {
+    let from_env = crate::settings::env_string("ATB_EXTENSION_ID", "");
+    if !from_env.is_empty() {
+        return Some(from_env);
+    }
+    let conn_id = {
+        let driver = state.driver.read().await;
+        driver
+            .sessions
+            .get(session_key)
+            .map(|session| session.conn_id)
+    }?;
+    let connections = state.ws_connections.lock().ok()?;
+    connections
+        .get(&conn_id)
+        .map(|connection| connection.extension_id.clone())
+        .filter(|id| !id.trim().is_empty())
+}
+
 /// 摘掉页面里别的扩展注入的 iframe，让 chrome.debugger 能 attach。
 ///
 /// 只处理当前文档这一次：这类扩展会在下一次导航时重新注入，做成持久化反而会
 /// 影响用户其它页面。返回值是摘掉的个数，写进 diag 让排障能看到「为什么突然能用了」。
 ///
-/// 失败必须返回 `Err`（C1-07）：旧实现 `.ok()...unwrap_or(0)` 把「脚本根本没跑」
+/// 旧实现无差别删除**所有** `chrome-extension://` iframe，包括本工具自己
+/// 注入的组件和用户合法扩展。现在只删「扩展 id ≠ 自身 id」的；自身 id 拿不到时
+/// **一个都不删**，返回 `SkippedUnknownOwnId` 让调用方换回落通道并如实记录。
+///
+/// 失败必须返回 `Err`：旧实现 `.ok...unwrap_or(0)` 把「脚本根本没跑」
 /// 和「跑完了、一个都没摘掉」压成同一个 0，排障时完全看不出 attach 为什么还是失败。
 pub(crate) async fn strip_foreign_extension_frames(
     state: &AppState,
     session_key: &str,
-) -> Result<u64> {
-    let script = "const frames = Array.prototype.slice.call(document.querySelectorAll('iframe'))\
-         .filter(function (frame) { return String(frame.src || '').indexOf('chrome-extension://') === 0; });\
-         frames.forEach(function (frame) { try { frame.remove(); } catch (_) {} });\
-         return frames.length;";
+) -> Result<StripFramesOutcome> {
+    let Some(own_id) = own_extension_id(state, session_key).await else {
+        return Ok(StripFramesOutcome::SkippedUnknownOwnId);
+    };
+    let own = json!([own_id]);
+    let script = format!(
+        "const own = {own};\
+         const prefix = 'chrome-extension://';\
+         const frames = Array.prototype.slice.call(document.querySelectorAll('iframe'))\
+         .filter(function (frame) {{\
+             const src = String(frame.src || '');\
+             if (src.indexOf(prefix) !== 0) return false;\
+             const id = src.slice(prefix.length).split('/')[0].split('?')[0].split('#')[0];\
+             return own.indexOf(id) < 0;\
+         }});\
+         frames.forEach(function (frame) {{ try {{ frame.remove(); }} catch (_) {{}} }});\
+         return frames.length;"
+    );
     let executed = execute_page_js_with_target(
         state,
-        script,
+        &script,
         SessionSelector::new(Some(session_key.to_string()), None, None),
         true,
         Duration::from_secs(5),
         &ExecTargetOptions::default(),
     )
     .await?;
-    executed
+    let stripped = executed
         .get("js_return")
         .cloned()
         .and_then(|value| {
@@ -687,5 +890,6 @@ pub(crate) async fn strip_foreign_extension_frames(
                 .or_else(|| value.as_f64().map(|number| number as u64))
         })
         // 没有计数就等于「不知道摘了几个」：不能让调用方以为已经处理干净了。
-        .ok_or_else(|| anyhow!("strip-foreign-frames: 页面脚本未返回摘除计数"))
+        .ok_or_else(|| anyhow!("strip-foreign-frames: 页面脚本未返回摘除计数"))?;
+    Ok(StripFramesOutcome::Stripped(stripped))
 }

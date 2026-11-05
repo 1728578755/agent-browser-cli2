@@ -33,7 +33,12 @@ pub(crate) async fn exec(
             // 组合 wait 失败时脚本结果仍然有效（script_executed=true），
             // 但顶层 ok 必须体现组合结论 —— 旧实现固定 ok:true，调用方看到成功
             // 就继续下一步，而等待条件其实从未成立。
-            if value.get("wait_js_failed").and_then(Value::as_bool) == Some(true) {
+            // `ATB_RESULT_STRICT=off` 是给旧脚本的逃生口：明确要求「组合命令只看
+            // 脚本结果、不看 wait 结论」时才恢复旧行为。默认 warn / strict 都必须
+            // 把失败如实报成 ok:false。
+            if value.get("wait_js_failed").and_then(Value::as_bool) == Some(true)
+                && crate::settings::result_strict() != "off"
+            {
                 json!({
                     "ok": false,
                     "error": value
@@ -75,7 +80,7 @@ pub(crate) async fn exec(
     })
 }
 
-/// `GET /exec-result/:exec_id`（A1-09）：取回迟到结果。
+/// `GET /exec-result/:exec_id`：取回迟到结果。
 ///
 /// 命中即取走（消费语义，避免同一结果被反复读到误判页面状态）；未命中返回
 /// `found:false` —— 可能从未迟到，也可能已超过 5 分钟 TTL。响应里的
@@ -149,6 +154,11 @@ pub(crate) async fn exec_value(
             .and_then(Value::as_str)
             .map(str::to_string);
         let main = result.get("js_return").cloned().unwrap_or(Value::Null);
+        // 组合模式下 `result.js_return` 变成 `{result, wait}`（不再是脚本裸值）。
+        // 在 result 内也显式打标，读 result 的调用方（skill / CI）无需猜形状；
+        // 顶层 `combined_wait` 由 `exec()` 统一附加，两者语义一致。
+        result["combined_wait"] = json!(true);
+        result["wait_js"] = json!(wait_js);
         match wait_for_js_condition(
             state,
             session_key.as_deref(),
@@ -160,8 +170,28 @@ pub(crate) async fn exec_value(
         .await
         {
             Ok(wait) => {
-                // 保持旧版输出形状，避免破坏已有 skill 提示词：js_return = { result, wait }
+                // 组合模式的 `js_return` 是 `{result, wait}` 两段式形状
+                // （顶层另有 `combined_wait:true` 供调用方判别），与单脚本的裸值不同。
+                // 保持旧版输出形状，避免破坏已有 skill 提示词。
+                // `wait_for_js_condition*` 的超时/取消是 `Ok({ok:false,
+                // matched:false,...})`，不是 Err。旧实现只在这里塞 js_return，
+                // 从不检查 `wait.ok`，于是 `exec()` 出口的 `wait_js_failed` 检查
+                // 永远不成立 —— 等待超时被报成顶层 ok:true（W 类假成功）。
+                let wait_failed = wait.get("ok").and_then(Value::as_bool) == Some(false)
+                    || wait.get("matched").and_then(Value::as_bool) == Some(false);
+                let wait_error = wait
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
                 result["js_return"] = json!({ "result": main, "wait": wait });
+                if wait_failed {
+                    // 脚本已经执行过：结果必须保留，只把组合结论标成失败。
+                    result["script_executed"] = json!(true);
+                    result["wait_js_failed"] = json!(true);
+                    result["wait_error"] = json!(wait_error.unwrap_or_else(|| {
+                        "--wait-js 条件未成立（超时 / 取消 / 页面错误）".to_string()
+                    }));
+                }
             }
             Err(err) => {
                 // 脚本**已经执行过**，结果必须原样交回（调用方可能已经下单/提交），
@@ -216,7 +246,7 @@ pub(crate) async fn execute_page_js_with_target(
     execute_page_js_inner(state, script, selector, no_monitor, timeout, options, true).await
 }
 
-/// 与 [`execute_page_js_with_target`] 相同，但**注入完成就释放会话锁**。
+/// 与 [`execute_page_js_with_target`] 相，但**注入完成就释放会话锁**。
 ///
 /// 用于「一次注入、在页面里等很久」的等待类调用（`wait --selector/--text` 的
 /// MutationObserver 分支）：锁跟着等会把同一标签上的 read / click 全部堵死，
@@ -520,7 +550,7 @@ pub(crate) async fn execute_raw_js_inner(
         payload_value["allFrames"] = json!(true);
     }
     let payload = payload_value.to_string();
-    // 「迟到副作用」防护：派发前先看剩余预算。剩不到 50ms 时连一次往返都
+    //  「迟到副作用」防护：派发前先看剩余预算。剩不到 50ms 时连一次往返都
     // 跑不完，派发出去只会在页面里留下一个**没人等的副作用**（调用方早已超时离开，
     // 这里却还是把 click / POST 打出去了）。明确报「未派发、可重试」。
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -569,6 +599,13 @@ pub(crate) async fn execute_raw_js_inner(
             let acked = execs.acked.remove(&exec_id);
             execs.take(&exec_id);
             drop(execs);
+            // 请求预算已耗尽，页面里的脚本可能还在跑。daemon 不再等它，
+            // 但必须**尽力**告诉扩展释放这次 exec 占用的 CDP attach —— 否则只能
+            // 等扩展的 idle 定时器回收，期间其他扩展的 attach 会被挡。
+            // 只走已建立的 sender 直发：此刻串行锁可能还在手上（hold_lock），
+            // 再走 extension_control 会二次排队甚至自锁；发送失败只记 warning，
+            // 绝不改变下面的原始超时错误。
+            notify_exec_cancel(&sender, &exec_id, &tab_id, "exec_timeout");
             // 超时必须作为失败返回：旧行为返回 ok:true + 一段提示字符串，
             // 智能体会误判成功并继续下一步，页面状态已经错乱。
             let detail = if acked {
@@ -576,12 +613,12 @@ pub(crate) async fn execute_raw_js_inner(
             } else {
                 "no ACK, script may not have been delivered"
             };
-            // A1-09：错误里带上 exec_id 与查询指引。请求被 take 之后扩展若晚到
+            // 错误里带上 exec_id 与查询指引。请求被 take 之后扩展若晚到
             // 回包，结果会暂存 5 分钟，可凭 GET /exec-result/:id 查回，不再丢失。
             Err(anyhow!(
-                "exec_timeout: 页面在 {}s 内没有返回结果（{detail}）。exec_id={exec_id}；\
+                "exec_timeout: 页面在 {:.1}s 内没有返回结果（{detail}）。exec_id={exec_id}；\
                  结果可能已通过 GET /exec-result/{exec_id} 查询（5 分钟内有效）",
-                timeout.as_secs()
+                timeout.as_secs_f64()
             ))
         }
     }?;
@@ -590,6 +627,36 @@ pub(crate) async fn execute_raw_js_inner(
         session_key,
         tab_id,
     })
+}
+
+/// 超时 / 取消后向扩展发一条 `cancel` 帧（best-effort，不等回包）。
+///
+/// 为什么要绕开 `extension_control`：该函数会走 `execute_raw_js_on_tab`，需要
+/// 会话锁 + 一次完整往返；而调用点恰恰是「预算已耗尽、串行锁可能仍被本请求持有」，
+/// 再排队会自锁。这里直接复用扩展连接的 sender（无锁、无等待）。
+/// 发送失败只记 warning —— 原始超时错误必须原样返回。
+fn notify_exec_cancel(
+    sender: &mpsc::UnboundedSender<String>,
+    exec_id: &str,
+    tab_id: &str,
+    reason: &str,
+) {
+    let Ok(tab) = parse_tab_id(tab_id) else {
+        eprintln!("exec: tab_id 无法解析（{tab_id}），跳过 cancel 通知 exec_id={exec_id}");
+        return;
+    };
+    // id 刻意与 exec_id 区分：扩展对未知 cmd 会回一条错误，若复用 exec_id，
+    // 这条错误会被存成该次执行的「迟到结果」，污染 GET /exec-result/:exec_id。
+    let frame = json!({
+        "id": format!("{exec_id}#cancel"),
+        "cmd": "cancel",
+        "execId": exec_id,
+        "tabId": tab,
+        "reason": reason,
+    });
+    if sender.send(frame.to_string()).is_err() {
+        eprintln!("exec: cancel 帧发送失败（扩展连接已断开）exec_id={exec_id}");
+    }
 }
 
 /// 页面元素数（带 2 分钟缓存）：决定 scan 要不要走整页 HTML 序列化。
@@ -692,8 +759,23 @@ pub(crate) async fn wait_for_js_condition_with_target(
     cancel: Option<&AtomicBool>,
     target: &ExecTargetOptions,
 ) -> Result<Value> {
-    let timeout = timeout.max(0.0);
-    let interval_ms = (interval.max(0.05) * 1000.0).round().max(1.0) as u64;
+    // 这是 `wait` / `--wait-js` 共用的轮询循环，入口统一 clamp：
+    // - timeout 不得超过 `ATB_WAIT_MAX_TOTAL_SEC`（否则 Duration 会饱和成天量）；
+    // - interval 不得低于 `ATB_WAIT_MIN_INTERVAL_MS`（否则 interval=0 忙轮询）；
+    // - NaN / inf 一律回落到安全值。
+    let max_total = crate::settings::wait_max_total_sec();
+    let min_interval_sec = crate::settings::wait_min_interval_ms() as f64 / 1000.0;
+    let timeout = if timeout.is_finite() {
+        timeout.clamp(0.0, max_total)
+    } else {
+        0.0
+    };
+    let interval = if interval.is_finite() {
+        interval.max(min_interval_sec)
+    } else {
+        min_interval_sec
+    };
+    let interval_ms = (interval * 1000.0).round().max(1.0) as u64;
     let deadline = Instant::now() + Duration::from_millis((timeout * 1000.0).max(1.0) as u64);
     let mut injections: u64 = 0;
     let mut checks_total: u64 = 0;
@@ -741,7 +823,16 @@ pub(crate) async fn wait_for_js_condition_with_target(
             html::js_page_wait(),
             opts
         );
-        let exec_timeout = Duration::from_millis(slice_ms + 3_000);
+        // 注入超时绝不能越过外层 deadline。旧实现固定 `slice + 3s`，
+        // 最后一片会多等 3 秒，整条命令的总耗时突破 `--wait-timeout`。
+        // 每轮按**当下的**剩余预算重算一次（循环里可能已经花掉若干往返）。
+        let remaining_now = deadline.saturating_duration_since(Instant::now());
+        if remaining_now.is_zero() {
+            break;
+        }
+        let budget_ms = remaining_now.as_millis() as u64;
+        let exec_timeout =
+            Duration::from_millis((slice_ms.saturating_add(3_000)).min(budget_ms.max(1)));
         match execute_raw_js_releasing_lock(state, &script, exec_timeout, session_key, target).await
         {
             Ok(execution) => {

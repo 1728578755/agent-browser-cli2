@@ -9,9 +9,8 @@ Tab scanning · Page reading · JS execution · Click and fill · Screenshots / 
 <p>
   <a href="https://github.com/1728578755/atb-cli"><img src="https://img.shields.io/badge/CLI-atb-2ea44f" alt="CLI atb"></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-green" alt="License MIT"></a>
-  <a href="https://github.com/1728578755/atb-cli/actions/workflows/ci.yml"><img src="https://github.com/1728578755/atb-cli/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/1728578755/atb-cli"><img src="https://img.shields.io/badge/sys-win%2Fmac%2Flinux-0078D6?labelColor=0078D6&color=C0C0C0" alt="sys win/mac/linux"></a>
-  <a href="https://github.com/1728578755/atb-cli/releases"><img src="https://img.shields.io/badge/release-v0.7.1-orange" alt="release v0.7.1"></a>
+  <a href="https://github.com/1728578755/atb-cli/releases"><img src="https://img.shields.io/badge/release-v0.7.2-orange" alt="release v0.7.2"></a>
   <a href="https://github.com/1728578755/atb-cli/pulls"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen" alt="PRs welcome"></a>
 </p>
 
@@ -89,7 +88,7 @@ npm i -g @g1728578755/atb
 atb status
 ```
 
-Prebuilt binaries come from `optionalDependencies` per platform, so no Rust toolchain is required. The npm package exposes a single command name, `atb`.
+Prebuilt binaries come from `optionalDependencies` per platform, so no Rust toolchain is required.
 
 ### Build from source
 
@@ -105,7 +104,7 @@ Point `ATB_BIN` at the built binary to avoid mixing it with a global install.
 1. Download `chrome-extensions.zip` from the [latest Release](https://github.com/1728578755/atb-cli/releases/latest) and extract it into a fixed directory (the zip root is the extension itself, with `manifest.json` directly inside), or use `assets/atb_bridge` from the repo.
 2. Open `chrome://extensions` (Edge: `edge://extensions`), enable developer mode, click "Load unpacked", and select the directory that directly contains `manifest.json`.
 3. Keep at least one normal web page tab open — not only `about:blank` or `chrome://` pages.
-4. **This release requires extension 5.2.9.** After you replace the extension directory the daemon asks the extension to reload on the next handshake; if the daemon is not running, click "Reload" on the extension page yourself — copying files without reloading keeps the old code running in pages.
+4. **This release requires extension 5.3.0.** After you replace the extension directory the daemon asks the extension to reload on the next handshake; if the daemon is not running, click "Reload" on the extension page yourself — copying files without reloading keeps the old code running in pages.
 
 ### Verify
 
@@ -147,7 +146,22 @@ Resolution order: `--agent` → `ATB_AGENT` → terminal session id (`WT_SESSION
 
 ### Protocols
 
-Three versions must line up: the CLI ↔ daemon API protocol (currently **5**), the extension message protocol (currently **4**), and the extension file version (currently **5.2.9**). The `compatibility` field of `atb status` reports expected and actual values, with `fixes[]` when they disagree.
+Three versions must line up: the CLI ↔ daemon API protocol (currently **5**), the extension message protocol (currently **4**), and the extension file version (currently **5.3.0**). The `compatibility` field of `atb status` reports expected and actual values, with `fixes[]` when they disagree.
+
+### New in 0.7.2 / extension 5.3.0
+
+| Capability | Notes |
+| --- | --- |
+| Shadow DOM | `find` / `snapshot` / `read` recurse into open shadow roots; results carry `scope:"shadow"`, `host_selector` and `shadow_path`, and selectors are written as `host >>> relative-path`. Closed shadow roots are unreachable and reported via `shadow_closed_unreachable` |
+| PDF pagination | Image-based PDFs are sliced into pages at 14200pt and normalised by `dpr` first, so HiDPI pages are no longer doubled; the response carries `pages` / `width_pt` / `height_pt` |
+| `--max-height` | Now applies to the CDP path as well as the stitched fallback; overflow sets `truncated:true` |
+| Download filename | `download --filename` keeps only the basename and rejects `..`, separators and Windows reserved names; the response reports `filename_sanitized` |
+| Download cancel | `ATB_DOWNLOAD_CANCEL_ON_TIMEOUT=1` cancels on timeout, `ATB_DOWNLOAD_CANCEL_ERASE=1` also erases the record |
+| `broadcast` | Paths inside `--args` are made absolute; `--dry-run` produces a local plan |
+| `scrape` | Transport failures become `outcome_unknown` (exit code 4) and are not retried; `--concurrency` / `--batch` accept 1..=32 |
+| `tabs --limit 0` | Means "no truncation"; `tabs_count` stays the original total |
+| `logs` | Returns JSON: `{ok, lines[], path, truncated}` |
+| WS trust tiers | `ATB_WS_TRUST_MODE=compat\|whitelist\|token\|both`, default `compat`; use `both` on shared machines |
 
 ## Common workflows
 
@@ -292,14 +306,14 @@ atb logs --tail 100
 
 | Item | Value |
 | --- | --- |
-| CLI / daemon | `0.7.1` |
+| CLI / daemon | `0.7.2` |
 | CLI ↔ daemon API protocol | `5` |
 | Extension message protocol | `4` |
-| Extension file version | `5.2.9` |
+| Extension file version | `5.3.0` |
 | Minimum Chrome | `120` |
 
-- Current version: `0.7.1`
-- Companion extension: `5.2.9` (display name `ATB`)
+- Current version: `0.7.2`
+- Companion extension: `5.3.0` (display name `ATB`)
 
 ```bash
 atb status
@@ -334,12 +348,141 @@ atb install-skill                # real dir ~/.agents/skills/atb; symlinks into 
 
 Upgrading the CLI: `npm i -g @g1728578755/atb@latest`, then update the extension files as described in "Load the extension". Full history in [CHANGELOG.md](./CHANGELOG.md); an AI-driven upgrade flow in [AI_INSTALL.md](./AI_INSTALL.md).
 
+## Environment variables
+
+Every threshold, tier and switch can be tuned with `ATB_*`; the legacy `AGENT_BROWSER_CLI_*` prefix still works and the new name wins. The 56 user-facing variables are grouped below; the 9 test/CI-only ones are listed separately at the end.
+
+### Identity and location
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `ATB_AGENT` | terminal session id → `default` | Caller identity; decides the default target and `cleanup` scope |
+| `ATB_HOME` | `~/.atb` | Config directory; affects config and tokens only, not `~` expansion |
+| `ATB_BIN` | auto-resolved | Point at a self-built atb binary |
+| `ATB_EXIT0` | off | Restore the old always-zero `status` exit code; must be `1` / `true` |
+| `ATB_NO_DEBUGGER` | off | Disable `chrome.debugger` attach entirely |
+
+### Result semantics and timeouts
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `ATB_RESULT_STRICT` | `warn` | Strictness of composite commands: `off` / `warn` / `strict` |
+| `ATB_WAIT_MAX_TOTAL_SEC` | 600 | Total budget for one `wait` / `--wait-js` command (1–3600s) |
+| `ATB_WAIT_MIN_INTERVAL_MS` | 50 | Polling floor, prevents `interval=0` busy looping |
+| `ATB_HTTP_SLACK_SEC` | 10 | Extra HTTP timeout margin added on top of the business timeout |
+| `ATB_CHALLENGE_MAX_IFRAMES` | 8 | Iframes processed per challenge probe (1–64) |
+| `ATB_CHALLENGE_CLICK_TIMEOUT_SEC` | 8 | Hard cap for the whole coordinate-click chain |
+| `ATB_DIAG_DEPTH` | 3 | Root-cause entries kept in diagnostics (0–20) |
+
+### Files and artifacts
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `ATB_IO_OVERWRITE` | `backup` | When `--out` exists: `backup` / `force` / `ask` / `append` |
+| `ATB_IO_SANITIZE_FILENAME` | `strict` | Download filename sanitising; `compat` only warns |
+| `ATB_IO_MAX_OUTPUT_MB` | 50 | Per-file / buffer limit (1–512MB) |
+| `ATB_CAPTURE_MAX_PIXELS` | 80000000 | Pixel budget for stitched screenshots / image PDFs (1M–500M) |
+
+### Privacy and idempotency
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `ATB_IDEMPOTENCY_PERSIST` | `redacted` | Idempotency persistence: `redacted` (metadata only) / `full` (with body) / `off` |
+| `ATB_IDEMPOTENCY_FILE_MAX_MB` | 32 | Runtime cap for `idempotency.jsonl`, compacted in the background (1–512MB) |
+
+### Sessions and multi-agent
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `ATB_SESSION_ISOLATION` | `legacy` | In `strict` mode a named agent without a target fails with `target_lost` |
+| `ATB_MULTI_SCOPE` | `agent` | Default ownership scope for `--tab all`; `all` crosses agents |
+| `ATB_PREFERRED_MISS_LIMIT` | 3 | Consecutive misses before dropping the preferred default target |
+| `ATB_PREFERRED_MISS_TTL_SEC` | 120 | How long a preferred target may keep missing (1–86400s) |
+
+### Downloads
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `ATB_DOWNLOAD_AUTO_CLAIM` | `true` | Whether `download-wait` without `--id` auto-claims a recent download |
+| `ATB_DOWNLOAD_CLAIM_TTL_SEC` | 600 | Auto-claim "recently completed" window (30–900s) |
+| `ATB_DOWNLOAD_REGISTRY_DEPTH` | 8 | Download ids remembered per agent (1–64) |
+| `ATB_DOWNLOAD_WAIT_LIMIT` | 200 | Rows queried per `download-wait` round (1–500) |
+| `ATB_DOWNLOAD_CANCEL_ON_TIMEOUT` | off | Cancel the download when waiting times out |
+| `ATB_DOWNLOAD_CANCEL_ERASE` | off | Erase the download record after cancelling |
+
+### Security and network boundaries
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `ATB_WS_TRUST_MODE` | `compat` | WS trust tier: `compat` / `whitelist` / `token` / `both` |
+| `ATB_WS_OUTBOUND_MAX` | 512 | Downlink control channel capacity (8–65536) |
+| `ATB_FILE_HOSTS` | empty | Allowed `file://host/...` hosts, comma separated (localhost only by default) |
+| `ATB_HTTP_NO_PROXY` | `true` | Skip the system proxy for loopback addresses |
+
+### Network and monitoring
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `ATB_NET_LOG_ITEM_CHARS` | 8192 | Per-item url/body/headers character limit (256–1M) |
+| `ATB_NET_RULE_MAX_BYTES` | 2MiB | Per-rule body byte limit (1KiB–16MiB) |
+| `ATB_NET_RULE_MAX_RULES` | 64 | Rules per profile (1–500) |
+| `ATB_NET_MAX_ENTRIES` | 5000 | Network buffer limit (100–100000) |
+| `ATB_CONSOLE_MAX_ENTRIES` | 5000 | Console buffer limit (100–100000) |
+| `ATB_MONITOR_SAMPLES` | 50 | Samples kept by `--monitor` (1–500) |
+
+### Startup and locks
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `ATB_LOCK_RETRIES` | 40 | Lock-file retry count |
+| `ATB_LOCK_RETRY_MS` | 25 | Lock retry interval (ms) |
+| `ATB_PROC_CMD_TIMEOUT_MS` | 5000 | Timeout for process enumeration commands |
+| `ATB_LAUNCH_SETTLE_MS` | 800 | Wait for the window to settle after `launch` |
+| `ATB_LAUNCH_CLOSE_WAIT_MS` | 3000 | Max wait for a graceful browser close |
+| `ATB_LAUNCH_KILL_WAIT_MS` | 8000 | Max wait after a forced kill |
+| `ATB_LAUNCH_POLL_MS` | 500 | Process polling interval during launch |
+| `ATB_BROWSER_EXE` | auto-detected | Explicit browser executable path |
+
+### Challenges and HTML
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `ATB_HTML_KEEP_SCRIPTS` | off | Keep `<script>` during HTML optimisation (debugging) |
+| `ATB_CHALLENGE_SRCDOC_MIN_AREA` | 2000 | Minimum area (px²) for srcdoc / about: iframes to be considered |
+| `ATB_CHALLENGE_FOCUS_ON_NEED_HUMAN` | `true` | Bring the tab forward when a human is needed |
+| `ATB_EXTENSION_ID` | auto-detected | Identify the tool's own iframe when several extensions coexist |
+
+### Idle and concurrency
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `ATB_IDLE_TTL` | 300 | Idle seconds before exit when no extension is connected |
+| `ATB_MAX_RUNNING_JOBS` | 32 | Concurrent job cap; running jobs are aborted before hard eviction |
+| `ATB_REQUIRE_TAB` | off | Write commands without `--tab` exit 2 instead of using the default tab |
+| `ATB_FORCE_ASSUME_ATB` | `strict` | Identity rule for `restart --force` / `doctor --fix`; `loose` relaxes it |
+| `ATB_ALLOW_RELATIVE_OUT` | off | Keep the old relative-path behaviour for `broadcast` output |
+| `ATB_BROWSERS_SNAPSHOT_TTL_SEC` | 5 | Short snapshot TTL for `browsers`; `force_refresh` bypasses it |
+
+### Test / CI only (not for daily use)
+
+| Variable | Purpose |
+| --- | --- |
+| `ATB_E2E` / `ATB_E2E_BIN` / `ATB_E2E_AGENT` | Scenario selection, binary path and agent name for the e2e scripts |
+| `ATB_EXT_DIR` | Extension directory override (deploy/test scripts only) |
+| `ATB_PACKAGE_DIR` | npm package directory override |
+| `ATB_PLATFORM_OVERRIDE` | Force a platform key in `npm/bin/atb.js` |
+| `ATB_SKIP_POSTINSTALL_CHECK` | Skip the postinstall binary probe |
+| `ATB_ALLOW_VERSION_MISMATCH` | Allow a platform package version mismatch (warning only) |
+| `ATB_LOCK_ALLOW_MISSING_INTEGRITY` | Allow a missing `integrity` in the lock check (release window) |
+
 ## Security and privacy
 
 - Traffic between the CLI, daemon and extension stays on `127.0.0.1`; no telemetry, no remote code, no ad SDK. The pages you drive still talk to their own sites.
 - `trust-extension` is one-way: it constrains who may connect to the daemon, but the extension never verifies that the daemon it talks to is genuine.
 - The daemon exits after 300 idle seconds only when no extension is connected; `atb stop` alone frees 18765 while the extension keeps reconnecting, so disable the extension or close the browser to truly close the window.
-- The extension declares `<all_urls>`, `cookies`, `debugger`, `scripting`, `management`, `contentSettings` and similar permissions; page data is read only when you or the CLI issue a command; `management` is used for the extension's own reload and to name the extension that blocks the debugger (`blockingExtensions`).
+- The extension requests `cookies`, `tabs`, `tabGroups`, `activeTab`, `debugger`, `scripting`, `alarms`, `storage`, `declarativeNetRequest`, `webNavigation` and `downloads` (the manifest is authoritative); page data is read only when you or the CLI issue a command; `blockingExtensions` now reports only the blocking extension's id / origin, not its name.
+- WS trust defaults to `compat`: any local process can connect to 18765. On shared machines set a whitelist plus token and switch `ATB_WS_TRUST_MODE` to `both`, then `atb restart` — configuring without switching has no effect. `security.warning` in `atb status` reports the current tier.
+- Idempotency defaults to `ATB_IDEMPOTENCY_PERSIST=redacted` (key / scope / time / status, no response body); `daemon.log` is 0600 in a 0700 directory, and `ws-trust.json` gets the same treatment as `api-token`.
 - `challenge` interacts with the page's verification widget (click and wait) but does not guarantee passage; image reading and SMS/email checks still need a human.
 
 Report vulnerabilities per [SECURITY.md](./SECURITY.md); the local data inventory and deletion steps are in [PRIVACY.md](./PRIVACY.md). Both documents promise only what the code can guarantee and mark everything else as a boundary.
@@ -389,4 +532,4 @@ The browser control capability was extracted and adapted from the Web toolchain 
 
 ## License
 
-MIT License, Copyright (c) 2026 1728578755. Upstream attribution is in [NOTICE](./NOTICE).
+MIT License, Copyright (c) 2026 sleepinginsummer. See [LICENSE](./LICENSE).

@@ -3,7 +3,7 @@
 目标现象：
 
 ```text
-Agent Browser CLI Bridge
+ATB（atb_bridge）
 问题 已找到 1 个
 Service worker registration failed. Status code: 2
 ```
@@ -18,11 +18,11 @@ Service worker registration failed. Status code: 2
 `edge://extensions` 里本扩展卡片上显示的版本号，必须等于磁盘上 `manifest.json` 的版本。
 
 ```bash
-node -e "console.log(require('<扩展目录>/manifest.json').version)"
+node -e "console.log(require('<你的扩展目录>/manifest.json').version)"
 ```
 
 - **两边一致** → 浏览器跑的是当前代码，继续往下排查；
-- **卡片上更旧**（例如磁盘 5.0.2、卡片 5.0.1）→ 浏览器从没重载过，`Service worker registration failed`
+- **卡片上更旧**（例如磁盘 5.3.0、卡片 5.0.1）→ 浏览器从没重载过，`Service worker registration failed`
   多半是上一次替换文件时读到了半截 `background.js`。这种情况**改代码没用**，点一次「重新加载」即可。
 
 ### 为什么会出现「半截文件」
@@ -139,6 +139,10 @@ atb doctor        # 逐项自检
 atb logs --tail 100
 ```
 
+### 扩展 5.3.0 的行为变化
+
+- **open shadow DOM**：`find` / `snapshot` / `read` 现在会递归 open shadow root，返回项多出 `scope` / `host_selector` / `shadow_path` 字段。旧版扩展不返回这些字段，daemon 仍按旧形状解析，不会报错，但拿不到 shadow 内容——这才是「明明页面上有按钮却 `find` 不到」的常见原因，先确认扩展卡片是 5.3.0。
+- **exec 取消帧**：daemon 在命令超时/取消时会向扩展发 `{cmd:"cancel", execId}`。**旧 daemon 不认识这个帧也无所谓**：扩展只是不提前释放那次 CDP attach，等 idle 定时器回收即可，命令结果与错误语义都不受影响。反过来，5.3.0 扩展配旧 daemon 时也不会因为缺少 cancel 帧而失败。
 - `extension_not_connected`：端口不一致（默认 18765）→ `set-extension-port` 或改扩展 popup 里的端口；
 - `compatibility.ok:false` 且 `issues[].kind=extension_outdated`：浏览器里跑的是旧版扩展文件，
   覆盖目录后重新加载；

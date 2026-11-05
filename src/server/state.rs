@@ -1,5 +1,5 @@
 use super::*;
-use std::io::Write as _;
+use std::io::{BufRead as _, Seek as _, SeekFrom, Write as _};
 
 pub(crate) const HOST: &str = "127.0.0.1";
 pub(crate) const API_PORT: u16 = 18767;
@@ -29,7 +29,17 @@ pub(crate) const IDEMPOTENCY_CACHE_LIMIT: usize = 512;
 ///
 /// 超过这个时间说明首个请求要么卡住要么已经异常消失：调用方必须自己决定
 /// 「继续等」还是「换个检查方式」，绝不能在等待后静默重放一次未完成的执行。
+///
+/// 这只是**兜底值**。请求体里带 `timeout` 时，真正的上限由
+/// [`idempotency_inflight_wait`] 按「命令超时 + 余量」派生（夹到
+/// [`IDEMPOTENCY_INFLIGHT_WAIT_MIN`]..=[`IDEMPOTENCY_INFLIGHT_WAIT_MAX`]），
+/// 否则 600s 的动作在 90s 就被判超时，重发必然拿到 504。
 pub(crate) const IDEMPOTENCY_INFLIGHT_WAIT: Duration = Duration::from_secs(90);
+/// 在途等待下限：再短的重发也至少给 5s，避免「刚抢到占位就报超时」。
+pub(crate) const IDEMPOTENCY_INFLIGHT_WAIT_MIN: Duration = Duration::from_secs(5);
+/// 在途等待上限：与动作类命令的单条上限（600s）对齐，不能超过它，
+/// 否则等待者会比首个请求活得久，504 变成「等一个永远不会来的回包」。
+pub(crate) const IDEMPOTENCY_INFLIGHT_WAIT_MAX: Duration = Duration::from_secs(600);
 /// 幂等中间件愿意读进内存的请求体上限。
 ///
 /// 超过它 / 拿不到 `Content-Length`（流式上传）时**不读体**，直接把请求原样放行
@@ -136,7 +146,7 @@ pub struct AppState {
     /// 只用读写锁挡不住两个并发请求同时通过查重（A2-05）。
     pub(crate) profile_label_lock: Arc<Mutex<()>>,
     /// net 配置落盘的串行锁：落盘改成「后台线程读盘 → 合并当前 profile → 写回」，
-    /// 读-改-写之间必须有锁，否则两个 profile 的并发保存会互相覆盖。
+    /// 读-改-写之间必须有锁，否则两个 profile 的并发保存会互相覆盖（B-13）。
     pub(crate) net_persist_lock: Arc<Mutex<()>>,
     pub(crate) started_at: SystemTime,
     pub(crate) last_activity: Arc<Mutex<Instant>>,
@@ -147,7 +157,7 @@ pub struct AppState {
     /// 「最近一次有请求进来」的时刻：**每条**请求进入 `track_inflight` 时刷新，
     /// 计数回到 0 时清空。只给 `monitor_idle_shutdown` 判断「在途请求是不是已经卡死」用。
     ///
-    /// 语义刻意不是「最早一条在途请求的起点」：旧实现只在 0→1 时记起点，
+    /// 语义刻意不是「最早一条在途请求的起点」（A-02）：旧实现只在 0→1 时记起点，
     /// 那条请求离场后时间戳滞留，后续长请求会被提前判死；改成每条请求都刷新之后，
     /// 「`inflight > 0` 且这个时刻已经超过阈值」等价于「阈值时间内没有任何新请求进来」，
     /// 持续重叠的健康流量不会误触发。
@@ -184,9 +194,9 @@ pub struct AppState {
     /// idle / inflight-stall / job-stall 三条退出路径都是「先 cleanup 再
     /// `shutdown.send(())`」，而 `graceful_shutdown` 的闭包还会再调一次，
     /// `/shutdown` handler 也各调一次。没有幂等位就会向扩展重复下发
-    /// `debugClearAll`，把刚重连上的新连接的拦截规则一并清掉（A1-06）。
+    /// `debugClearAll`，把刚重连上的新连接的拦截规则一并清掉。
     pub(crate) cleanup_done: Arc<AtomicBool>,
-    /// 扩展最近一次自检上报的 `warnings`。
+    /// 扩展最近一次自检上报的 `warnings`（R-19）。
     ///
     /// 只在非空时覆盖：连上来的旧扩展不发这个字段，不能把已有告警清空。
     pub(crate) ext_warnings: Arc<Mutex<Vec<Value>>>,
@@ -199,7 +209,7 @@ pub struct AppState {
     /// A1：`Done` 条目同时追加到 `~/.atb/idempotency.jsonl`，daemon 重启时由
     /// `load_idempotency_cache` 读回（`Pending` 永不落盘）。
     pub(crate) idempotency: Arc<Mutex<HashMap<String, IdempotencySlot>>>,
-    /// 迟到结果暂存（A1-09）：`exec_id` -> (结果/错误, 登记时刻)。
+    /// 迟到结果暂存：`exec_id` -> (结果/错误, 登记时刻)。
     ///
     /// 扩展在 pending 已被超时路径 take 掉之后才回包的结果不再静默丢弃，
     /// 5 分钟内可凭 `GET /exec-result/:exec_id` 查回。
@@ -268,11 +278,16 @@ where
 /// - 先读请求体，按 `method + path + query + body` 算指纹（`DefaultHasher`，不引依赖），
 ///   指纹与调用方一起绑定到条目上；
 /// - 同一个 `{agent}|{key}` 但指纹不同 → 409 `idempotency_key_reused`，**不执行**；
-/// - 同 key 同指纹且首个请求仍在执行 → 等它的完成通知（≤90s），再回放结果；
+/// - 同 key 同指纹且首个请求仍在执行 → 等它的完成通知（上限见 [`idempotency_inflight_wait`]），
+///   再回放结果；
 /// - 只对 POST 生效：GET 无副作用，重复请求天然安全；
+/// - 只有「成功的」响应才进缓存：`status >= 400` 或 `ok:false` 视为本次
+///   未成功，释放占位且不缓存，用户修正条件后同 key 重发能真正重跑；
 /// - 幂等键只保证「响应丢失后重发」这一件事，不承担分布式锁的职责。
 ///
-/// 分层位置（见 `build_api_router`）：在 token 校验之内——未授权请求不进缓存。
+/// 分层位置（见 `build_api_router`）：`require_api_access` **内层**、`track_inflight`
+/// **内层**——即 token 校验之后才进本中间件，未授权请求既不会占位也不会被缓存
+/// （层序由 `.layer` 的添加顺序保证，见 boot.rs 注释）。
 pub(crate) async fn idempotency_replay(
     State(state): State<AppState>,
     request: Request<Body>,
@@ -313,16 +328,20 @@ pub(crate) async fn idempotency_replay(
     let query = parts.uri.query().unwrap_or("").to_string();
     let bytes = match axum::body::to_bytes(body, IDEMPOTENCY_BODY_LIMIT).await {
         Ok(bytes) => bytes,
+        // 以前是「以空体重建后放行」。体已经读坏了，放行等于把
+        // 「请求不完整」伪装成「无参数请求」——handler 会按缺省参数执行
+        // （例如动作类请求丢了 selector 就可能作用于默认标签），而且不缓存、
+        // 调用方看到的却是一次「正常」响应。改成结构化 400，明确「本次未执行」。
         Err(err) => {
-            // 体已经被这次带长度上限的读取消耗掉了，只能以空体重建后放行：
-            // 该路径只在「Content-Length 撒谎 / 传输中断」时出现，不缓存。
-            eprintln!("idempotency: 读取 {path} 的请求体失败，本次放行且不缓存: {err}");
-            return next.run(Request::from_parts(parts, Body::empty())).await;
+            eprintln!("idempotency: 读取 {path} 的请求体失败，本次拒绝执行: {err}");
+            return invalid_request_body(&path, &err);
         }
     };
     // dry-run 没有副作用：缓存它会让「先 dry-run、再真跑」被回放成 dry-run 的结果。
     // 空 body（无参数动作）没有可比较的指纹差异，同样不缓存。
     let cacheable = !bytes.is_empty() && !body_requests_dry_run(&bytes);
+    // 等待上限按请求体里的 `timeout` 派生（解析不出来才用 90s 兜底）。
+    let wait = idempotency_inflight_wait(&bytes);
     let request = Request::from_parts(parts, Body::from(bytes.clone()));
     if !cacheable {
         return next.run(request).await;
@@ -334,26 +353,39 @@ pub(crate) async fn idempotency_replay(
     // 只有这样才能在「同一个 key 换了请求体」时识别出冲突并回 409
     // （把指纹拼进键里就变成另一条缓存项，冲突会静默通过并再执行一次）。
     let cache_key = format!("{agent}|{key}");
-    let notify = match claim_idempotency_slot(&state, &cache_key, &scope, &key).await {
+    let notify = match claim_idempotency_slot(&state, &cache_key, &scope, &key, wait).await {
         SlotDecision::Replay(value) => return replay_response(value),
         SlotDecision::Conflict => return idempotency_conflict(&key, &scope),
-        SlotDecision::Timeout => return idempotency_inflight_timeout(&key),
+        SlotDecision::Timeout => return idempotency_inflight_timeout(&key, wait),
         SlotDecision::Lead(notify) => notify,
     };
+    // 占位一旦建立，就必须有人为它收尾。旧的实现只在「正常走到
+    // 函数末尾」时 `yield_slot`，一旦首个请求被取消（CLI 断开、超时、客户端中断）
+    // 或 handler panic，槽就永远停在 `Pending`——`Pending` 又刻意不过期，于是同 key
+    // 的重发全部等到超时 504，直到 daemon 重启。
+    // 这里挂一个 RAII 守卫：Drop（取消 / panic / 早退）时异步清掉仍是 Pending 的槽
+    // 并唤醒等待者；正常完成走 `yield_slot` 之后 `disarm`。
+    let mut guard = IdempotencySlotGuard::new(
+        state.clone(),
+        cache_key.clone(),
+        scope.clone(),
+        notify.clone(),
+    );
 
     let response = next.run(request).await;
     // 缓存要求能完整读出响应体并解析成 JSON；流式/超大响应原样放行，不缓存也不破坏。
     let (parts, body) = response.into_parts();
-    // 落盘记录里带上原状态码（回放本身仍按既有语义返回 200 + 标记，不改动）。
+    // 记录原状态码：回放时不再把它抹平成 200。
     let status = parts.status.as_u16();
     let bytes = match axum::body::to_bytes(body, 16 * 1024 * 1024).await {
         Ok(bytes) => bytes,
         // 响应体读不出来（客户端中断等）：无法缓存，也没有可重建的正文，
         // 只能返回空体 + 原状态头。该路径正常业务不会走到（响应都由 Json() 构造）。
         Err(err) => {
-            // 但**必须**解除占位：否则同 key 的等待者会一直等到 90s 超时。
+            // 但**必须**解除占位：否则同 key 的等待者会一直等到超时。
             eprintln!("idempotency: 读取 {path} 的响应体失败，本次不缓存且释放占位: {err}");
             yield_slot(&state, &cache_key, &scope, &notify, None, status).await;
+            guard.disarm();
             return Response::from_parts(parts, Body::empty());
         }
     };
@@ -363,7 +395,44 @@ pub(crate) async fn idempotency_replay(
         eprintln!("idempotency: {path} 的响应不是 JSON，无法回放，已释放占位");
     }
     yield_slot(&state, &cache_key, &scope, &notify, cached, status).await;
+    guard.disarm();
     Response::from_parts(parts, Body::from(bytes))
+}
+
+/// 在途等待上限：`min(600s, 请求体 timeout + 余量)`，夹到 5..=600s。
+///
+/// 旧实现固定 90s，而动作类命令允许 600s：首个请求还在正常执行时，第二次重发
+/// 就已经 504，正好落在「幂等键最该起作用」的窗口里。余量复用 CLI 的
+/// `ATB_HTTP_SLACK_SEC`，保证等待方不比执行为方先放弃。
+/// 解析不出 `timeout`（无参数请求 / 非 JSON）时回落 [`IDEMPOTENCY_INFLIGHT_WAIT`]。
+fn idempotency_inflight_wait(body: &[u8]) -> Duration {
+    let timeout = serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|value| value.get("timeout").and_then(Value::as_f64))
+        .filter(|value| value.is_finite() && *value > 0.0);
+    let Some(timeout) = timeout else {
+        return IDEMPOTENCY_INFLIGHT_WAIT;
+    };
+    let secs = (timeout + crate::settings::http_slack_sec()).clamp(
+        IDEMPOTENCY_INFLIGHT_WAIT_MIN.as_secs_f64(),
+        IDEMPOTENCY_INFLIGHT_WAIT_MAX.as_secs_f64(),
+    );
+    Duration::from_secs_f64(secs)
+}
+
+/// 读请求体失败：结构化 400，明确说明「本次未执行」。
+fn invalid_request_body(path: &str, err: &impl std::fmt::Display) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "ok": false,
+            "error": format!("读取 {path} 的请求体失败：{err}"),
+            "error_code": "invalid_request_body",
+            "executed": false,
+            "hint": "请求体与 Content-Length 不符或传输中断；本次未执行，可原样重发",
+        })),
+    )
+        .into_response()
 }
 
 /// 幂等指纹：`agent|method|path|query|body_hash`。
@@ -392,7 +461,7 @@ enum SlotDecision {
     Replay(Value),
     /// 同一个 key 换了请求（指纹不同）。
     Conflict,
-    /// 首个请求 90s 内没有完成。
+    /// 首个请求在等待上限内没有完成。
     Timeout,
 }
 
@@ -405,8 +474,9 @@ async fn claim_idempotency_slot(
     cache_key: &str,
     scope: &str,
     key: &str,
+    wait: Duration,
 ) -> SlotDecision {
-    let deadline = Instant::now() + IDEMPOTENCY_INFLIGHT_WAIT;
+    let deadline = Instant::now() + wait;
     loop {
         let now = Instant::now();
         let step = {
@@ -426,7 +496,7 @@ async fn claim_idempotency_slot(
                         },
                     );
                     // 注意：这是**自己的**占位，必须直接返回给调用方去执行，
-                    // 绝不能变成 `Step::Wait`——那会变成「等自己」，空转到 90s 超时。
+                    // 绝不能变成 `Step::Wait`——那会变成「等自己」，空转到等待上限。
                     Step::Other(SlotDecision::Lead(notify))
                 }
             }
@@ -437,7 +507,7 @@ async fn claim_idempotency_slot(
                 if now >= deadline {
                     eprintln!(
                         "idempotency: key={key} 的首个请求 {}s 内未完成，本次不再等待",
-                        IDEMPOTENCY_INFLIGHT_WAIT.as_secs()
+                        wait.as_secs()
                     );
                     return SlotDecision::Timeout;
                 }
@@ -487,7 +557,7 @@ fn lookup_idempotency_step(
 /// 兜底上限：超出时淘汰最旧的一项。
 ///
 /// **选中 `Pending` 时跳过**（要求）：那些条目有等待者在 `notify` 上挂着，
-/// 删掉它们会让等待者永远收不到完成通知，只能等到 90s 超时。
+/// 删掉它们会让等待者永远收不到完成通知，只能等到等待上限。
 fn evict_one_finished(cache: &mut HashMap<String, IdempotencySlot>) {
     if cache.len() < IDEMPOTENCY_CACHE_LIMIT {
         return;
@@ -513,6 +583,14 @@ fn evict_one_finished(cache: &mut HashMap<String, IdempotencySlot>) {
 /// `value` 为 `None` 表示响应不可回放（非 JSON / 读取失败）：此时移除占位，
 /// 等待者醒来后按「没有条目」重新抢一次——最坏情况是再执行一次，
 /// 但这比「永远等不到」和「拿一份无法解析的缓存」都更可诊断。
+///
+/// `status >= 400` 或 `ok:false` 的响应**不缓存**。旧实现把失败也写进
+/// `Done` 并以 HTTP 200 回放，用户修正条件后用同一个 key 重试只会拿到旧错误，
+/// 而且再也执行不了——幂等键于是变成了「永久失败锁」。
+///
+/// 序列化与文件追加都移出 tokio 锁。锁内只做 `insert` / `remove`；
+/// 行文本在加锁前生成、写盘在解锁后交给 `spawn_blocking`，否则每个 POST 的收尾
+/// 都会在临界区里做同步 IO，把整个 daemon 的请求串行化。
 async fn yield_slot(
     state: &AppState,
     cache_key: &str,
@@ -521,23 +599,22 @@ async fn yield_slot(
     value: Option<Value>,
     status: u16,
 ) {
+    // 失败响应一律按「本次没有可回放的结果」处理：释放占位，让重发真的重跑。
+    let value = value.filter(|value| cacheable_response(status, value));
+    // 落盘内容在锁外准备好（可能是一次大 JSON 序列化）。
+    let pending_line = value
+        .as_ref()
+        .and_then(|value| prepare_persist_line(cache_key, scope, status, value));
     {
         let mut cache = state.idempotency.lock().await;
         match value {
             Some(value) => {
-                let entry = IdempotencyEntry::Done(Instant::now(), value);
-                // A1：落盘与写内存在**同一把锁**内完成，顺序与内容天然一致；
-                // 落盘失败只打一行日志，绝不影响本次请求的响应。
-                if let Some(path) = idempotency_store_path() {
-                    let at = epoch_secs() as u64;
-                    append_idempotency_record(&path, cache_key, scope, at, status, &entry);
-                }
                 cache.insert(
                     cache_key.to_string(),
                     IdempotencySlot {
                         // 指纹保持首次执行时的那一份：同一 key 换 body 必须继续被拒。
                         scope: scope.to_string(),
-                        entry,
+                        entry: IdempotencyEntry::Done(Instant::now(), value),
                     },
                 );
             }
@@ -547,6 +624,85 @@ async fn yield_slot(
         }
     }
     notify.notify_waiters();
+    if let Some((path, line)) = pending_line {
+        persist_line_async(path, line);
+    }
+}
+
+/// 这条响应值不值得进幂等缓存。
+fn cacheable_response(status: u16, value: &Value) -> bool {
+    status < 400 && value.get("ok").and_then(Value::as_bool) != Some(false)
+}
+
+/// 幂等占位的 RAII 守卫。
+///
+/// 首个请求可能以三种方式离开而**走不到** `yield_slot`：客户端断开导致 handler
+/// future 被取消、handler panic、以及中间件自身在收尾前早退。`Pending` 刻意不过期
+/// （见 [`IdempotencyEntry`]），没有这道兜底就会把一个 key 永久钉在 504 上。
+///
+/// `Drop` 里不能 `.await`，所以只 `tokio::spawn` 一个清理任务；正常完成路径调用
+/// [`Self::disarm`] 避免「刚写好的 Done 被误删」。
+struct IdempotencySlotGuard {
+    state: AppState,
+    cache_key: String,
+    scope: String,
+    notify: Arc<Notify>,
+    armed: bool,
+}
+
+impl IdempotencySlotGuard {
+    fn new(state: AppState, cache_key: String, scope: String, notify: Arc<Notify>) -> Self {
+        Self {
+            state,
+            cache_key,
+            scope,
+            notify,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for IdempotencySlotGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let state = self.state.clone();
+        let cache_key = std::mem::take(&mut self.cache_key);
+        let scope = std::mem::take(&mut self.scope);
+        let notify = self.notify.clone();
+        // 进程正在关掉 runtime（`try_current` 失败）时没有可用的执行器：
+        // 直接放弃清理——daemon 都要退出了，内存表随之销毁，没有等待者会受影响。
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        handle.spawn(async move {
+            let removed = {
+                let mut cache = state.idempotency.lock().await;
+                // 只清「仍然是 Pending」的槽：若期间已被别的路径写成 Done，
+                // 删掉就把可回放结果弄丢了。
+                let still_pending = matches!(
+                    cache.get(&cache_key).map(|slot| &slot.entry),
+                    Some(IdempotencyEntry::Pending(_))
+                );
+                if still_pending {
+                    cache.remove(&cache_key);
+                }
+                still_pending
+            };
+            if removed {
+                eprintln!(
+                    "idempotency: 首个请求在完成前中断（{scope}），已释放 key={cache_key} 的占位"
+                );
+            }
+            // 无论删没删都要通知：等待者需要重新检查表，否则会干等到超时。
+            notify.notify_waiters();
+        });
+    }
 }
 
 /// 回放响应打上标记，调用方能区分「刚执行的结果」与「60s 内的重复请求」。
@@ -575,13 +731,13 @@ fn idempotency_conflict(key: &str, scope: &str) -> Response {
         .into_response()
 }
 
-/// 首个请求 90s 内没有完成：不给「未知是否执行」的假成功，让调用方自己决定下一步。
-fn idempotency_inflight_timeout(key: &str) -> Response {
+/// 首个请求在等待上限内没有完成：不给「未知是否执行」的假成功，让调用方自己决定下一步。
+fn idempotency_inflight_timeout(key: &str, wait: Duration) -> Response {
     (
         StatusCode::GATEWAY_TIMEOUT,
         Json(json!({
             "ok": false,
-            "error": format!("幂等键 {key} 的首个请求仍在执行，等待超过 {}s", IDEMPOTENCY_INFLIGHT_WAIT.as_secs()),
+            "error": format!("幂等键 {key} 的首个请求仍在执行，等待超过 {}s", wait.as_secs()),
             "error_code": "idempotency_in_flight_timeout",
             "retryable": true,
             "hint": "命令很可能已在执行：不要换新 key 盲目重发，先用页面状态或 job get 确认结果",
@@ -596,16 +752,43 @@ fn idempotency_inflight_timeout(key: &str) -> Response {
 // 内存缓存只能在**同一个** daemon 生命周期内回放：daemon 重启（空闲退出、升级、
 // 崩溃）后缓存清空，调用方带同一个 `--idempotency-key` 重发就会**二次执行**——
 // 正是幂等键要防的场景。这里把 `Done` 条目追加到 `idempotency.jsonl`，启动时读回。
+//
+// 落盘内容由 `ATB_IDEMPOTENCY_PERSIST` 控制，默认 `redacted` 只写
+// `{key, scope, at, status}`，**不写响应体**（响应体可能含页面正文 / httpOnly
+// Cookie / 网络响应，与「正文不落盘」的隐私承诺冲突）。`full` 才写 body，
+// `off` 完全不落盘。无 body 的行在加载时一律视为「不可回放」并跳过。
 // ---------------------------------------------------------------------------
 
 /// 落盘文件名：与 `api-token` 同目录（`config::user_config_dir()`）。
 const IDEMPOTENCY_STORE_FILE: &str = "idempotency.jsonl";
-/// 单条响应体的落盘上限：大响应（整页 HTML / base64）会迅速撑大文件，
-/// 而回放窗口只有 60s，写进磁盘的性价比很低。
+/// 单条响应体的落盘上限（仅 `full` 模式）：大响应（整页 HTML / base64）会迅速撑大
+/// 文件，而回放窗口只有 60s，写进磁盘的性价比很低。
 const IDEMPOTENCY_PERSIST_BODY_LIMIT: usize = 256 * 1024;
-/// 启动期压缩阈值：文件超过它就重写一次（只保留未过期条目）。
-/// 运行期不做 compaction——每条请求都去 stat/重写文件是纯浪费。
-const IDEMPOTENCY_STORE_COMPACT_BYTES: u64 = 4 * 1024 * 1024;
+/// 启动读取上限：按行流式读，最多读这么多字节 / 行。
+///
+/// 超过时从**文件尾部**读（保留最新记录）并截断：旧实现是 `read_to_string`，
+/// 一个被灌大的 `idempotency.jsonl` 会在启动瞬间整份读进内存，慢启动甚至 OOM。
+const IDEMPOTENCY_LOAD_MAX_BYTES: u64 = 8 * 1024 * 1024;
+const IDEMPOTENCY_LOAD_MAX_LINES: usize = 100_000;
+
+/// 文件当前的近似字节数：运行期只做 `fetch_add`，避免每条请求都 stat。
+static IDEMPOTENCY_FILE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// 追加串行化：多线程 `spawn_blocking` 同时写同一文件时保证「一行一次 write_all」。
+static IDEMPOTENCY_APPEND_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+
+/// 运行期文件上限：`ATB_IDEMPOTENCY_FILE_MAX_MB`（1..=512，默认 32）。
+///
+/// 超过就触发一次 compact（tmp + rename，只保留未过期条目），而不是让长驻
+/// daemon 把文件无限追加下去。
+fn idempotency_file_max_bytes() -> u64 {
+    crate::settings::env_usize_clamped("ATB_IDEMPOTENCY_FILE_MAX_MB", 32, 1, 512) as u64
+        * 1024
+        * 1024
+}
+
+fn idempotency_append_lock() -> &'static std::sync::Mutex<()> {
+    IDEMPOTENCY_APPEND_LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
 
 fn idempotency_store_path() -> Option<PathBuf> {
     config::user_config_dir()
@@ -613,66 +796,152 @@ fn idempotency_store_path() -> Option<PathBuf> {
         .map(|dir| dir.join(IDEMPOTENCY_STORE_FILE))
 }
 
+/// 旧版本（之前）的落盘行**没有 `status` 字段**。
+///
+/// `serde(default)` 会给 `u16` 补 0，而读取侧把 `0` 当坏行跳过——升级后一夜间
+/// 所有跨进程回放都静默失效。缺省值必须是 200（当时只有成功响应会落盘）。
+fn default_status_200() -> u16 {
+    200
+}
+
 /// 一条落盘记录。字段顺序即落盘顺序，方便人眼看。
 ///
-/// `body` 直接是响应 JSON（不是被转义的字符串）：加载时不需要二次解析。
+/// `body` 直接是响应 JSON（不是被转义的字符串）：加载时不需要二次解析；
+/// `redacted` 模式下**省略该字段**（`Option` + `skip_serializing_if`），
+/// 旧版本写下的带 body 的行仍能被本版本读回（`#[serde(default)]`）。
 /// `at` 用整秒（回放窗口 60s，亚秒精度没有意义），也让 TTL 判断保持纯整数运算。
 #[derive(Debug, Serialize, Deserialize)]
 struct PersistedIdempotency {
     key: String,
     scope: String,
     at: u64,
-    #[serde(default)]
+    /// 缺省 200 而不是 0：见 [`default_status_200`]。
+    #[serde(default = "default_status_200")]
     status: u16,
-    body: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    body: Option<Value>,
 }
 
-/// 追加一条记录；**只有 `Done` 会落盘**，返回是否真的写了一行。
-///
-/// `Pending` 绝不能落盘：进程在动作执行到一半时崩掉，磁盘上没有任何可信结果，
-/// 恢复出来只会把「不知道成没成」伪装成「执行成功」。
-fn append_idempotency_record(
-    path: &Path,
+/// 把一条记录序列化成一行（含换行）；`value` 为 `None` 时只写元数据。
+fn encode_idempotency_record(
     cache_key: &str,
     scope: &str,
     at: u64,
     status: u16,
-    entry: &IdempotencyEntry,
-) -> bool {
-    let IdempotencyEntry::Done(_, value) = entry else {
-        return false;
-    };
-    let body = match serde_json::to_string(value) {
-        Ok(body) => body,
-        Err(err) => {
-            eprintln!("idempotency: 响应序列化失败，跳过本次落盘（内存回放不受影响）: {err}");
-            return false;
-        }
-    };
-    if body.len() > IDEMPOTENCY_PERSIST_BODY_LIMIT {
-        // 大响应不落盘：回放窗口只有 60s，写进去只会让文件迅速膨胀。
-        return false;
-    }
+    value: Option<&Value>,
+) -> Option<String> {
     let record = PersistedIdempotency {
         key: cache_key.to_string(),
         scope: scope.to_string(),
         at,
         status,
-        body: value.clone(),
+        body: value.cloned(),
     };
-    let mut line = match serde_json::to_string(&record) {
-        Ok(line) => line,
+    match serde_json::to_string(&record) {
+        Ok(mut line) => {
+            line.push('\n');
+            Some(line)
+        }
         Err(err) => {
             eprintln!("idempotency: 落盘记录序列化失败，跳过本次落盘: {err}");
-            return false;
+            None
         }
-    };
-    line.push('\n');
+    }
+}
+
+/// 按落盘策略准备一行文本（这一步在锁**外**做，可能包含大 JSON 序列化）。
+///
+/// - `off`：不落盘；
+/// - `redacted`（默认）：只写 `{key, scope, at, status}`，不写响应体；
+/// - `full`：写完整响应，但超过 [`IDEMPOTENCY_PERSIST_BODY_LIMIT`] 的仍跳过。
+fn prepare_persist_line(
+    cache_key: &str,
+    scope: &str,
+    status: u16,
+    value: &Value,
+) -> Option<(PathBuf, String)> {
+    let mode = crate::settings::idempotency_persist();
+    if mode == "off" {
+        return None;
+    }
+    let include_body = mode == "full";
+    if include_body {
+        match serde_json::to_string(value) {
+            Ok(body) if body.len() <= IDEMPOTENCY_PERSIST_BODY_LIMIT => {}
+            Ok(body) => {
+                eprintln!(
+                    "idempotency: 响应体 {} 字节超过落盘上限，跳过本次落盘（内存回放不受影响）",
+                    body.len()
+                );
+                return None;
+            }
+            Err(err) => {
+                eprintln!("idempotency: 响应序列化失败，跳过本次落盘（内存回放不受影响）: {err}");
+                return None;
+            }
+        }
+    }
+    let path = idempotency_store_path()?;
+    let line = encode_idempotency_record(
+        cache_key,
+        scope,
+        epoch_secs() as u64,
+        status,
+        include_body.then_some(value),
+    )?;
+    Some((path, line))
+}
+
+/// 把准备阶段生成的行异步写盘：调用方已经释放幂等锁。
+fn persist_line_async(path: PathBuf, line: String) {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            // `spawn_blocking` 而不是直接写：追加 + 可能的 compact 都是同步文件 IO，
+            // 放在 worker 线程上会卡住其它请求。
+            handle.spawn_blocking(move || persist_line_blocking(&path, &line));
+        }
+        // 没有 runtime（单元测试 / 极端收尾路径）：退化成本线程写，语义一致。
+        Err(_) => persist_line_blocking(&path, &line),
+    }
+}
+
+/// 加锁追加一行；超过文件上限时顺手 compact 一次。
+fn persist_line_blocking(path: &Path, line: &str) {
+    // 进程内串行化：不使用 tokio 锁（这里已经在阻塞线程，且绝不能再 await）。
+    let _guard = idempotency_append_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !append_idempotency_line(path, line) {
+        return;
+    }
+    let written = line.len() as u64;
+    let total = IDEMPOTENCY_FILE_BYTES.fetch_add(written, Ordering::Relaxed) + written;
+    let limit = idempotency_file_max_bytes();
+    if total <= limit {
+        return;
+    }
+    let now = epoch_secs() as u64;
+    let records = read_persisted_idempotency(path, now);
+    if compact_idempotency_file(path, &records) {
+        let size = fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+        IDEMPOTENCY_FILE_BYTES.store(size, Ordering::Relaxed);
+        eprintln!(
+            "idempotency: {} 超过 {}MB，已压缩为 {} 条未过期记录",
+            path.display(),
+            limit / (1024 * 1024),
+            records.len()
+        );
+    }
+}
+
+/// 追加一行；目录不存在（首次运行）时建出来。
+///
+/// 追加而不是重写：并发请求各自写一行，不需要读-改-写，也就不会互相截断。
+/// 任何失败都只打日志（落盘是尽力而为的加速，不影响内存回放）。
+fn append_idempotency_line(path: &Path, line: &str) -> bool {
     if let Some(parent) = path.parent() {
-        // 尽力而为：目录不存在（首次运行）时建出来；失败留给 open 报错。
         let _ = fs::create_dir_all(parent);
     }
-    // 追加而不是重写：并发请求各自写一行，不需要读-改-写，也就不会互相截断。
     let mut file = match fs::OpenOptions::new().create(true).append(true).open(path) {
         Ok(file) => file,
         Err(err) => {
@@ -695,14 +964,54 @@ fn append_idempotency_record(
     }
 }
 
+/// 追加一条记录；**只有 `Done` 会落盘**，返回是否真的写了一行。
+///
+/// `Pending` 绝不能落盘：进程在动作执行到一半时崩掉，磁盘上没有任何可信结果，
+/// 恢复出来只会把「不知道成没成」伪装成「执行成功」。
+///
+/// 本函数始终写完整 body（不受 `ATB_IDEMPOTENCY_PERSIST` 影响），只给单测与
+/// 「显式回放」这类调用方用；生产路径走 [`prepare_persist_line`] + [`persist_line_async`]。
+#[cfg(test)]
+fn append_idempotency_record(
+    path: &Path,
+    cache_key: &str,
+    scope: &str,
+    at: u64,
+    status: u16,
+    entry: &IdempotencyEntry,
+) -> bool {
+    let IdempotencyEntry::Done(_, value) = entry else {
+        return false;
+    };
+    match serde_json::to_string(value) {
+        Ok(body) if body.len() > IDEMPOTENCY_PERSIST_BODY_LIMIT => {
+            // 大响应不落盘：回放窗口只有 60s，写进去只会让文件迅速膨胀。
+            return false;
+        }
+        Ok(_) => {}
+        Err(err) => {
+            eprintln!("idempotency: 响应序列化失败，跳过本次落盘（内存回放不受影响）: {err}");
+            return false;
+        }
+    }
+    let Some(line) = encode_idempotency_record(cache_key, scope, at, status, Some(value)) else {
+        return false;
+    };
+    append_idempotency_line(path, &line)
+}
+
 /// 读出仍然可用的条目（按落盘顺序，越靠后越新）。
 ///
 /// 坏行、指纹/键为空、时间戳非法的行一律 **跳过而不是 panic**：这个文件是
 /// 尽力而为的加速缓存，磁盘上出现半行（写一半被杀）完全正常，不能因此让 daemon
 /// 起不来。返回的条目已按 TTL 过滤，且不超过 `IDEMPOTENCY_CACHE_LIMIT` 条。
+///
+/// 改为 `BufReader` 逐行读取（原来 `read_to_string` 无上限）。文件超过
+/// [`IDEMPOTENCY_LOAD_MAX_BYTES`] 时从尾部对齐到行边界后再读，保留最新的记录；
+/// 行数也设上限。截断时记一条 warning，绝不因此失败。
 fn read_persisted_idempotency(path: &Path, now: u64) -> Vec<PersistedIdempotency> {
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
         Err(err) => {
             if err.kind() != std::io::ErrorKind::NotFound {
                 eprintln!(
@@ -713,9 +1022,49 @@ fn read_persisted_idempotency(path: &Path, now: u64) -> Vec<PersistedIdempotency
             return Vec::new();
         }
     };
+    let file_len = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+    let mut file = file;
+    let mut truncated = false;
+    if file_len > IDEMPOTENCY_LOAD_MAX_BYTES {
+        truncated = true;
+        let offset = file_len - IDEMPOTENCY_LOAD_MAX_BYTES;
+        if let Err(err) = file.seek(SeekFrom::Start(offset)) {
+            eprintln!(
+                "idempotency: 定位 {} 失败，按空缓存启动: {err}",
+                path.display()
+            );
+            return Vec::new();
+        }
+    }
+    let mut reader = std::io::BufReader::new(file);
+    if truncated {
+        // 从中间切入时第一行大概率是半行：丢掉它（丢弃前最多读一行）。
+        let mut discard = String::new();
+        let _ = reader.read_line(&mut discard);
+    }
     let mut kept: Vec<PersistedIdempotency> = Vec::new();
     let mut skipped = 0usize;
-    for line in text.lines() {
+    let mut read_bytes = 0u64;
+    let mut read_lines = 0usize;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(size) => read_bytes += size as u64,
+            Err(err) => {
+                eprintln!(
+                    "idempotency: 读取 {} 中断，已读到的部分照常使用: {err}",
+                    path.display()
+                );
+                break;
+            }
+        }
+        read_lines += 1;
+        if read_bytes > IDEMPOTENCY_LOAD_MAX_BYTES || read_lines > IDEMPOTENCY_LOAD_MAX_LINES {
+            truncated = true;
+            break;
+        }
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -743,6 +1092,14 @@ fn read_persisted_idempotency(path: &Path, now: u64) -> Vec<PersistedIdempotency
             Err(_) => skipped += 1,
         }
     }
+    if truncated {
+        eprintln!(
+            "idempotency: {} 超过启动读取上限（{}MB / {} 行），只加载了最新的部分记录",
+            path.display(),
+            IDEMPOTENCY_LOAD_MAX_BYTES / (1024 * 1024),
+            IDEMPOTENCY_LOAD_MAX_LINES
+        );
+    }
     if skipped > 0 {
         eprintln!("idempotency: 忽略 {skipped} 条过期或损坏的落盘记录");
     }
@@ -756,6 +1113,9 @@ fn read_persisted_idempotency(path: &Path, now: u64) -> Vec<PersistedIdempotency
 }
 
 /// 把落盘条目装回内存表。`at` 换算成 `Instant` 后，后续 TTL 语义与首次执行完全一致。
+///
+/// `redacted` 模式写下的行没有 `body`，**不可回放**——跳过并计数，
+/// 由调用方决定是否提示。内存缓存本身不受落盘策略影响。
 fn restore_idempotency_entries(
     cache: &mut HashMap<String, IdempotencySlot>,
     records: Vec<PersistedIdempotency>,
@@ -764,6 +1124,14 @@ fn restore_idempotency_entries(
     let now_instant = Instant::now();
     let mut restored = 0usize;
     for record in records {
+        let Some(body) = record.body else {
+            continue;
+        };
+        // 的兼容面：旧版本会把失败响应也落盘（`status` 记了真实码但回放恒 200）。
+        // 升级后不能把这些「错误缓存」继续恢复成可回放响应，否则修好条件也永远失败。
+        if !cacheable_response(record.status, &body) {
+            continue;
+        }
         // `is_fresh` 只看「登记时刻距今多久」，所以把 Instant 往前拨 age 秒即可，
         // 不需要额外字段；进程刚起来时 `checked_sub` 理论上不会失败（age < 60s），
         // 真失败就退化成「刚写入」，最多多活一个 TTL。
@@ -775,7 +1143,7 @@ fn restore_idempotency_entries(
             record.key,
             IdempotencySlot {
                 scope: record.scope,
-                entry: IdempotencyEntry::Done(at, record.body),
+                entry: IdempotencyEntry::Done(at, body),
             },
         );
         restored += 1;
@@ -783,7 +1151,7 @@ fn restore_idempotency_entries(
     restored
 }
 
-/// 启动期压缩：把仍然有效的条目重写成新文件（临时文件 + rename，避免半截文件）。
+/// 启动 / 运行期压缩：把仍然有效的条目重写成新文件（临时文件 + rename，避免半截文件）。
 fn compact_idempotency_file(path: &Path, records: &[PersistedIdempotency]) -> bool {
     let mut text = String::new();
     for record in records {
@@ -815,28 +1183,41 @@ pub(crate) async fn load_idempotency_cache(state: &AppState) {
     let Some(path) = idempotency_store_path() else {
         return;
     };
+    // 运行期阈值用它来判断是否需要压缩；同时把「当前文件大小」记进近似计数器，
+    // 后续追加只做 fetch_add（不再每条请求 stat）。
+    let limit = idempotency_file_max_bytes();
+    let file_len = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+    IDEMPOTENCY_FILE_BYTES.store(file_len, Ordering::Relaxed);
     let now = epoch_secs() as u64;
     let records = read_persisted_idempotency(&path, now);
-    // 启动期压缩：只在此处做一次，运行期不再碰文件长度。
-    let oversized = fs::metadata(&path)
-        .map(|meta| meta.len() > IDEMPOTENCY_STORE_COMPACT_BYTES)
-        .unwrap_or(false);
-    if oversized && compact_idempotency_file(&path, &records) {
+    if file_len > limit && compact_idempotency_file(&path, &records) {
+        let size = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        IDEMPOTENCY_FILE_BYTES.store(size, Ordering::Relaxed);
         eprintln!(
             "idempotency: {} 超过 {}MB，已压缩为 {} 条未过期记录",
             path.display(),
-            IDEMPOTENCY_STORE_COMPACT_BYTES / (1024 * 1024),
+            limit / (1024 * 1024),
             records.len()
         );
     }
     if records.is_empty() {
         return;
     }
-    let restored = {
+    let (restored, skipped_redacted) = {
         let mut cache = state.idempotency.lock().await;
-        restore_idempotency_entries(&mut cache, records, now)
+        let before = records.len();
+        let restored = restore_idempotency_entries(&mut cache, records, now);
+        (restored, before - restored)
     };
-    eprintln!("idempotency: 从磁盘恢复 {restored} 条可回放响应");
+    if restored > 0 {
+        eprintln!("idempotency: 从磁盘恢复 {restored} 条可回放响应");
+    }
+    if skipped_redacted > 0 {
+        // 默认 `redacted` 策略下这是常态，不是错误，只做一行说明。
+        eprintln!(
+            "idempotency: {skipped_redacted} 条落盘记录没有响应体（ATB_IDEMPOTENCY_PERSIST=redacted），仅作审计、不参与回放"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1011,6 +1392,141 @@ mod tests {
         let records = read_persisted_idempotency(&path, now);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].key, "agent|k3");
+        let _ = fs::remove_file(&path);
+    }
+
+    /// 失败响应（4xx/5xx 或 `ok:false`）不进缓存。
+    ///
+    /// 旧实现把它们也写进 `Done` 并恒以 200 回放：用户修好条件后同 key 重试，
+    /// 拿到的还是旧错误，而且永远不会再执行一次。
+    #[test]
+    fn failed_responses_are_never_cached() {
+        assert!(!cacheable_response(500, &json!({ "ok": true })));
+        assert!(!cacheable_response(404, &json!({ "ok": false })));
+        assert!(
+            !cacheable_response(200, &json!({ "ok": false })),
+            "HTTP 200 但业务失败同样不能回放"
+        );
+        assert!(cacheable_response(200, &json!({ "ok": true })));
+        // 没有 ok 字段的响应（老 handler）按成功处理，保持兼容。
+        assert!(cacheable_response(200, &json!({ "tab": "t1" })));
+    }
+
+    /// 在途等待上限从请求体的 `timeout` 派生，而不是固定 90s。
+    #[test]
+    fn inflight_wait_derives_from_body_timeout() {
+        // 解析不出 timeout：回落兜底值（90s）。
+        assert_eq!(idempotency_inflight_wait(b"{}"), IDEMPOTENCY_INFLIGHT_WAIT);
+        assert_eq!(
+            idempotency_inflight_wait(b"not json"),
+            IDEMPOTENCY_INFLIGHT_WAIT
+        );
+        assert_eq!(
+            idempotency_inflight_wait(b"{\"timeout\":-1}"),
+            IDEMPOTENCY_INFLIGHT_WAIT
+        );
+        // 300s 的动作必须给出明显长于 90s 的窗口，否则就是复现条件。
+        assert!(idempotency_inflight_wait(b"{\"timeout\":300}") > IDEMPOTENCY_INFLIGHT_WAIT);
+        // 上限夹到 600s：timeout=600 加上余量后仍不能超过它。
+        assert_eq!(
+            idempotency_inflight_wait(b"{\"timeout\":600}"),
+            IDEMPOTENCY_INFLIGHT_WAIT_MAX
+        );
+        // 极小值也被夹到下限之上（余量默认 10s，因此结果落在 5..=600）。
+        let tiny = idempotency_inflight_wait(b"{\"timeout\":0.001}");
+        assert!(tiny >= IDEMPOTENCY_INFLIGHT_WAIT_MIN && tiny <= IDEMPOTENCY_INFLIGHT_WAIT_MAX);
+    }
+
+    /// `redacted` 落盘行不含响应体，读回时视为不可回放。
+    ///
+    /// 元数据仍然被解析出来（供审计 / 压缩），但绝不能进内存缓存——
+    /// 否则「没有 body」会被当成「body 是 null」，回放出一个假响应。
+    #[test]
+    fn redacted_records_are_not_replayable() {
+        let path = temp_store_path("redacted");
+        let now = epoch_secs() as u64;
+        let line = encode_idempotency_record("agent|k9", "agent|POST|/open||ffff", now, 200, None)
+            .expect("元数据行必须能序列化");
+        assert!(
+            !line.contains("\"body\""),
+            "redacted 行不能出现 body 字段: {line}"
+        );
+        assert!(append_idempotency_line(&path, &line));
+
+        let records = read_persisted_idempotency(&path, now);
+        assert_eq!(records.len(), 1, "元数据行仍应被解析出来");
+        assert!(records[0].body.is_none());
+        let mut cache = HashMap::new();
+        assert_eq!(
+            restore_idempotency_entries(&mut cache, records, now),
+            0,
+            "没有 body 的记录不能回放"
+        );
+        assert!(cache.is_empty());
+        let _ = fs::remove_file(&path);
+    }
+
+    /// 没有 `status` 字段的旧行必须按 200 读回（缺省 0 会被当坏行丢掉，
+    /// 升级后跨进程回放会静默失效）。
+    #[test]
+    fn legacy_records_without_status_are_still_replayable() {
+        let path = temp_store_path("legacy-no-status");
+        let now = epoch_secs() as u64;
+        let legacy = format!(
+            "{{\"key\":\"agent|k12\",\"scope\":\"agent|POST|/open||abcd\",\"at\":{now},\"body\":{{\"ok\":true}}}}\n"
+        );
+        assert!(append_idempotency_line(&path, &legacy));
+        let records = read_persisted_idempotency(&path, now);
+        assert_eq!(records.len(), 1, "缺 status 的行不能被当成坏行丢弃");
+        assert_eq!(records[0].status, 200, "缺省必须是 200 而不是 0");
+        let mut cache = HashMap::new();
+        assert_eq!(restore_idempotency_entries(&mut cache, records, now), 1);
+        assert!(cache.contains_key("agent|k12"));
+        let _ = fs::remove_file(&path);
+    }
+
+    /// 显式写入的非法 status（0 / 999）仍然按坏行跳过——缺省值只补「没写」。
+    #[test]
+    fn explicit_bogus_status_is_still_skipped() {
+        let path = temp_store_path("bogus-status");
+        let now = epoch_secs() as u64;
+        for (key, status) in [("agent|k13", 0u16), ("agent|k14", 999u16)] {
+            let line = format!(
+                "{{\"key\":\"{key}\",\"scope\":\"agent|POST|/open||abcd\",\"at\":{now},\"status\":{status},\"body\":{{\"ok\":true}}}}\n"
+            );
+            assert!(append_idempotency_line(&path, &line));
+        }
+        let records = read_persisted_idempotency(&path, now);
+        assert!(records.is_empty(), "显式非法 status 必须被跳过");
+        let _ = fs::remove_file(&path);
+    }
+
+    /// 兼容性：旧版本写下的「带 body」行必须仍能回放（升级不丢缓存）。
+    #[test]
+    fn legacy_records_with_body_still_replay() {
+        let path = temp_store_path("legacy");
+        let now = epoch_secs() as u64;
+        let legacy = format!(
+            "{{\"key\":\"agent|k10\",\"scope\":\"agent|POST|/open||abcd\",\"at\":{now},\"status\":200,\"body\":{{\"ok\":true,\"n\":2}}}}\n"
+        );
+        assert!(append_idempotency_line(&path, &legacy));
+        // 的兼容面：旧版本把失败也落了盘，升级后不能再恢复成可回放响应。
+        let legacy_error = format!(
+            "{{\"key\":\"agent|k11\",\"scope\":\"agent|POST|/open||abcd\",\"at\":{now},\"status\":500,\"body\":{{\"ok\":false}}}}\n"
+        );
+        assert!(append_idempotency_line(&path, &legacy_error));
+        let records = read_persisted_idempotency(&path, now);
+        assert_eq!(records.len(), 2);
+        let mut cache = HashMap::new();
+        assert_eq!(restore_idempotency_entries(&mut cache, records, now), 1);
+        match cache.get("agent|k10").map(|slot| &slot.entry) {
+            Some(IdempotencyEntry::Done(_, value)) => assert_eq!(value["n"], json!(2)),
+            _ => panic!("旧格式的带 body 行必须能恢复成 Done"),
+        }
+        assert!(
+            !cache.contains_key("agent|k11"),
+            "旧的错误响应不能被恢复成可回放条目"
+        );
         let _ = fs::remove_file(&path);
     }
 

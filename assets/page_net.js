@@ -68,6 +68,41 @@ function __abcNet(opts) {
   const STATE_PREFIX = '__atb_net_';
   const LEGACY_STATE_KEY = '__abcNetState';
 
+  /// wrapper 归属标记。
+  ///
+  /// 旧实现只靠 `state.installed` 防重复包装：状态槽被 scrub / reset 删掉后，
+  /// 下一次注入会新建一份空 state，并把**已经是我们自己的 wrapper** 当成「原始 fetch」
+  /// 再包一层 —— 一次会话可以套出好几层，日志重复、reset 也还原不回去。
+  /// 现在给每个 wrapper 打两个不可枚举标记：
+  ///   * `__abcNetOwn === true`：这个函数是我们装的（与扩展侧 __abcOwn 同一思路）；
+  ///   * `[Symbol.for('atb.net.hookOwner')] = { state, key, originals }`：
+  ///     包装时用的状态与原始函数。槽位丢失后再注入时直接**接管**这份状态，
+  ///     既不二次包装，也不丢已捕获的日志/规则。
+  /// 非枚举是硬要求：`Object.keys(fn)` / `for...in` 不能多出痕迹。
+  const OWN_FETCH_MARK = '__abcNetOwn';
+  const OWNER_SYMBOL = (function () {
+    try { return Symbol.for('atb.net.hookOwner'); } catch (_) { return '__abcNetHookOwner'; }
+  })();
+
+  function markOwn(fn, info) {
+    if (typeof fn !== 'function') return fn;
+    try { Object.defineProperty(fn, OWN_FETCH_MARK, { value: true, enumerable: false, configurable: true }); } catch (_) {}
+    if (info) {
+      try { Object.defineProperty(fn, OWNER_SYMBOL, { value: info, enumerable: false, configurable: true }); } catch (_) {}
+    }
+    return fn;
+  }
+
+  function ownerOf(fn) {
+    if (typeof fn !== 'function') return null;
+    try { return fn[OWNER_SYMBOL] || null; } catch (_) { return null; }
+  }
+
+  function isOurWrapper(fn) {
+    if (typeof fn !== 'function') return false;
+    try { return fn[OWN_FETCH_MARK] === true; } catch (_) { return false; }
+  }
+
   let state = null;
   let stateKey = null;
 
@@ -143,6 +178,14 @@ function __abcNet(opts) {
       originals: null,
       maxLog: 200,
       captureBodies: false,
+      // 响应体捕获的超时（毫秒）：0 = 用默认值。由 hook 的 bodyTimeoutMs 覆盖。
+      bodyTimeoutMs: 0,
+      // 我们装上去的 wrapper 引用：reset 只还原**自己的**包装，
+      // 页面后来又替换过的 fetch 一律不碰。
+      fetchWrapper: null,
+      xhrOpenWrapper: null,
+      xhrSendWrapper: null,
+      xhrSetHeaderWrapper: null,
       xhrGuarded: false,
       xhrNative: null,
       xhrRestore: null
@@ -169,21 +212,26 @@ function __abcNet(opts) {
       try { delete window[LEGACY_STATE_KEY]; } catch (_) {}
     }
 
-    const key = STATE_PREFIX + randomToken();
+    const key = publishState(created, null);
+    return { key: key, state: created };
+  }
+
+  /// 把状态对象挂回 window（不可枚举、可配置）。reset / scrub 会把它删掉，
+  /// 接管旧 wrapper 时也要重新挂回去，否则下一次注入又找不到这份状态。
+  function publishState(target, preferredKey) {
+    const key = preferredKey || (STATE_PREFIX + randomToken());
     try {
       Object.defineProperty(window, key, {
-        value: created,
+        value: target,
         enumerable: false,
         configurable: true,
         writable: false
       });
     } catch (_) {
-      // 走到这里说明 defineProperty 在 window 上失败了（页面把名字占成了不可配置等），
-      // 退回普通赋值至少让本次注入能用；代价是这个槽位变成可枚举，下次注入认不出来
-      // （会重新建一份）。正常页面不会走到这里。
-      try { window[key] = created; } catch (_) {}
+      // 页面把这个名字占成了不可配置属性：退回普通赋值至少让本次注入能用。
+      try { window[key] = target; } catch (_) {}
     }
-    return { key: key, state: created };
+    return key;
   }
 
   /// 每次进入都确认 state 绑在 window 的真实槽位上：reset 会把槽位删掉，
@@ -506,7 +554,30 @@ function __abcNet(opts) {
   //   * 改写只动 status/headers 时透传 response.body 流，不缓冲；
   //   * 命中流式/超大响应且规则没给 body 时跳过改写，并标明原因。
   const MAX_CAPTURE_BYTES = 4 * 1024 * 1024;
+  // 捕获超时：旧实现只按 content-length 判「太大就跳过」，
+  // 没有长度的 chunked 响应于是走 clone().text() 一直等下去 —— 页面自己的 fetch
+  // 不受影响（捕获是旁路），但这条日志永远停在 body_capture_pending，body 永远补不上。
+  // 现在：超时硬上限 + reader.cancel()，并由 content-type 白名单挡掉二进制。
+  const DEFAULT_BODY_TIMEOUT_MS = 1500;
+  const MAX_BODY_TIMEOUT_MS = 10000;
+  const TEXT_LIKE_TYPES = [
+    'text/',
+    'application/json',
+    'application/x-www-form-urlencoded',
+    'application/javascript',
+    'application/xml',
+    'application/xhtml+xml',
+    'application/ld+json',
+    'application/problem+json',
+    'application/graphql'
+  ];
   const NULL_BODY_STATUS = new Set([101, 204, 205, 304]);
+
+  function captureTimeoutMs() {
+    const raw = Number(state.bodyTimeoutMs);
+    if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_BODY_TIMEOUT_MS;
+    return Math.min(MAX_BODY_TIMEOUT_MS, Math.max(100, Math.floor(raw)));
+  }
 
   function captureSkipReason(response) {
     let type = '';
@@ -515,20 +586,70 @@ function __abcNet(opts) {
     try { length = Number(response.headers.get('content-length') || 0); } catch (_) {}
     if (type.indexOf('text/event-stream') >= 0) return 'streaming_response (text/event-stream)';
     if (length > MAX_CAPTURE_BYTES) return 'content_length ' + length + ' > ' + MAX_CAPTURE_BYTES;
+    // 二进制（图片/字体/视频分片）不做捕获：clone().text() 会把它按 UTF-8 解码，
+    // 体积膨胀几十倍、内容全是乱码，对诊断没有价值。
+    // 没有 content-type 时不跳过（宁可多读一次），没有 content-length 也不再跳过 ——
+    // chunked 流由超时兜住。
+    if (type && !TEXT_LIKE_TYPES.some((prefix) => type.indexOf(prefix) >= 0)) {
+      return 'non_text_content_type (' + type.slice(0, 60) + ')';
+    }
     return null;
   }
 
-  /// 旁路读取响应体：不 await，读完把 preview 补进同一条日志。
+  /// 旁路读取响应体：不 await（页面自己的 fetch 不等这条），但**必须有上限**。
+  /// 优先用 reader 逐块读：超时能 cancel；`clone().text()` 没有取消入口，
+  /// 遇到永不结束的 chunked 流就是永久挂起。
   function captureBody(response, entry) {
+    const limitMs = captureTimeoutMs();
+    let reader = null;
+    let finished = false;
+    let timer = null;
+    function finish(fn) {
+      if (finished) return;
+      finished = true;
+      if (timer) { try { clearTimeout(timer); } catch (_) {} timer = null; }
+      try { fn(); } finally { try { delete entry.body_capture_pending; } catch (_) {} }
+    }
+    timer = setTimeout(function () {
+      try { if (reader) reader.cancel(); } catch (_) {}
+      finish(function () {
+        entry.body_capture_skipped = 'timeout ' + limitMs + 'ms';
+        entry.body_capture_error = 'body_capture_timeout';
+      });
+    }, limitMs);
     Promise.resolve().then(async function () {
+      let text = '';
       try {
-        const text = await response.clone().text();
+        const clone = response.clone();
+        if (!clone || typeof clone.text !== 'function') throw new Error('response.clone() unavailable');
+        if (clone.body && typeof clone.body.getReader === 'function'
+            && typeof TextDecoder !== 'undefined') {
+          reader = clone.body.getReader();
+          const decoder = new TextDecoder('utf-8');
+          let bytes = 0;
+          for (;;) {
+            const step = await reader.read();
+            if (step.done) break;
+            if (!step.value) continue;
+            bytes += step.value.byteLength || 0;
+            // 内容被压缩/服务端没给长度时，字节数只能边读边算：超了立刻停。
+            if (bytes > MAX_CAPTURE_BYTES) throw new Error('body > ' + MAX_CAPTURE_BYTES + ' bytes');
+            text += decoder.decode(step.value, { stream: true });
+          }
+          text += decoder.decode();
+        } else {
+          text = await clone.text();
+        }
+      } catch (e) {
+        finish(function () {
+          entry.body_capture_error = (e && e.message) || String(e);
+        });
+        return;
+      }
+      finish(function () {
         entry.response_preview = text.slice(0, 2000);
         entry.response_length = text.length;
-      } catch (e) {
-        entry.body_capture_error = (e && e.message) || String(e);
-      }
-      delete entry.body_capture_pending;
+      });
     });
   }
 
@@ -680,13 +801,60 @@ function __abcNet(opts) {
   }
 
   function install() {
-    if (state.installed) return state.originals;
-    const originals = {
-      fetch: window.fetch,
-      xhrOpen: XMLHttpRequest.prototype.open,
-      xhrSend: XMLHttpRequest.prototype.send,
-      xhrSetHeader: XMLHttpRequest.prototype.setRequestHeader
-    };
+    // ① 已经装好且仍在位：直接复用（重复 hook 的最常见路径）。
+    if (state.installed && state.fetchWrapper && window.fetch === state.fetchWrapper) {
+      return state.originals;
+    }
+    const currentFetch = window.fetch;
+
+    // ② 页面上的 fetch 带我们的标记，但不是当前 state 装的 —— 说明状态槽被
+    //    reset / scrub 删过，这是上一次注入留下的 wrapper。接管它的状态
+    //    （已捕获的日志、规则都还在），绝不二次包装。
+    if (isOurWrapper(currentFetch)) {
+      const owner = ownerOf(currentFetch);
+      if (owner && owner.state && owner.state !== state && looksLikeNetState(owner.state)) {
+        state = owner.state;
+        state.installed = true;
+        state.fetchWrapper = currentFetch;
+        if (owner.originals) state.originals = owner.originals;
+        // 槽位可能已被删掉：重新挂回去，让 scrub / 下一次注入仍能定位同一份状态。
+        stateKey = publishState(state, stateKey);
+        return state.originals;
+      }
+      if (owner && owner.state === state) {
+        state.installed = true;
+        state.fetchWrapper = currentFetch;
+        stateKey = publishState(state, stateKey);
+        return state.originals;
+      }
+      // 有标记但没有归属信息（极旧版本留下的 wrapper / 被页面整体复制过）：
+      // 不覆盖它，本次只做观测，并明确标注冲突。
+      state.installed = true;
+      state.fetchWrapper = currentFetch;
+      state.fetch_conflict = 'own_wrapper_without_owner';
+      if (!state.originals) state.originals = { fetch: currentFetch };
+      return state.originals;
+    }
+
+    // ③ 别家（页面自己）替换过 fetch，或我们在装好之后被页面顶掉：
+    //    当前值原样保存成 originals（reset 时还原它），包装在它**外面**。
+    //    旧实现无条件把 window.fetch 覆盖掉且 reset 直接写回旧引用，
+    //    既不认页面后来装的 wrapper，也可能把页面的 fetch 抹成未定义。
+    let originals = state.originals;
+    if (originals && typeof originals === 'object') {
+      if (originals.fetch !== currentFetch) {
+        // 记录「装好之后被页面换过」：回包给调用方，排查起来不用猜。
+        if (state.fetchWrapper) state.fetch_replaced = true;
+        originals.fetch = currentFetch;
+      }
+    } else {
+      originals = {
+        fetch: currentFetch,
+        xhrOpen: XMLHttpRequest.prototype.open,
+        xhrSend: XMLHttpRequest.prototype.send,
+        xhrSetHeader: XMLHttpRequest.prototype.setRequestHeader
+      };
+    }
     state.originals = originals;
     // XHR 的响应改写靠访问器接管，必须和 fetch 一起装上。
     guardXhr();
@@ -842,6 +1010,10 @@ function __abcNet(opts) {
         throw e;
       }
     }, originals.fetch);
+    // 打归属标记（不可枚举）：下一次注入据此认出「这是我们的 wrapper」，
+    // 状态槽丢失时接管而不是二次包装。
+    markOwn(fetchWrapper, { state: state, originals: originals });
+    state.fetchWrapper = fetchWrapper;
     window.fetch = fetchWrapper;
 
     XMLHttpRequest.prototype.open = disguise(function (method, url) {
@@ -1009,6 +1181,15 @@ function __abcNet(opts) {
       return originals.xhrSend.call(this, nextBody);
     }, originals.xhrSend);
 
+    // XHR 三个包装函数同样打标记并留引用：reset 只还原**自己的**包装，
+    // 页面后来替换过的方法一律不碰。
+    markOwn(XMLHttpRequest.prototype.open, { state: state, originals: originals });
+    markOwn(XMLHttpRequest.prototype.send, { state: state, originals: originals });
+    markOwn(XMLHttpRequest.prototype.setRequestHeader, { state: state, originals: originals });
+    state.xhrOpenWrapper = XMLHttpRequest.prototype.open;
+    state.xhrSendWrapper = XMLHttpRequest.prototype.send;
+    state.xhrSetHeaderWrapper = XMLHttpRequest.prototype.setRequestHeader;
+
     state.installed = true;
     return originals;
   }
@@ -1018,12 +1199,12 @@ function __abcNet(opts) {
     if (responseType === 'base64') {
       const buffer = await response.arrayBuffer();
       const bytes = new Uint8Array(buffer);
-      // E1-10：base64 相对原始字节的膨胀比是 4/3，要拿到 maxChars 个字符
+      // base64 相对原始字节的膨胀比是 4/3，要拿到 maxChars 个字符
       // 只需要读约 0.75 * maxChars 字节；先截断再编码，避免把整页 base64 塞进内存。
       const maxBytes = Math.max(1, Math.ceil(maxChars * 0.75));
       const limit = Math.min(bytes.length, maxBytes);
       // 分块 String.fromCharCode.apply：逐字节 `binary +=` 在大页面上是 O(n²) 字符串
-      // 拼接，会卡死页面（E1-10）。0x8000 一块也远低于各引擎的 apply 参数上限。
+      // 拼接，会卡死页面。0x8000 一块也远低于各引擎的 apply 参数上限。
       const CHUNK = 0x8000;
       let binary = '';
       for (let i = 0; i < limit; i += CHUNK) {
@@ -1038,7 +1219,7 @@ function __abcNet(opts) {
       };
     }
     // 文本分支：直接用 reader 流式读，累计到 maxChars 就 cancel，避免先
-    // `response.text()` 全量缓冲再 slice（E1-10）。没有 getReader 的老实现 /
+    // `response.text` 全量缓冲再 slice。没有 getReader 的老实现 /
     // 测试桩（mock Response）退回原来的 text() 路径。
     if (response.body && typeof response.body.getReader === 'function'
         && typeof TextDecoder !== 'undefined') {
@@ -1152,19 +1333,26 @@ function __abcNet(opts) {
   if (action === 'fetch') return doFetch();
 
   if (action === 'hook' || action === 'install') {
-    // 只有显式给出才覆盖。旧实现无条件 `= opts.captureBodies === true`，
+    // B-17：只有显式给出才覆盖。旧实现无条件 `= opts.captureBodies === true`，
     // 于是第二次 `net hook --persist`（只想刷新 matches）会把已持久化的
     // captureBodies 静默压回 false，用户看到的是「body 抓不到了」却找不到原因。
     // daemon 侧已改成「None 不下发」，页面侧必须同样把「未传」当成「保持现状」。
     if (opts.captureBodies !== undefined) {
       state.captureBodies = opts.captureBodies === true;
     }
-    // E1-11：maxLog 之前没有上限，`--max-log 100000000` 会把整个进程的内存吃光。
+    // 响应体捕获超时（毫秒）：未传 = 保持现状；<0/0/非数字 = 回默认。
+    if (opts.bodyTimeoutMs !== undefined) {
+      const raw = Math.floor(Number(opts.bodyTimeoutMs));
+      state.bodyTimeoutMs = Number.isFinite(raw) && raw > 0
+        ? Math.min(MAX_BODY_TIMEOUT_MS, Math.max(100, raw))
+        : 0;
+    }
+    // maxLog 之前没有上限，`--max-log 100000000` 会把整个进程的内存吃光。
     // 下限 10 保证还能看到最近的几条；上限 20000 条足够诊断，再大就该用 match 过滤。
     if (opts.maxLog > 0) {
       state.maxLog = Math.min(20000, Math.max(10, Math.floor(opts.maxLog)));
       // 收紧上限时立刻裁剪：否则要等下一条日志进来才生效，刚 `--max-log 10`
-      // 就 `net log` 仍会看到旧的几千条。
+      // 就 `net log` 仍会看到旧的几千条（P2-22b）。
       if (state.log.length > state.maxLog) state.log.splice(0, state.log.length - state.maxLog);
     }
     // 持久注入重放时会带上已有规则，避免刷新后规则丢失。
@@ -1182,6 +1370,12 @@ function __abcNet(opts) {
       action: 'hook',
       installed: true,
       capture_bodies: state.captureBodies,
+      // 捕获超时的实际生效值：调用方据此判断「body 没抓到」是不是超时导致。
+      body_timeout_ms: captureTimeoutMs(),
+      // 冲突/顶替如实回报：旧实现只在内部静默覆盖，用户永远查不到
+      // 「为什么 hook 装了却不生效」。
+      fetch_replaced_by_page: state.fetch_replaced || undefined,
+      fetch_conflict: state.fetch_conflict || undefined,
       // routes 历史上是「规则条数」（数字），保留给老调用方；
       // 新调用方（daemon 持久化后重放）必须读 routes_list —— 把数字当数组存下来，
       // 刷新后原样下发会被上面的 Array.isArray(opts.routes) 跳过，规则就静默丢了。
@@ -1253,11 +1447,33 @@ function __abcNet(opts) {
   }
 
   if (action === 'reset' || action === 'unhook') {
+    // 只还原**我们自己装的**包装：
+    // 旧实现无条件 `window.fetch = state.originals.fetch`，页面在自己包装之后
+    // 又把 fetch 换成别的东西时，reset 会把页面当前的实现整个抹掉 ——
+    // 站点自己的拦截器、SDK 的 fetch 补丁全没了，而且没有任何提示。
+    const skipped = [];
     if (state.originals) {
-      window.fetch = state.originals.fetch;
-      XMLHttpRequest.prototype.open = state.originals.xhrOpen;
-      XMLHttpRequest.prototype.send = state.originals.xhrSend;
-      XMLHttpRequest.prototype.setRequestHeader = state.originals.xhrSetHeader;
+      const currentFetch = window.fetch;
+      if (!state.fetchWrapper || currentFetch === state.fetchWrapper
+          || (isOurWrapper(currentFetch) && (ownerOf(currentFetch) || {}).state === state)) {
+        window.fetch = state.originals.fetch;
+      } else if (currentFetch !== state.originals.fetch) {
+        // 页面在我们之后换过 fetch：保留它，并如实回报「没还原」。
+        skipped.push('fetch');
+      }
+      const proto = XMLHttpRequest.prototype;
+      const restoreFn = (name, key, wrapperKey) => {
+        if (!state.originals[key]) return;
+        const current = proto[name];
+        if (state[wrapperKey] && current === state[wrapperKey]) {
+          proto[name] = state.originals[key];
+        } else if (current !== state.originals[key]) {
+          skipped.push('xhr.' + name);
+        }
+      };
+      restoreFn('open', 'xhrOpen', 'xhrOpenWrapper');
+      restoreFn('send', 'xhrSend', 'xhrSendWrapper');
+      restoreFn('setRequestHeader', 'xhrSetHeader', 'xhrSetHeaderWrapper');
     }
     // 还原被接管的访问器，避免 hook 关掉后页面还留着我们的 getter。
     if (state.xhrGuarded && state.xhrNative) {
@@ -1275,6 +1491,12 @@ function __abcNet(opts) {
     state.log = [];
     state.installed = false;
     state.originals = null;
+    state.fetchWrapper = null;
+    state.xhrOpenWrapper = null;
+    state.xhrSendWrapper = null;
+    state.xhrSetHeaderWrapper = null;
+    state.fetch_replaced = false;
+    state.fetch_conflict = null;
     // 状态槽位本身也是痕迹：不可枚举，但仍能被 getOwnPropertyNames 列出来，
     // 所以 reset 要连它一起删掉（configurable:true 就是为了这一步）。
     // 旧版本留下的 window.__abcNetState 也一并清掉。
@@ -1284,7 +1506,14 @@ function __abcNet(opts) {
     // 会回调到 pushLog，直接置 null 会让页面里的请求抛 TypeError。
     // stateKey 置 null 后，下一次进入 __abcNet 由 hydrate() 重建槽位。
     stateKey = null;
-    return { ok: true, action: 'reset', cleared_log: cleared, cleared: true };
+    return {
+      ok: true,
+      action: 'reset',
+      cleared_log: cleared,
+      cleared: true,
+      // 非空表示「这些包装不是我们的 / 已被页面换掉，没有还原」。
+      restore_skipped: skipped.length ? skipped : undefined
+    };
   }
 
   return { ok: false, error: 'net: 未知 action ' + action };

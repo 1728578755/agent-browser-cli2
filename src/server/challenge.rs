@@ -11,8 +11,17 @@ pub(crate) struct ChallengeRequest {
     /// 等多久还没过就把标签页带到前台交给人工（秒，0 表示不聚焦）
     #[serde(default)]
     pub(crate) focus_after: Option<f64>,
+    /// 兼容字段：旧调用方只认识 `focus`。含义按 action 分叉：
+    /// `action=focus` 时等价于 `focus_allow_system`，等待路径里等价于
+    /// `focus_on_need_human`。新调用方应使用下面两个显式字段。
     #[serde(default)]
     pub(crate) focus: Option<bool>,
+    /// `action=focus`：是否允许抢占系统焦点（false = 只切标签、不抢前台窗口）。
+    #[serde(default)]
+    pub(crate) focus_allow_system: Option<bool>,
+    /// 等待路径：页面判定 `need_human` 时是否把标签页带到前台。
+    #[serde(default)]
+    pub(crate) focus_on_need_human: Option<bool>,
     /// 等这么久仍被拦就整页 reload 一次再继续等（秒，0 = 不 reload）。
     /// 卡住的挑战页多半是服务端已经放了 cookie、页面脚本没走完，reload 一次比死等有效。
     #[serde(default)]
@@ -22,7 +31,7 @@ pub(crate) struct ChallengeRequest {
     pub(crate) point: Option<[f64; 2]>,
     /// 页面侧「判定清除需要稳定多久」（毫秒，`confirmMs`）。None 表示不下发，
     /// 保留页面默认 250ms。挑战页刚导航提交时是空白文档，确认窗口太短会把
-    /// 「还没渲染出挑战」当成「已经放行」。
+    /// 「还没渲染出挑战」当成「已经放行」（X-15）。
     #[serde(default)]
     pub(crate) confirm_ms: Option<f64>,
     pub(crate) switch_tab_id: Option<String>,
@@ -49,7 +58,9 @@ pub(crate) async fn stealth_page(
     Json(req): Json<StealthRequest>,
 ) -> Json<Value> {
     touch(&state).await;
-    Json(json_result(stealth_value(&state, req).await))
+    // 外层 ok 跟随内层结论。旧的 `json_result` 会把 `{ok:false}`
+    // 包成 `{"ok":true,"result":{"ok":false}}`，调用方只看顶层就以为成功。
+    Json(json_result_with_inner_ok(stealth_value(&state, req).await))
 }
 
 /// 审计 / 清理当前页面的自动化痕迹。
@@ -90,15 +101,6 @@ pub(crate) async fn stealth_value(state: &AppState, req: StealthRequest) -> Resu
         timeout,
     )
     .await?;
-    if payload.get("ok").and_then(Value::as_bool) == Some(false) {
-        return Err(anyhow!(
-            "stealth {normalized}: {}",
-            payload
-                .get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("页面脚本执行失败")
-        ));
-    }
     // 反检测能力一半在扩展里（page ops 走 ISOLATED world、角标默认关闭）。
     // 浏览器里还挂着旧扩展时，审计会显示"干净"但实际仍在写页面全局 —— 必须说清楚。
     let extension_version = {
@@ -158,9 +160,22 @@ pub(crate) async fn stealth_value(state: &AppState, req: StealthRequest) -> Resu
             ]),
         );
     }
-    // 页面脚本判定失败（scrub 仍有残留）时压成 ok:false，CLI 才会给非 0 退出码。
+    // 页面脚本判定失败（scrub 仍有残留 / audit 自身报错）时压成 ok:false，
+    // 由 `json_result_with_inner_ok` 反映到外层 ok，CLI 才会给非 0 退出码。
+    // 以前这里分成「进函数就 return Err」与「函数尾部再插一次 ok」两段，
+    // 尾部那段永远执行不到（死代码），注释还声称它负责收尾。现在只在尾部统一收尾。
     if payload.get("ok").and_then(Value::as_bool) == Some(false) {
         object.insert("ok".to_string(), json!(false));
+        if !object.contains_key("error") {
+            object.insert(
+                "error".to_string(),
+                payload
+                    .get("error")
+                    .cloned()
+                    .unwrap_or_else(|| json!("页面脚本执行失败")),
+            );
+        }
+        object.insert("error_code".to_string(), json!("stealth_page_failed"));
     }
     Ok(result)
 }
@@ -220,11 +235,17 @@ pub(crate) fn challenge_click_point(frame: &ChallengeFrame) -> (f64, f64) {
     }
 }
 
-/// 点组件里的一个局部坐标，鼠标轨迹**全部落在组件内部**。
+/// 点组件里的一个局部坐标：**起点在组件外，轨迹跨边界进入组件，落点全部在组件内**。
 ///
-/// 之前的轨迹从 `(x-90, y-60)` 起步，那已经在组件外面甚至窗口外（x 可能是负数），
-/// Turnstile 看到的是一次「凭空出现」的点击。这里改成从组件左内侧出发、水平靠近目标：
-/// 鼠标进入 iframe → 连续 mousemove → 按下 → 抬起，是它期望的那条路径。
+/// 起点必须在组件外：Turnstile 靠 mouseenter（跨越边界那一下）把勾选框从
+/// 「静态渲染」切到「可交互」。起点放在组件内部时，页面照样会进入「正在验证」，
+/// 但服务端始终不给结果 —— 这是实测出来的差别。因此中途点用负的局部坐标，
+/// 经仿射映射后落在组件左侧的页面空白处；**只有最终落点**做负数 clamp。
+///
+/// 之前的轨迹从 `(x-90, y-60)` 起步，那已经在组件外甚至窗口外，Turnstile 看到的
+/// 是一次「凭空出现」的点击；现在改为从组件左外侧水平滑到目标。
+///
+/// `diag` 只接收「落点被 clamp」这类几何异常，成功路径不产生噪音。
 pub(crate) async fn challenge_click_widget(
     state: &AppState,
     session_key: &str,
@@ -232,20 +253,18 @@ pub(crate) async fn challenge_click_widget(
     lx: f64,
     ly: f64,
     timeout: Duration,
+    diag: &mut Vec<Value>,
 ) -> Result<()> {
     // 轨迹与节奏照抄「人手靠近」的形态：
-    //   - 事件全部落在组件内部（从左侧 8% 处滑入），保证 mouseenter → mousemove 序列完整；
+    //   - 起点在组件外侧（负局部坐标），保证 mouseenter → mousemove 序列完整；
     //   - 相邻事件之间留 ~35ms 间隔。这不是「等某个条件」，而是 Turnstile 会统计
     //     mousemove 的时间分布：一次性把 move/press/release 全打出去（<10ms）时，
     //     点击会被接收（页面照样进「正在验证」），但服务端始终不给结果。
     //     实测同一台机器、同一个 profile：带节奏 1.4s 通过，不带节奏永远卡住。
-    // 起点必须在组件**外面**：Turnstile 靠 mouseenter（跨越边界那一下）把勾选框从
-    // 「静态渲染」切到「可交互」。起点直接放在组件内部时，页面照样会进入「正在验证」，
-    // 但服务端始终不给结果 —— 这是实测出来的差别。
-    // 负的局部坐标经仿射映射后落在组件左侧的页面空白处，正好用来产生这次跨越。
     let points = [(-40.0, ly + 2.0), (-18.0, ly + 1.0), (-6.0, ly), (lx, ly)];
     const MOUSE: &str = "Input.dispatchMouseEvent";
     for (px, py) in points {
+        // 中途点保留负坐标：负数正是「从组件外滑入」所需要的，不能 clamp。
         let (sx, sy) = frame.to_screen(px, py);
         // 扩展回 `{ok:false}` 时必须停下 —— 鼠标没进到组件里，
         // 后面的按下/抬起只会点在一个不存在的光标位置上。
@@ -260,7 +279,17 @@ pub(crate) async fn challenge_click_widget(
         .into_ok(MOUSE)?;
         tokio::time::sleep(EVENT_GAP).await;
     }
-    let (sx, sy) = frame.to_screen(lx, ly);
+    // 落点必须在组件内且非负：仿射变换后的负坐标只可能来自组件被滚出视口，
+    // 直接发给 CDP 在部分版本上会被静默拒绝。夹紧后写 diag，便于排查「点歪了」。
+    let ((sx, sy), clamped) = frame.to_screen_clamped(lx, ly);
+    if clamped {
+        diag.push(json!({
+            "step": "click-geometry",
+            "reason": "negative_point_clamped",
+            "local": { "x": lx.round(), "y": ly.round() },
+            "screen": { "x": sx.round(), "y": sy.round() },
+        }));
+    }
     // 按下 → 保持 → 抬起这段时间里，只有 press 的成败会影响要不要抬起：
     // 按下成功就**一定**要释放（页面停在 mousedown 会让组件永远收不到 click）。
     // Rust 没有异步 Drop，所以用「显式收尾」实现 finally 语义：
@@ -310,6 +339,145 @@ pub(crate) fn default_solve_ms(budget: Duration) -> u64 {
     budget.as_millis() as u64
 }
 
+/// 同一窗口的 `tabs switch` 冷却窗口。
+///
+/// 多标签并发求解时，每个求解器都无条件把标签切到前台会互相抢 active tab：
+/// A 切过去、B 又切走，两边的定时器都被 Chrome 节流，最后一起超时。
+/// 只对「同一窗口」做节流（不同窗口的点击/聚焦互不影响）。
+const ACTIVATE_COOLDOWN: Duration = Duration::from_millis(1500);
+
+fn activate_cooldowns() -> &'static std::sync::Mutex<HashMap<String, Instant>> {
+    static TABLE: OnceLock<std::sync::Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    TABLE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// 把目标标签切成 active 的**唯一入口**。
+///
+/// - `allow_focus=false` 且标签已经是 active：什么也不做（旧实现每次求解都切，
+///   把别人的 active tab 抢走）；
+/// - 同一窗口 1.5s 内只切一次，避免多个求解器来回抢；
+/// - 切失败 / 被冷却都写进 diag，调用方不用靠「等超时」反推原因。
+pub(crate) async fn challenge_activate_tab(
+    state: &AppState,
+    session_key: &str,
+    allow_focus: bool,
+    diag: &mut Vec<Value>,
+) {
+    let (window_key, is_active) = {
+        let driver = state.driver.read().await;
+        match driver.sessions.get(session_key) {
+            Some(session) => (
+                format!(
+                    "{}:{}:{}",
+                    session.browser_id,
+                    session.profile_id,
+                    session.info.window_id.unwrap_or(-1)
+                ),
+                session.info.active,
+            ),
+            None => (session_key.to_string(), false),
+        }
+    };
+    if !allow_focus && is_active {
+        return;
+    }
+    {
+        let table = activate_cooldowns();
+        let mut guard = match table.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if guard
+            .get(&window_key)
+            .is_some_and(|last| last.elapsed() < ACTIVATE_COOLDOWN)
+        {
+            diag.push(json!({
+                "step": "activate-tab",
+                "reason": "cooldown",
+                "window": window_key.clone(),
+            }));
+            return;
+        }
+        guard.insert(window_key.clone(), Instant::now());
+    }
+    if let Err(err) = extension_control(
+        state,
+        session_key,
+        "tabs",
+        json!({ "method": "switch", "allowFocus": allow_focus }),
+        DEFAULT_EXTENSION_CONTROL_TIMEOUT,
+    )
+    .await
+    {
+        push_diag_error(
+            diag,
+            "activate-tab",
+            "extension_error",
+            &err.to_string(),
+            None,
+        );
+    }
+}
+
+/// 硬拦截（"Sorry, you have been blocked"）的统一结论。
+///
+/// 进循环前的预探与等待循环里的每一片都用同一份构造，避免两处字段漂移。
+fn challenge_blocked_verdict(
+    session_key: &str,
+    action: &str,
+    status: Value,
+    focused: bool,
+    injections: u64,
+    started: Instant,
+) -> Value {
+    json!({
+        "tab_id": tab_id_of_session(session_key),
+        "session_key": session_key,
+        "action": action,
+        "ok": false,
+        "passed": false,
+        "cleared": false,
+        "blocked": true,
+        "via": "hard-block",
+        "focused": focused,
+        "injections": injections,
+        "elapsed_ms": started.elapsed().as_millis() as u64,
+        "error": "站点返回 Cloudflare 硬拦截页：当前出口 IP / 环境被判为风险，等待与点击都不会放行",
+        "error_code": "challenge_blocked",
+        "challenge": status,
+    })
+}
+
+/// 探测不可用时的统一结论（的「连续不可用」出口）。
+fn challenge_probe_failed_verdict(
+    session_key: &str,
+    action: &str,
+    status: Value,
+    focused: bool,
+    injections: u64,
+    started: Instant,
+    reason: &str,
+) -> Value {
+    json!({
+        "tab_id": tab_id_of_session(session_key),
+        "session_key": session_key,
+        "action": action,
+        "ok": false,
+        "passed": false,
+        "cleared": false,
+        // 没探测成功 = 不能认为放行，与「已确认仍在拦截」同一个安全侧。
+        "blocking": true,
+        "via": "probe-failed",
+        "focused": focused,
+        "injections": injections,
+        "elapsed_ms": started.elapsed().as_millis() as u64,
+        "status_error": reason,
+        "error_code": "challenge_probe_failed",
+        "error": "无法确认挑战状态（扩展未连接或页面禁止 eval）：自动判定不可信，请人工确认页面",
+        "challenge": status,
+    })
+}
+
 /// 单次页面 status 查询的超时上限（实际还会被本轮剩余预算再截断）。
 pub(crate) const STATUS_CALL_TIMEOUT: Duration = Duration::from_secs(8);
 /// 单次 CDP 几何定位的超时上限（同上，会被剩余预算截断）。
@@ -333,7 +501,7 @@ pub(crate) fn challenge_status_usable(status: &Value) -> bool {
         .unwrap_or(false)
 }
 
-/// 把调用方给的确认时长（毫秒）塞进页面 op 参数。
+/// 把调用方给的确认时长（毫秒）塞进页面 op 参数（X-15）。
 ///
 /// 键名固定为 `confirmMs`（`page_challenge.js` 读的就是它，缺省 250ms）。
 /// `None` 时**不下发**该键：老页面脚本不认识它，多一个字段只会增加载荷。
@@ -382,7 +550,7 @@ pub(crate) async fn challenge_auto_solve(
     let mut last_click_at: Option<Instant> = None;
     // 点击已被接收的证据：widget-removed / widget-replaced / verifying。
     let mut accepted: Option<&'static str> = None;
-    // 页面上可能同时有两个（甚至更多）验证码组件（站点自己的检测框 +
+    // B-07：页面上可能同时有两个（甚至更多）验证码组件（站点自己的检测框 +
     // 真正的组件，或两套验证码）。旧实现只点 `frames.first()`：第一个点不动时
     // 整段预算都耗在它身上，等大的第二个组件永远轮不到。
     // 现在按面积序（`challenge_frames` 已排好）取前 3 个可用组件**轮转**点击，
@@ -401,20 +569,9 @@ pub(crate) async fn challenge_auto_solve(
 
     // 后台标签的定时器会被 Chrome 节流到分钟级，Turnstile 的轮询/上报要跑几十秒。
     // 失败必须留诊断：切不过去时挑战永远等不到结果，而返回里只会出现
-    // 「click-no-effect / 超时」，调用方无从知道真正原因（C1-08）。
-    if let Err(err) = extension_control(
-        state,
-        session_key,
-        "tabs",
-        json!({ "method": "switch", "allowFocus": false }),
-        DEFAULT_EXTENSION_CONTROL_TIMEOUT,
-    )
-    .await
-    {
-        diag.push(
-            json!({ "step": "activate-tab", "error": humanize_extension_error(&err.to_string()) }),
-        );
-    }
+    // 「click-no-effect / 超时」，调用方无从知道真正原因。
+    // 只在「确实被拦且该 tab 非 active」时才切，且同窗口带冷却。
+    challenge_activate_tab(state, session_key, false, &mut diag).await;
 
     // 页面侧 status 要注入一段脚本、还要扫正文，比 CDP 查询重得多；
     // 120ms 一次会把挑战页的主线程占满，反而拖慢组件渲染（实测会导致整段
@@ -433,12 +590,11 @@ pub(crate) async fn challenge_auto_solve(
             break;
         }
         // ① 页面自己的元素结论优先：拿到 token 或已经离开挑战页，立刻收工。
+        // 以前同一条件连写两个 `if status_now`（第二个纯冗余），合并成一个。
         let status_now = Instant::now() >= next_status_at;
         if status_now {
             next_status_at = Instant::now() + STATUS_INTERVAL;
-        }
-        if status_now {
-            // C1-02：`Ok` 不等于「探测过」。`challenge_page_call` 在页面脚本没有返回值时
+            // `Ok` 不等于「探测过」。`challenge_page_call` 在页面脚本没有返回值时
             // 给 `Value::Null`，Null 上 token_ready / detected 全是 None（按 false 处理），
             // 于是 `token_ready || !detected` 恒真 —— 旧实现在这里直接返回 solved:true，
             // 把「扩展失联 / 空载荷」报成「挑战已通过」。守卫与 challenge_click.rs 的
@@ -499,15 +655,17 @@ pub(crate) async fn challenge_auto_solve(
         if left.is_zero() {
             break;
         }
+        // 几何探测的 deadline 就是整段求解的 deadline，不再单独给 6s
+        // 让每个 iframe 复用同一份额度。
         let (frames, mut frame_diag, frames_query_failed) =
-            challenge_frames(state, session_key, left.min(FRAME_CALL_TIMEOUT)).await;
+            challenge_frames(state, session_key, deadline).await;
         if !took_frame_diag {
             took_frame_diag = true;
             diag.append(&mut frame_diag);
         }
         // 状态机（组件签名 / 替换 / 尺寸 / 确认窗口）始终以**面积最大**的那个
         // 组件为准：它是主挑战，页面刷新、被摘掉、进入 verifying 都先体现在它身上。
-        // 点击目标则按 ⑥ 的轮转在前 3 个候选之间轮换。
+        // 点击目标则按 ⑥ 的轮转在前 3 个候选之间轮换（B-07）。
         let Some(frame) = frames.first() else {
             // 查询失败 ≠ 组件被摘掉。CDP 附不上 / DOM 域不可用时会返回空集合，
             // 那不是「点击被接收」的证据，只是这一轮没拿到几何 —— 继续下一轮，
@@ -529,7 +687,9 @@ pub(crate) async fn challenge_auto_solve(
             continue;
         };
         saw_widget = true;
-        let signature = frame.url.clone();
+        // 签名必须能识别「同 URL 重载的新组件」。只用 URL 时页面把 iframe
+        // 重新加载一次，签名不变，求解器会把它当成同一次点击的后续验证状态。
+        let signature = challenge_frame_signature(frame);
         let replaced = widget_url.as_ref().is_some_and(|prev| prev != &signature);
         if replaced {
             // 组件被换成新的实例。两种可能，必须分开处理：
@@ -577,7 +737,7 @@ pub(crate) async fn challenge_auto_solve(
             break;
         }
         // 剩余预算不够走完一次「滑入 → 按下 → 抬起」（4×35ms + 80ms 的节奏），
-        // 就别起这个头：半截的点击拿不到结论，只会把最后一点预算烧掉。
+        // 就别起这个头：半截的点击拿不到结论，只会把最后一点预算烧掉（B-07）。
         if left < Duration::from_millis(300) {
             break;
         }
@@ -597,6 +757,7 @@ pub(crate) async fn challenge_auto_solve(
             lx,
             ly,
             left.min(FRAME_CALL_TIMEOUT),
+            &mut diag,
         )
         .await
         {
@@ -629,7 +790,7 @@ pub(crate) async fn challenge_auto_solve(
         tokio::time::sleep(CHALLENGE_POLL).await;
     }
 
-    // 所有候选都没能推进时，把每个组件的失败原因交回去。只说
+    // B-07：所有候选都没能推进时，把每个组件的失败原因交回去。只说
     // 「点了没反应」的话，调用方无从知道是哪个组件、卡在哪一步。
     if accepted.is_none() && saw_widget {
         for label in &clicked_frames {
@@ -721,11 +882,14 @@ pub(crate) async fn challenge_value(state: &AppState, req: ChallengeRequest) -> 
     .await?;
 
     if action == "focus" {
+        // `focus` 在旧的单一字段里同时承担「允许抢系统焦点」与
+        // 「need_human 时自动聚焦」两种语义。这里只取前者，兼容旧字段。
+        let allow_focus = req.focus_allow_system.or(req.focus).unwrap_or(true);
         let reply = extension_control(
             state,
             &session_key,
             "tabs",
-            json!({ "method": "switch", "allowFocus": req.focus.unwrap_or(true) }),
+            json!({ "method": "switch", "allowFocus": allow_focus }),
             DEFAULT_EXTENSION_CONTROL_TIMEOUT,
         )
         .await?;
@@ -742,15 +906,26 @@ pub(crate) async fn challenge_value(state: &AppState, req: ChallengeRequest) -> 
     // 只想看「组件在哪、该点哪个坐标」：给智能体自己点的兜底入口。
     // 返回的所有数据都来自元素（CDP 的 pierce DOM / OOPIF 目标），不含任何猜测。
     if action == "widget" {
-        let timeout = Duration::from_secs(6);
-        let (frames, diag, frames_query_failed) =
-            challenge_frames(state, &session_key, timeout).await;
+        // 几何探测用独立 deadline（widget 是一次性查询，没有外层预算）。
+        let deadline = Instant::now() + FRAME_CALL_TIMEOUT;
+        let (frames, mut diag, frames_query_failed) =
+            challenge_frames(state, &session_key, deadline).await;
         let present = !frames.is_empty();
         let widgets: Vec<Value> = frames
             .iter()
             .map(|frame| {
                 let (lx, ly) = challenge_click_point(frame);
-                let (sx, sy) = frame.to_screen(lx, ly);
+                // 给出去的坐标同样要 clamp，否则调用方原样回传
+                // `--at` 时会把负值送进 CDP。
+                let ((sx, sy), clamped) = frame.to_screen_clamped(lx, ly);
+                if clamped {
+                    diag.push(json!({
+                        "step": "widget-geometry",
+                        "reason": "negative_point_clamped",
+                        "x": sx.round(),
+                        "y": sy.round(),
+                    }));
+                }
                 json!({
                     "url": frame.url.chars().take(160).collect::<String>(),
                     "rect": {
@@ -803,43 +978,51 @@ pub(crate) async fn challenge_value(state: &AppState, req: ChallengeRequest) -> 
     }
 
     // 一次性坐标点击：自动求解失败后，调用方拿着 `challenge widget` 给的坐标自己点。
-    if let Some([x, y]) = req.point {
-        // C1-06：这条路径以前把「点一次 + 复查一次」各自写死 8s，完全忽略 --timeout：
-        // 扩展挂死时一次坐标点击能耗 16s。现在按调用方给的超时两等分（点一次 / 查一次），
-        // 每次不小于 1s（低于一次 CDP 往返的实用下限）；没传 --timeout 时保持旧行为。
-        let per_call = match req
+    if let Some([raw_x, raw_y]) = req.point {
+        // 整条链（点一次 + 复查一次）共享同一个 deadline，硬上限取
+        // `--timeout` 与 ATB_CHALLENGE_CLICK_TIMEOUT_SEC（默认 8s）的较小值。
+        // 旧实现把「点」与「查」各给 total/2，但点击内部 6 次 CDP 各用这份额度，
+        // 扩展挂死时最坏 6×per_call + per_call，`--timeout` 完全失效。
+        let click_cap = Duration::from_secs_f64(crate::settings::challenge_click_timeout_sec());
+        let requested = req
             .timeout
             .filter(|value| value.is_finite() && *value > 0.0)
-        {
-            // 上限 300s：与 challenge 命令自己的 --timeout 量级一致，
-            // 也避免异常大的值把 Duration::from_secs_f64 顶到溢出。
-            Some(total) => Duration::from_secs_f64((total / 2.0).clamp(1.0, 300.0)),
-            None => Duration::from_secs(8),
-        };
-        let clicked = challenge_click_at(state, &session_key, x, y, per_call).await;
+            .map(|total| Duration::from_secs_f64(total.clamp(1.0, 300.0)));
+        let chain_budget = requested.unwrap_or(click_cap).min(click_cap);
+        let deadline = Instant::now() + chain_budget;
+        // 负坐标只可能来自调用方算错：clamp 到视口并如实标记，别把 -37 直接发给 CDP。
+        let x = raw_x.max(0.0);
+        let y = raw_y.max(0.0);
+        let at_clamped = x != raw_x || y != raw_y;
+        let clicked = challenge_click_at(state, &session_key, x, y, deadline).await;
         // 取证失败时不能给 `cleared:true`：`Value::Null` 上 token_ready 与 detected
         // 都是 false，旧的 `token_ready || !detected` 恒为真，于是「点了 + 探测不到」
         // 被说成「挑战已通过」（机制 B）。这里把探测结果单独收起来。
-        let (status, status_error, probed) = match challenge_page_call(
-            state,
-            &session_key,
-            with_confirm_ms(json!({ "action": "status" }), req.confirm_ms),
-            req.frame_id,
-            per_call,
-        )
-        .await
-        {
-            Ok(status) if challenge_status_usable(&status) => (status, Value::Null, true),
-            Ok(_) => (
-                Value::Null,
-                json!("页面 status 返回空载荷（扩展未注入或页面脚本未执行）"),
-                false,
-            ),
-            Err(err) => (
-                Value::Null,
-                json!(humanize_extension_error(&err.to_string())),
-                false,
-            ),
+        let status_budget = deadline.saturating_duration_since(Instant::now());
+        let (status, status_error, probed) = if status_budget < Duration::from_millis(50) {
+            (Value::Null, json!(CLICK_TIMEOUT_CODE), false)
+        } else {
+            match challenge_page_call(
+                state,
+                &session_key,
+                with_confirm_ms(json!({ "action": "status" }), req.confirm_ms),
+                req.frame_id,
+                status_budget.min(STATUS_CALL_TIMEOUT),
+            )
+            .await
+            {
+                Ok(status) if challenge_status_usable(&status) => (status, Value::Null, true),
+                Ok(_) => (
+                    Value::Null,
+                    json!("页面 status 返回空载荷（扩展未注入或页面脚本未执行）"),
+                    false,
+                ),
+                Err(err) => (
+                    Value::Null,
+                    json!(humanize_extension_error(&err.to_string())),
+                    false,
+                ),
+            }
         };
         let token_ready = status
             .get("token_ready")
@@ -849,12 +1032,20 @@ pub(crate) async fn challenge_value(state: &AppState, req: ChallengeRequest) -> 
             .get("detected")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let click_error = clicked
+            .as_ref()
+            .err()
+            .map(|err| humanize_extension_error(&err.to_string()));
+        let timed_out = click_error
+            .as_deref()
+            .is_some_and(|message| message.contains(CLICK_TIMEOUT_CODE));
         return Ok(json!({
             "tab_id": tab_id_of_session(&session_key),
             "session_key": session_key,
             "action": "click",
             "ok": clicked.is_ok(),
             "at": { "x": x, "y": y },
+            "at_clamped": at_clamped,
             "clicked": clicked.is_ok(),
             // 没有探测结论就没有 cleared：宁可说「不知道」，也不能说「已通过」。
             "cleared": probed && (token_ready || !detected),
@@ -864,40 +1055,8 @@ pub(crate) async fn challenge_value(state: &AppState, req: ChallengeRequest) -> 
             "token_ready": token_ready,
             "detected": detected,
             "challenge": status,
-            "error": clicked.err().map(|err| humanize_extension_error(&err.to_string())),
-        }));
-    }
-
-    // open 返回时新标签可能还停在 about:blank 或上一个文档上；
-    // 先等它落到真实页面，否则会把「空白页」误判成「没有验证码」。
-    let _ = wait_for_js_condition_with_target(
-        state,
-        Some(&session_key),
-        "return location.href !== 'about:blank' && document.readyState !== 'loading';",
-        2.5,
-        0.1,
-        None,
-        &ExecTargetOptions {
-            frame_id: req.frame_id,
-            ..Default::default()
-        },
-    )
-    .await;
-
-    if action == "status" || action == "detect" {
-        let challenge = challenge_page_call(
-            state,
-            &session_key,
-            with_confirm_ms(json!({ "action": "status" }), req.confirm_ms),
-            req.frame_id,
-            Duration::from_secs(10),
-        )
-        .await?;
-        return Ok(json!({
-            "tab_id": tab_id_of_session(&session_key),
-            "session_key": session_key,
-            "action": "status",
-            "challenge": challenge,
+            "error": click_error,
+            "error_code": if timed_out { json!(CLICK_TIMEOUT_CODE) } else { Value::Null },
         }));
     }
 
@@ -906,11 +1065,111 @@ pub(crate) async fn challenge_value(state: &AppState, req: ChallengeRequest) -> 
     // solve 是「主动求解 + 被动等待 + 转人工」的接力。
     let one_shot = action == "auto" || action == "click";
     let is_solve = action == "solve" || one_shot;
+    // 总预算先落到 deadline 上，**前置等待也算在里面**。旧实现先固定等
+    // 2.5s、再起算 deadline，等于让 `--timeout` 白送 2.5s。
     let timeout = req
         .timeout
         .unwrap_or(if action == "solve" { 120.0 } else { 30.0 })
         .clamp(0.5, 600.0);
+    let started = Instant::now();
+    let deadline = started + Duration::from_millis((timeout * 1000.0) as u64);
+
+    // open 返回时新标签可能还停在 about:blank 或上一个文档上；
+    // 先等它落到真实页面，否则会把「空白页」误判成「没有验证码」。
+    let pre_wait_budget = deadline
+        .saturating_duration_since(Instant::now())
+        .min(Duration::from_millis(2_500));
+    let mut pre_wait_error: Option<String> = None;
+    if pre_wait_budget >= Duration::from_millis(50) {
+        match wait_for_js_condition_with_target(
+            state,
+            Some(&session_key),
+            "return location.href !== 'about:blank' && document.readyState !== 'loading';",
+            pre_wait_budget.as_secs_f64(),
+            0.1,
+            None,
+            &ExecTargetOptions {
+                frame_id: req.frame_id,
+                ..Default::default()
+            },
+        )
+        .await
+        {
+            // 条件没命中是常态（页面还在加载），只有真正的执行错误才值得带回去。
+            Ok(value) => {
+                if value.get("matched").and_then(Value::as_bool) != Some(true) {
+                    if let Some(error) = value.get("error").and_then(Value::as_str) {
+                        pre_wait_error = Some(humanize_extension_error(error));
+                    }
+                }
+            }
+            Err(err) => pre_wait_error = Some(humanize_extension_error(&err.to_string())),
+        }
+    }
+
+    if action == "status" || action == "detect" {
+        // `Ok` 不等于「探测过」。空载荷 / 扩展失联时必须给
+        // `ok:false + challenge_probe_failed`，否则 `challenge status` 会把
+        // 「根本没探到」报成「识别成功、没有挑战」。
+        let left = deadline.saturating_duration_since(Instant::now());
+        let challenge = if left < Duration::from_millis(50) {
+            Err(anyhow!("challenge status: 探测预算已耗尽"))
+        } else {
+            challenge_page_call(
+                state,
+                &session_key,
+                with_confirm_ms(json!({ "action": "status" }), req.confirm_ms),
+                req.frame_id,
+                left.min(STATUS_CALL_TIMEOUT),
+            )
+            .await
+        };
+        return Ok(match challenge {
+            Ok(challenge) if challenge_status_usable(&challenge) => json!({
+                "tab_id": tab_id_of_session(&session_key),
+                "session_key": session_key,
+                "action": "status",
+                "ok": true,
+                "probed": true,
+                "status_usable": true,
+                "challenge": challenge,
+            }),
+            Ok(challenge) => json!({
+                "tab_id": tab_id_of_session(&session_key),
+                "session_key": session_key,
+                "action": "status",
+                "ok": false,
+                "probed": false,
+                "status_usable": false,
+                "error_code": "challenge_probe_failed",
+                "error": "页面 status 返回空载荷（扩展未注入或页面脚本未执行）：本次识别不可信",
+                "status_error": "页面 status 返回空载荷（扩展未注入或页面脚本未执行）",
+                "hint": "先确认扩展已连接（`atb status`），或页面是否禁止 eval；不要据此判定「没有挑战」",
+                "challenge": challenge,
+            }),
+            Err(err) => json!({
+                "tab_id": tab_id_of_session(&session_key),
+                "session_key": session_key,
+                "action": "status",
+                "ok": false,
+                "probed": false,
+                "status_usable": false,
+                "error_code": "challenge_probe_failed",
+                "error": humanize_extension_error(&err.to_string()),
+                "status_error": humanize_extension_error(&err.to_string()),
+                "hint": "先确认扩展已连接（`atb status`），或页面是否禁止 eval；不要据此判定「没有挑战」",
+                "challenge": Value::Null,
+            }),
+        });
+    }
+
     let focus_after = req.focus_after.unwrap_or(8.0).max(0.0);
+    // 等待路径只关心「need_human 时要不要自动聚焦」，不再复用
+    // `focus` 的「允许抢系统焦点」语义。旧字段继续兼容；env 提供全局缺省。
+    let focus_on_need_human = req
+        .focus_on_need_human
+        .or(req.focus)
+        .unwrap_or_else(|| crate::settings::env_bool("ATB_CHALLENGE_FOCUS_ON_NEED_HUMAN", true));
     // 页面侧的计时基准是「本次注入的起点」，而单片最多只等 4s：
     // 固定下发 8000ms 时 `at - started` 永远到不了，`need_human` 从不返回，
     // 需要人工的验证码页会一路静默等到总超时。所以要下发「还差多久」，每片递减。
@@ -921,14 +1180,12 @@ pub(crate) async fn challenge_value(state: &AppState, req: ChallengeRequest) -> 
         0
     };
     let interval_ms = (req.interval.unwrap_or(0.25).clamp(0.05, 5.0) * 1000.0) as u64;
-    let deadline = Instant::now() + Duration::from_millis((timeout * 1000.0) as u64);
-    let started = Instant::now();
     let mut injections: u64 = 0;
     let mut focused = false;
     let mut last = Value::Null;
     let reload_after = req.reload_after.unwrap_or(0.0).max(0.0);
     let mut reloaded = false;
-    // reload 失败的原因（C1-04）：与 `reloaded` 一起交回去，别让「没重载成功」
+    // reload 失败的原因：与 `reloaded` 一起交回去，别让「没重载成功」
     // 沉默地变成一个纯超时。
     let mut reload_error: Option<String> = None;
 
@@ -944,15 +1201,20 @@ pub(crate) async fn challenge_value(state: &AppState, req: ChallengeRequest) -> 
     // 这种最需要人工介入的场景反而被告知「挑战已通过」（机制 C）。
     let mut probe_error: Option<String> = None;
     {
-        match challenge_page_call(
-            state,
-            &session_key,
-            with_confirm_ms(json!({ "action": "status" }), req.confirm_ms),
-            req.frame_id,
-            Duration::from_secs(10),
-        )
-        .await
-        {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let pre_probe = if left < Duration::from_millis(50) {
+            Err(anyhow!("challenge: 预探预算已耗尽"))
+        } else {
+            challenge_page_call(
+                state,
+                &session_key,
+                with_confirm_ms(json!({ "action": "status" }), req.confirm_ms),
+                req.frame_id,
+                left.min(STATUS_CALL_TIMEOUT),
+            )
+            .await
+        };
+        match pre_probe {
             Ok(status) if challenge_status_usable(&status) => {
                 let blocking = status
                     .get("blocking")
@@ -972,7 +1234,7 @@ pub(crate) async fn challenge_value(state: &AppState, req: ChallengeRequest) -> 
                 // turnstile iframe，此刻 `detected:false, blocking:false,
                 // interactive:false` 是**假阴性**。旧实现据此直接返回
                 // `passed:true, via:"no-challenge"`，等于对一张正在变成拦截页的
-                // 文档说「没有挑战、已通过」。pending 时跳过所有早退，
+                // 文档说「没有挑战、已通过」（B-03）。pending 时跳过所有早退，
                 // 交给下面的 auto_solve / 等待循环继续观察。
                 let pending = status
                     .get("pending")
@@ -996,22 +1258,14 @@ pub(crate) async fn challenge_value(state: &AppState, req: ChallengeRequest) -> 
                     }));
                 }
                 if blocked {
-                    return Ok(json!({
-                        "tab_id": tab_id_of_session(&session_key),
-                        "session_key": session_key,
-                        "action": action.clone(),
-                        "ok": false,
-                        "passed": false,
-                        "cleared": false,
-                        "blocked": true,
-                        "via": "hard-block",
-                        "focused": focused,
-                        "injections": 0,
-                        "elapsed_ms": started.elapsed().as_millis() as u64,
-                        "error": "站点返回 Cloudflare 硬拦截页：当前出口 IP / 环境被判为风险，等待与点击都不会放行",
-                        "error_code": "challenge_blocked",
-                        "challenge": status,
-                    }));
+                    return Ok(challenge_blocked_verdict(
+                        &session_key,
+                        &action,
+                        status,
+                        focused,
+                        0,
+                        started,
+                    ));
                 }
                 last = status;
             }
@@ -1024,6 +1278,8 @@ pub(crate) async fn challenge_value(state: &AppState, req: ChallengeRequest) -> 
             }
         }
     }
+    // 前置等待的执行错误单独交回：它不是「页面还在加载」，
+    // 但也够不上判「挑战探测失败」，所以只作为诊断字段出现。
 
     // 主动求解：Turnstile 勾选框这类「必须真点」的挑战，光等永远不会过。
     // 预算取总超时的一半（上限 30s），剩下的时间留给被动等待兜底——
@@ -1037,24 +1293,15 @@ pub(crate) async fn challenge_value(state: &AppState, req: ChallengeRequest) -> 
         // 探测不到状态时，solve/auto/click 一律不给 passed:true：没有证据就没有结论，
         // 把原因交回去让人处理，比一句「已通过」有用得多。
         if let Some(reason) = probe_error.clone() {
-            return Ok(json!({
-                "tab_id": tab_id_of_session(&session_key),
-                "session_key": session_key,
-                "action": action.clone(),
-                "ok": false,
-                "passed": false,
-                "cleared": false,
-                // 没探测成功 = 不能认为放行，与「已确认仍在拦截」同一个安全侧。
-                "blocking": true,
-                "via": "probe-failed",
-                "focused": focused,
-                "injections": 0,
-                "elapsed_ms": started.elapsed().as_millis() as u64,
-                "status_error": reason,
-                "error_code": "challenge_probe_failed",
-                "error": "无法确认挑战状态（扩展未连接或页面禁止 eval）：自动判定不可信，请人工确认页面",
-                "challenge": last,
-            }));
+            return Ok(challenge_probe_failed_verdict(
+                &session_key,
+                &action,
+                last,
+                focused,
+                0,
+                started,
+                &reason,
+            ));
         }
         let remaining_total = deadline.saturating_duration_since(Instant::now());
         let budget = if one_shot {
@@ -1094,17 +1341,22 @@ pub(crate) async fn challenge_value(state: &AppState, req: ChallengeRequest) -> 
     // 「已经拦了多久」只能由 daemon 记：页面脚本刻意不写 `window.*`（那会留下自动化
     // 指纹，实测注入过之后 CF 会卡在「正在验证」），所以 `stalledMs` 必须由这里下发。
     // 旧实现从不传，页面侧 `stalled` 恒 false，`turnstile_not_rendered` 的快速失败
-    // 与归因整条链路都是死代码，`--challenge-timeout` 只能被完整耗光。
+    // 与归因整条链路都是死代码，`--challenge-timeout` 只能被完整耗光（B-05）。
     let mut first_blocking_at: Option<Instant> = None;
+    // 连续拿不到可用载荷的次数。偶尔一次扩展抖动不该收手，
+    // 但连续两次说明探测通道确实坏了，继续等只会把 --timeout 耗完。
+    let mut unusable_slices: u32 = 0;
+    let mut activation_diag: Vec<Value> = Vec::new();
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        // 只用 deadline 判终止：每片至少 1ms、最多 4s，剩余时间必然收敛。
-        // 旧实现写死 `injections >= 80`（= 最多 320s），把 --timeout 600 静默截断成 320s，
-        // 而且超时后既不说明原因也不报错。injections 现在只做诊断计数。
+        // 只用 deadline 判终止：每片至少 1ms、最多 3.5s（再留 0.5s 给 CDP 回包），
+        // 剩余时间必然收敛。旧实现写死 `injections >= 80`（= 最多 320s），
+        // 把 --timeout 600 静默截断成 320s，而且超时后既不说明原因也不报错。
         if remaining.is_zero() {
             break;
         }
-        let slice_ms = (remaining.as_millis() as u64).clamp(1, 4_000);
+        // 给页面侧留一点余量：`timeoutMs` 用满 4s 时，回包正好撞上 CDP 超时。
+        let slice_ms = (remaining.as_millis() as u64).clamp(1, 3_500);
         injections += 1;
         let opts = with_confirm_ms(
             json!({
@@ -1128,7 +1380,7 @@ pub(crate) async fn challenge_value(state: &AppState, req: ChallengeRequest) -> 
                         .max(1)
                 },
             }),
-            // 确认窗口由调用方决定；None 不下发，页面沿用默认 250ms。
+            // X-15：确认窗口由调用方决定；None 不下发，页面沿用默认 250ms。
             req.confirm_ms,
         );
         match challenge_page_call(
@@ -1136,21 +1388,13 @@ pub(crate) async fn challenge_value(state: &AppState, req: ChallengeRequest) -> 
             &session_key,
             opts,
             req.frame_id,
-            Duration::from_millis(slice_ms + 4_000),
+            // 单次调用超时按 deadline 截断，绝不再加固定 4s 尾巴。
+            remaining.min(Duration::from_secs(4)),
         )
         .await
         {
             Ok(payload) => {
-                // 维护「从什么时候开始被拦」，供下一轮 `stalledMs` 使用。
-                // 清除条件用 `!detected`：只靠 `!blocking` 会把「组件还在但能浏览」
-                // 当成已恢复，时间戳被反复重置，stalled 永远攒不够。
-                let flagged =
-                    |key: &str| payload.get(key).and_then(Value::as_bool).unwrap_or(false);
-                if flagged("blocking") || flagged("interactive") {
-                    first_blocking_at.get_or_insert_with(Instant::now);
-                } else if !flagged("detected") {
-                    first_blocking_at = None;
-                }
+                // 清除结论优先：这是页面脚本明确给出的成功信号，不依赖 usable 守卫。
                 if payload.get("cleared").and_then(Value::as_bool) == Some(true) {
                     let via = payload
                         .get("via")
@@ -1172,27 +1416,70 @@ pub(crate) async fn challenge_value(state: &AppState, req: ChallengeRequest) -> 
                     // wait 的目标是离开挑战页。旧实现只在 `is_solve` 时写 `passed`，
                     // 而 CLI 对 `action=="wait"` 只读 `/result/passed`、不回落
                     // `/result/cleared`，于是**成功清除被判成 challenge_timeout**
-                    // （退出码 1）——功能是好的，报告说它坏了。
+                    // （退出码 1）——功能是好的，报告说它坏了（B-25）。
                     result["passed"] = json!(true);
                     result["via"] = json!(via);
                     if let Some(reason) = &reload_error {
                         // 重载失败但挑战后来还是过了：如实带上，便于排查「为什么慢」。
                         result["reload_error"] = json!(reason);
                     }
+                    if !activation_diag.is_empty() {
+                        result["diag"] = json!(activation_diag);
+                    }
                     return Ok(result);
+                }
+                // 每一片都要重新确认「这次到底探到没有」。空载荷上
+                // `detected` 恒 false，旧实现会把 hard-block 之后的探测失败当成
+                // 「已恢复」，或者反过来一直等到超时。
+                if !challenge_status_usable(&payload) {
+                    unusable_slices += 1;
+                    last = payload;
+                    if unusable_slices >= 2 {
+                        return Ok(challenge_probe_failed_verdict(
+                            &session_key,
+                            if is_solve { "solve" } else { "wait" },
+                            last,
+                            focused,
+                            injections,
+                            started,
+                            "连续两次页面 status 返回空载荷（扩展未注入 / 页面脚本未执行）",
+                        ));
+                    }
+                    continue;
+                }
+                unusable_slices = 0;
+                // 等待期间才识别出的硬拦截：立刻给结论，不再把剩余预算耗完。
+                // 兼容两种字段形态：status 用 `kind:"blocked"`，wait 回包若带
+                // `hard_block:true` 同样算硬拦截（旧版 wait 回包两者都没有，
+                // 这时靠进循环前的 status 预探兜底）。
+                let hard_blocked = payload.get("kind").and_then(Value::as_str) == Some("blocked")
+                    || payload.get("hard_block").and_then(Value::as_bool) == Some(true);
+                if hard_blocked {
+                    return Ok(challenge_blocked_verdict(
+                        &session_key,
+                        if is_solve { "solve" } else { "wait" },
+                        payload,
+                        focused,
+                        injections,
+                        started,
+                    ));
+                }
+                // 维护「从什么时候开始被拦」，供下一轮 `stalledMs` 使用。
+                // 清除条件用 `!detected`：只靠 `!blocking` 会把「组件还在但能浏览」
+                // 当成已恢复，时间戳被反复重置，stalled 永远攒不够。
+                let flagged =
+                    |key: &str| payload.get(key).and_then(Value::as_bool).unwrap_or(false);
+                if flagged("blocking") || flagged("interactive") {
+                    first_blocking_at.get_or_insert_with(Instant::now);
+                } else if !flagged("detected") {
+                    first_blocking_at = None;
                 }
                 let need_human = payload.get("need_human").and_then(Value::as_bool) == Some(true);
                 last = payload;
-                if need_human && !focused && req.focus != Some(false) {
+                if need_human && !focused && focus_on_need_human {
                     // 超时前没自动过：把标签页带到前台，人处理完继续等。
-                    let _ = extension_control(
-                        state,
-                        &session_key,
-                        "tabs",
-                        json!({ "method": "switch", "allowFocus": true }),
-                        DEFAULT_EXTENSION_CONTROL_TIMEOUT,
-                    )
-                    .await;
+                    // 走统一入口，避免同窗口多个求解器互相抢 active tab。
+                    challenge_activate_tab(state, &session_key, true, &mut activation_diag).await;
                     focused = true;
                     continue;
                 }
@@ -1202,7 +1489,7 @@ pub(crate) async fn challenge_value(state: &AppState, req: ChallengeRequest) -> 
                     && reload_after > 0.0
                     && started.elapsed().as_secs_f64() >= reload_after
                 {
-                    // C1-04：`reloaded` 必须在**调用成功之后**才置位。旧实现先置 true
+                    // `reloaded` 必须在**调用成功之后**才置位。旧实现先置 true
                     // 再 `let _ =` 丢掉错误：reload 失败（CDP 不可用 / 页面禁止 eval）
                     // 时输出里照样是 `reloaded:true`，调用方会以为「已经重载过一次，
                     // 还是没通过」，据此下「这站过不去」的错误结论。
@@ -1267,9 +1554,16 @@ pub(crate) async fn challenge_value(state: &AppState, req: ChallengeRequest) -> 
         result["status_error"] = json!(reason);
         result["blocking"] = json!(true);
     }
-    // C1-04：reload 失败要能被看见（`reloaded` 此时恒为 false）。
+    // reload 失败要能被看见（`reloaded` 此时恒为 false）。
     if let Some(reason) = reload_error {
         result["reload_error"] = json!(reason);
+    }
+    // 前置等待的执行错误不再沉默（只有真正失败才会写）。
+    if let Some(reason) = pre_wait_error {
+        result["pre_wait_error"] = json!(reason);
+    }
+    if !activation_diag.is_empty() {
+        result["diag"] = json!(activation_diag);
     }
     if is_solve {
         // 没等到：把球交回给调用方，不要伪装成通过。
@@ -1325,7 +1619,7 @@ pub(crate) async fn stealth_page_call(
 ///
 /// 只认两类：扩展不认识这个 op（版本过旧），或连接已经断了。除此之外的错误
 /// （exec_timeout、上下文销毁、页面脚本自身报错）都应该如实返回或重试——
-/// 退到 MAIN world 会留下站点可读的注入痕迹。
+/// 退到 MAIN world 会留下站点可读的注入痕迹（B-04）。
 fn is_extension_channel_unavailable(message: &str) -> bool {
     const MARKERS: &[&str] = &[
         "unknown cmd",
@@ -1365,7 +1659,7 @@ pub(crate) async fn challenge_page_call(
         // 只有「扩展根本不支持这个 op / 连不上」才退回 eval。以前是**任何** Err 都退，
         // 于是 exec_timeout（挑战页导航期间是常态）、执行上下文被销毁、扩展抖动
         // 全都会把整轮等待变成 MAIN world 注入 —— 而注入痕迹站点读得到，实测会让
-        // CF 卡在「正在验证」再也放行不了。超时应当重试扩展通道，
+        // CF 卡在「正在验证」再也放行不了（B-04）。超时应当重试扩展通道，
         // 不该换一条更危险的通道。
         Err(err) if is_extension_channel_unavailable(&err.to_string()) => {
             eprintln!("challenge: 扩展通道不可用（{err}），退回 eval 读取挑战状态");

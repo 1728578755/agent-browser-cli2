@@ -91,7 +91,59 @@
       .map(([name, entry]) => ({ name, code: entry.code, world: entry.world || 'MAIN' }));
     if (!hits.length) return;
 
-    chrome.runtime.sendMessage({ type: 'persist-apply', entries: hits }).catch(() => {});
+    // 旧实现 `sendMessage(...).catch(=>{})` —— 既不 await 也不看回包。
+    // document_start 阶段 SW 常常还在启动（或刚被回收），消息会失败；
+    // 那时这页的持久注入就**永久丢失**了，连一条日志都没有。
+    // 现在：await + 校验 ok / applied，本地重试 2 次（50/150ms 退避），
+    // 仍失败就把待办写进 storage.session，等 content.js 首次可见时补一次。
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const payload = { type: 'persist-apply', entries: hits };
+    const attempts = [0, 50, 150];
+    let lastError = '';
+    let delivered = false;
+    for (let i = 0; i < attempts.length; i += 1) {
+      if (attempts[i] > 0) await sleep(attempts[i]);
+      try {
+        const resp = await chrome.runtime.sendMessage(payload);
+        if (!resp || resp.ok !== true) {
+          lastError = (resp && resp.error) || 'response not ok';
+          continue;
+        }
+        // applied 里只要有一条失败，这一页的注入就不完整 —— 当作失败重试。
+        const applied = Array.isArray(resp.applied) ? resp.applied : [];
+        const failed = applied.filter((item) => item && item.ok !== true);
+        if (failed.length) {
+          lastError = failed.map((item) => `${item.name}: ${item.error || 'failed'}`).join('; ');
+          continue;
+        }
+        delivered = true;
+        break;
+      } catch (e) {
+        // SW 尚未就绪时 sendMessage 会直接 reject（"Could not establish connection"）。
+        lastError = (e && e.message) || String(e);
+      }
+    }
+    if (delivered) return;
+
+    // 兜底：记下这一页还没应用成功的注入，content.js 首次可见时补一次。
+    //
+    // 用 storage.local 而不是 storage.session：本文件是**内容脚本**，MV3 的
+    // storage.session 默认只对受信上下文（SW / 扩展页）开放，内容脚本读写会抛
+    // "Access to storage is not allowed from this context"，标记会静默丢失。
+    // 只存「条目名 + 时间」，代码本体仍在 persistInjections 里，不重复落一份。
+    // 条目带 TTL（content.js 侧清理 10 分钟前的），避免长期堆积。
+    try {
+      const store = await chrome.storage.local.get({ persistBootPending: {} });
+      const pending = store.persistBootPending && typeof store.persistBootPending === 'object'
+        ? store.persistBootPending
+        : {};
+      pending[url] = {
+        names: hits.map((item) => item.name),
+        at: Date.now(),
+        error: String(lastError || '').slice(0, 300)
+      };
+      await chrome.storage.local.set({ persistBootPending: pending });
+    } catch (_) {}
   } catch (_) {
     /* 注入失败不能影响页面本身 */
   }

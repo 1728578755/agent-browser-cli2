@@ -30,7 +30,7 @@ fn test_state() -> AppState {
         ext_restart_seq: Arc::new(Mutex::new(HashMap::new())),
         cleanup_done: Arc::new(AtomicBool::new(false)),
         ext_warnings: Arc::new(Mutex::new(Vec::new())),
-        // / A1-09 新增状态字段：与生产构造点保持同步。
+        // 新增状态字段：与生产构造点保持同步。
         idempotency: Arc::new(Mutex::new(HashMap::new())),
         late_results: Arc::new(Mutex::new(HashMap::new())),
     }
@@ -428,7 +428,7 @@ fn handshake_query_token_is_parsed_and_decoded() {
     assert_eq!(query_param(Some("token="), "token").as_deref(), Some(""));
     assert_eq!(query_param(None, "token"), None);
     assert_eq!(query_param(Some("token=abc"), "other"), None);
-    // query 语义里裸 `+` 不是空格；空格只能来自 `%20`（A1-03）。
+    // query 语义里裸 `+` 不是空格；空格只能来自 `%20`。
     assert_eq!(
         query_param(Some("token=a+b"), "token").as_deref(),
         Some("a+b")
@@ -462,8 +462,9 @@ fn monitor_scripts_keep_their_wire_contract() {
     assert!(stop.contains("\"monitor-1\""), "令牌不匹配时判 superseded");
 }
 
-/// 的核心不变式：`track_inflight` 必须比 token 校验更外层
-/// （401 也算在途、也续期），且请求结束后计数一定归零。
+/// `track_inflight` 必须是最外层（401 也计入在途、请求结束后
+/// 计数归零），但 401/403 属于「鉴权失败」**不是业务活动**，不能续期
+/// `last_activity`——否则拿着旧 token 的进程每次轮询都能把空闲计时清零。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unauthorized_api_request_is_tracked_and_released() {
     let state = test_state();
@@ -515,10 +516,119 @@ async fn unauthorized_api_request_is_tracked_and_released() {
         "请求结束后 inflight 必须归零，否则 daemon 永不自退"
     );
     assert!(
-        probe.last_activity.lock().await.elapsed() < Duration::from_secs(30),
-        "被 401 拒绝的请求也要续期 last_activity（说明 track_inflight 在最外层）"
+        probe.last_activity.lock().await.elapsed() >= Duration::from_secs(55),
+        "401 是鉴权失败不是业务活动：不能续期 last_activity"
     );
     server.abort();
+}
+
+/// 未授权请求必须被鉴权层短路，**既不能占位也不能写幂等缓存**。
+///
+/// 旧层序是 `idempotency_replay` 在 `require_api_access` 外层：无 token 的 POST
+/// 先占位、401 被当成可回放结果缓存，随后带正确 token 的同 key 请求直接回放
+/// 那个 401（CLI 的「token 失效重发一次」因此永远失败），本地进程还能用任意
+/// key 污染缓存并落盘。
+async fn core01_probe_handler(State(state): State<AppState>) -> Json<Value> {
+    // 可观察副作用：只有 handler 真的执行过才会出现这个 key。
+    state
+        .late_results
+        .lock()
+        .await
+        .insert("core01-probe".to_string(), (json!(1), Instant::now()));
+    Json(json!({ "ok": true }))
+}
+
+/// 与 `build_api_router` 相同的三层顺序：幂等在内、鉴权居中、inflight 最外。
+fn core01_probe_router(state: AppState) -> Router {
+    Router::new()
+        .route("/probe", post(core01_probe_handler))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            idempotency_replay,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_api_access,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            track_inflight,
+        ))
+        .with_state(state)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unauthorized_post_does_not_pollute_idempotency_cache() {
+    // 幂等中间件默认会把成功响应的元数据追加到真实 `~/.atb/idempotency.jsonl`；
+    // 测试只关心内存表，关掉落盘避免污染用户目录。
+    std::env::set_var("ATB_IDEMPOTENCY_PERSIST", "off");
+
+    let state = test_state();
+    let probe = state.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, core01_probe_router(state))
+            .await
+            .unwrap();
+    });
+
+    let send = move |with_token: bool| {
+        let client = reqwest::blocking::Client::new();
+        let url = format!("http://{addr}/probe");
+        let mut request = client
+            .post(&url)
+            .header("x-atb-idempotency-key", "core01-key")
+            .header("content-type", "application/json")
+            .body(r#"{"probe":1}"#);
+        if with_token {
+            request = request.header(config::API_TOKEN_HEADER, "test-token");
+        }
+        let response = request.send().unwrap();
+        let status = response.status();
+        let body = response.json::<Value>().unwrap_or(Value::Null);
+        (status, body)
+    };
+
+    // 第一次：无 token → 401，且不占位、不执行、不写缓存。
+    let (first_status, _) = {
+        tokio::task::spawn_blocking(move || send(false))
+            .await
+            .unwrap()
+    };
+    assert_eq!(first_status, StatusCode::UNAUTHORIZED);
+    assert!(
+        probe.idempotency.lock().await.is_empty(),
+        "401 不能占用幂等槽/写缓存"
+    );
+    assert!(
+        !probe.late_results.lock().await.contains_key("core01-probe"),
+        "401 不能执行 handler"
+    );
+
+    // 第二次：带正确 token、同一个 key 与 body → 必须真正执行（不是回放 401）。
+    let (second_status, second_body) = {
+        tokio::task::spawn_blocking(move || send(true))
+            .await
+            .unwrap()
+    };
+    assert_eq!(second_status, StatusCode::OK);
+    assert_eq!(
+        second_body["ok"],
+        json!(true),
+        "带 token 的同 key 请求必须真正执行，实际回包: {second_body}"
+    );
+    assert!(
+        probe.late_results.lock().await.contains_key("core01-probe"),
+        "handler 必须被执行一次"
+    );
+    assert_eq!(
+        probe.idempotency.lock().await.len(),
+        1,
+        "只有成功响应才允许进入幂等缓存"
+    );
+    server.abort();
+    let _ = server.await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -769,6 +879,8 @@ async fn page_execution_reports_the_session_that_received_the_command() {
 fn pending_default_session_does_not_match_another_browser_tab() {
     let mut driver = DriverState {
         preferred_default_session_key: Some("browser-a:profile-a:42".to_string()),
+        // key 与时间戳必须同生共死，只有 key 的记忆现在视为无效。
+        preferred_default_session_at: Some(epoch_secs()),
         ..DriverState::default()
     };
     assert!(!should_set_default_session(
@@ -894,7 +1006,7 @@ fn exec_registry_tracks_and_clears_entries() {
     assert!(registry.active.is_empty());
 }
 
-/// 淘汰必须按「完成时间升序」，而不是 HashMap 的迭代顺序。
+/// C-05：淘汰必须按「完成时间升序」，而不是 HashMap 的迭代顺序。
 /// 旧实现 `values().take(20)` 会随机删掉刚完成、正等 `job wait` 的新任务。
 #[test]
 fn job_store_evicts_oldest_finished_jobs() {
@@ -943,7 +1055,7 @@ fn job_store_evicts_oldest_finished_jobs() {
     assert!(store.jobs.contains_key("job-119"));
 }
 
-/// 的另一半：全是 Running 时表也必须有硬上限，且淘汰最旧的。
+/// C-05 的另一半：全是 Running 时表也必须有硬上限，且淘汰最旧的。
 #[test]
 fn job_store_stays_bounded_when_all_jobs_are_running() {
     let mut store = JobStore::default();
@@ -1068,7 +1180,7 @@ fn site_match_pattern_strips_query_and_keeps_regular_hosts() {
         site_match_pattern("https://example.com:8443/a?b=1#c").as_deref(),
         Some("*://example.com/*")
     );
-    // 以前 `starts_with("chrom")` 会误杀这两个正常域名。
+    // 以前 `starts_with("chrom")` 会误杀这两个正常域名（B-10）。
     assert_eq!(
         site_match_pattern("https://chromium.org/docs").as_deref(),
         Some("*://chromium.org/*")
@@ -1202,4 +1314,315 @@ fn multi_browser_hint_requires_two_browsers_and_implicit_target() {
             "显式目标不应附带隐式默认提示"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// 补充用例
+// ---------------------------------------------------------------------------
+
+/// 构造一条指定下行通道的测试会话（`insert_test_session` 自己建通道，覆盖不到
+/// "sender 相同 / 不同" 这两类清理判据）。
+fn test_session_raw(
+    session_key: &str,
+    browser_id: &str,
+    profile_id: &str,
+    tab_id: &str,
+    sender: mpsc::UnboundedSender<String>,
+) -> Session {
+    Session {
+        session_key: session_key.to_string(),
+        tab_id: tab_id.to_string(),
+        browser_id: browser_id.to_string(),
+        profile_id: profile_id.to_string(),
+        profile_label: None,
+        extension_version: Some("2.1".to_string()),
+        extension_protocol: crate::protocol::EXTENSION_PROTOCOL_VERSION,
+        file_scheme_access: Some(true),
+        info: TabInfo {
+            id: tab_id.to_string(),
+            window_id: None,
+            tab_id: tab_id.to_string(),
+            browser_id: browser_id.to_string(),
+            profile_id: profile_id.to_string(),
+            profile_label: None,
+            browser_label: None,
+            session_key: session_key.to_string(),
+            url: "https://example.com".to_string(),
+            title: "test".to_string(),
+            group_title: None,
+            active: true,
+            tab_type: "ext_ws".to_string(),
+            connected_at: None,
+        },
+        sender,
+        disconnected_at: None,
+        conn_id: 0,
+    }
+}
+
+fn registry_with(keys: &[String]) -> std::sync::Mutex<HashSet<String>> {
+    let mut set = HashSet::new();
+    for key in keys {
+        set.insert(key.clone());
+    }
+    std::sync::Mutex::new(set)
+}
+
+/// 会话已被新连接（conn 2）接管时，conn 1 送来的 Result 必须被丢弃，
+/// 而且**不能**把 pending 取走——否则真正属于 conn 2 的结果永远没有接收者，
+/// 调用方只能拿到泛化的 RecvError。
+#[tokio::test]
+async fn late_result_from_stale_generation_keeps_pending() {
+    let state = test_state();
+    let session_key = crate::protocol::make_session_key("browser-a", "profile-a", "1");
+    {
+        let mut driver = state.driver.write().await;
+        let _rx = insert_test_session(&mut driver, "browser-a", "profile-a", "1");
+    }
+    // 会话归属连接 2（登记的会话表决定 `session_owner_conn` 的返回值）。
+    let (owner_tx, _owner_rx) = mpsc::unbounded_channel();
+    let mut owned = HashSet::new();
+    owned.insert(session_key.clone());
+    ws_connections_lock(&state).insert(
+        2,
+        WsConn {
+            extension_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            token_fingerprint: None,
+            revoked: Arc::new(AtomicBool::new(false)),
+            session_registry: Arc::new(std::sync::Mutex::new(owned)),
+            sender: owner_tx,
+        },
+    );
+    let (tx, mut rx) = oneshot::channel();
+    {
+        let mut execs = state.execs.lock().await;
+        execs.register(
+            "exec-stale",
+            &session_key,
+            crate::protocol::PendingExec {
+                delivered_at: None,
+                tx,
+            },
+        );
+    }
+
+    let (feed_tx, _feed_rx) = mpsc::unbounded_channel();
+    let scratch = std::sync::Mutex::new(HashSet::new());
+    handle_ws_message(
+        WsIncoming::Result {
+            id: "exec-stale".to_string(),
+            result: json!({ "ok": true }),
+            new_tabs: None,
+        },
+        &state,
+        feed_tx,
+        1, // 旧代际
+        &scratch,
+    )
+    .await;
+
+    assert!(
+        state.execs.lock().await.pending.contains_key("exec-stale"),
+        "代际不符时必须保留 pending，等真正的回包或原超时收敛"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "旧代际的结果不能投递给调用方的 oneshot"
+    );
+}
+
+/// refresh 路径可能以 `conn_id = 0` 登记会话。旧判据
+/// `conn_id != 0` 直接 continue，这类会话永远清不掉（`/health.ready` 谎报、
+/// 空闲自杀判不出来）。现在必须按 sender 兜底。
+#[tokio::test]
+async fn disconnect_cleanup_falls_back_to_sender_for_zero_conn_id() {
+    let state = test_state();
+    let session_key = crate::protocol::make_session_key("browser-a", "profile-a", "1");
+    let (sender, _receiver) = mpsc::unbounded_channel();
+    {
+        let mut driver = state.driver.write().await;
+        let session = test_session_raw(&session_key, "browser-a", "profile-a", "1", sender.clone());
+        driver.sessions.insert(session_key.clone(), session);
+    }
+    let (exec_tx, mut exec_rx) = oneshot::channel();
+    {
+        let mut execs = state.execs.lock().await;
+        execs.register(
+            "exec-on-zero",
+            &session_key,
+            crate::protocol::PendingExec {
+                delivered_at: None,
+                tx: exec_tx,
+            },
+        );
+    }
+    let registry = registry_with(std::slice::from_ref(&session_key));
+
+    cleanup_conn_sessions(&state, 7, &sender, &registry).await;
+
+    assert!(
+        !state
+            .driver
+            .read()
+            .await
+            .sessions
+            .contains_key(&session_key),
+        "sender 同通道的 conn_id=0 会话必须被清理"
+    );
+    assert!(
+        exec_rx.try_recv().is_ok(),
+        "清理时必须让在途执行立即失败，而不是等 CLI 超时"
+    );
+    assert!(registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .is_empty());
+
+    // 幂等：第二次调用不能 panic，也不能影响其他会话。
+    cleanup_conn_sessions(&state, 7, &sender, &registry).await;
+}
+
+/// 的反向断言：不同通道的 `conn_id = 0` 会话不能误伤
+/// （sender 兜底必须真的比对通道，而不是「0 就清」）。
+#[tokio::test]
+async fn disconnect_cleanup_skips_zero_conn_id_other_sender() {
+    let state = test_state();
+    let session_key = crate::protocol::make_session_key("browser-a", "profile-a", "1");
+    let (owner_sender, _owner_rx) = mpsc::unbounded_channel();
+    let (other_sender, _other_rx) = mpsc::unbounded_channel();
+    {
+        let mut driver = state.driver.write().await;
+        let session = test_session_raw(&session_key, "browser-a", "profile-a", "1", owner_sender);
+        driver.sessions.insert(session_key.clone(), session);
+    }
+    let registry = registry_with(std::slice::from_ref(&session_key));
+
+    cleanup_conn_sessions(&state, 9, &other_sender, &registry).await;
+
+    assert!(
+        state
+            .driver
+            .read()
+            .await
+            .sessions
+            .contains_key(&session_key),
+        "sender 不同的会话不属于这条连接，不能误清"
+    );
+}
+
+/// 关机清理必须 drain 在途 oneshot（给结构化错误）、
+/// 把 running job 标成 daemon_shutdown 终态，且重复调用保持幂等。
+#[tokio::test]
+async fn shutdown_cleanup_drains_pending_and_aborts_running_jobs() {
+    let state = test_state();
+    let (tx, rx) = oneshot::channel();
+    {
+        let mut execs = state.execs.lock().await;
+        execs.register(
+            "exec-1",
+            "browser-a:profile-a:1",
+            crate::protocol::PendingExec {
+                delivered_at: None,
+                tx,
+            },
+        );
+    }
+    {
+        let mut jobs = state.jobs.lock().await;
+        jobs.jobs.insert(
+            "job-1".to_string(),
+            JobRecord {
+                id: "job-1".to_string(),
+                op: "exec".to_string(),
+                status: JobStatus::Running,
+                created_at: 0.0,
+                started_at: None,
+                finished_at: None,
+                elapsed_ms: 0,
+                result: None,
+                error: None,
+                session_key: None,
+                cancel: Arc::new(AtomicBool::new(false)),
+            },
+        );
+    }
+
+    let cleanup = cleanup_on_shutdown(&state).await;
+    assert_eq!(cleanup["daemon"]["pending"], json!(1));
+
+    let err = rx
+        .await
+        .expect("在途请求必须收到显式错误，而不是 RecvError")
+        .expect_err("关机清理只能给 Err");
+    assert!(
+        err.to_string().contains("daemon_shutdown"),
+        "错误必须带稳定的 daemon_shutdown 码，实际: {err}"
+    );
+
+    let jobs = state.jobs.lock().await;
+    let job = jobs.jobs.get("job-1").expect("job 记录保留");
+    assert_eq!(job.status, JobStatus::Failed);
+    assert!(job.is_aborted_by_shutdown());
+    drop(jobs);
+
+    // 幂等：第二次 cleanup 直接跳过，不能重复发 debugClearAll / 重复报错。
+    let again = cleanup_on_shutdown(&state).await;
+    assert_eq!(again["skipped"], json!(true));
+}
+
+/// 握手信任档位（纯函数）。默认 compat 必须保持旧行为，其余三档
+/// fail-closed 且拒绝原因带稳定 error_code。
+#[test]
+fn ws_handshake_trust_modes_enforce_identity() {
+    let id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let other = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    let compat = WsTrust::default();
+    let warning =
+        ws_handshake_check(WsTrustMode::Compat, &compat, id, None).expect("compat 默认必须放行");
+    assert!(warning.is_some(), "compat 必须返回安全告警");
+
+    let whitelist = WsTrust {
+        extension_ids: vec![id.to_string()],
+        token: None,
+    };
+    assert!(ws_handshake_check(WsTrustMode::Whitelist, &whitelist, id, None).is_ok());
+    let reject = ws_handshake_check(WsTrustMode::Whitelist, &whitelist, other, None)
+        .expect_err("名单外的扩展必须拒绝");
+    assert_eq!(reject.error_code, "ws_untrusted_extension");
+    let reject = ws_handshake_check(WsTrustMode::Whitelist, &compat, id, None)
+        .expect_err("档位要求白名单但没配置时必须 fail-closed");
+    assert_eq!(reject.error_code, "ws_whitelist_not_configured");
+
+    let token_only = WsTrust {
+        extension_ids: Vec::new(),
+        token: Some("s3cret".to_string()),
+    };
+    assert!(ws_handshake_check(WsTrustMode::Token, &token_only, id, Some("s3cret")).is_ok());
+    assert_eq!(
+        ws_handshake_check(WsTrustMode::Token, &token_only, id, Some("bad"))
+            .expect_err("错误 token 必须拒绝")
+            .error_code,
+        "ws_token_invalid"
+    );
+    assert_eq!(
+        ws_handshake_check(WsTrustMode::Token, &token_only, id, None)
+            .expect_err("缺 token 必须拒绝")
+            .error_code,
+        "ws_token_invalid"
+    );
+    assert_eq!(
+        ws_handshake_check(WsTrustMode::Token, &compat, id, None)
+            .expect_err("档位要求 token 但没配置时必须 fail-closed")
+            .error_code,
+        "ws_token_not_configured"
+    );
+
+    let both = WsTrust {
+        extension_ids: vec![id.to_string()],
+        token: Some("s3cret".to_string()),
+    };
+    assert!(ws_handshake_check(WsTrustMode::Both, &both, id, Some("s3cret")).is_ok());
+    assert!(ws_handshake_check(WsTrustMode::Both, &both, id, None).is_err());
+    assert!(ws_handshake_check(WsTrustMode::Both, &token_only, id, Some("s3cret")).is_err());
 }

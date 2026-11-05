@@ -62,7 +62,7 @@
 | 脚本 | 作用 |
 | --- | --- |
 | `scripts/sync-version.mjs` | 以 `package.json` 为准，同步 `Cargo.toml`、README 版本行与徽章 |
-| `scripts/sync-optional-deps.mjs` | 同步平台包的可选依赖 |
+| `scripts/sync-version.mjs --deps` | 同步平台包的可选依赖 |
 | `scripts/sync-extension-assets.mjs` | 同步扩展与页面脚本副本；`--check` 只校验 |
 | `scripts/package-platform.mjs` | 生成单平台 npm 包 |
 | `scripts/deploy-extension.mjs` | 把扩展部署到浏览器加载目录，逐文件原子替换并校验 |
@@ -83,9 +83,7 @@ npm 发布开启 provenance（`publishConfig.provenance = true`），主包通�
 
 ## 素材
 
-`assets/atb_bridge/icons/bot-*.png`（16/32/48/128）随仓库以 MIT 分发，不单独声明原创作者。替换图标时保持这四个尺寸与文件名。
-
-`tests/fixtures/live/vendor/react*.production.min.js` 是 React 官方构建产物，仅用于本地测试页，版权归 Meta Platforms, Inc. 及其关联方，按 MIT 许可随附，文件头保留了原始许可声明。
+`assets/atb_bridge/icons/*.png` 为本项目自绘，随仓库以 MIT 分发。替换图标时保持 16/32/48/128 四个尺寸与对应文件名。
 
 ## 规范参考
 
@@ -97,7 +95,7 @@ npm 发布开启 provenance（`publishConfig.provenance = true`），主包通�
 
 ## 许可证边界
 
-- 本项目以 MIT 许可发布，Copyright (c) 2026 1728578755，全文见 [LICENSE](./LICENSE)。本项目派生自 MIT 许可的上游项目，上游版权声明见 [NOTICE](./NOTICE)。
+- 本项目以 MIT 许可发布，Copyright (c) 2026 sleepinginsummer，全文见 [LICENSE](./LICENSE)。
 - 上游项目与第三方 crate 各自保留其许可，不因本项目采用 MIT 而改变。
 - 再分发二进制或源码时，保留 `LICENSE`、上游版权声明与依赖许可文本；如需对外分发，建议同时生成第三方许可清单。
 - 修改派生自上游的文件时，不要移除已有的版权或来源注释；如果上游许可要求署名，在该文件顶部补上。
