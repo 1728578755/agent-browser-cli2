@@ -10,7 +10,7 @@
       "libc": null,
       "rustTarget": "aarch64-apple-darwin",
       "binary": "atb",
-      "runner": "macos-14"
+      "runner": "macos-15"
     },
     {
       "name": "darwin-x64",
