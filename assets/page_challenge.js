@@ -1,6 +1,6 @@
 // 挑战页 / 验证码识别与等待（page_challenge.js）。
 //
-// ---- world 与入口（审阅 的代码侧注记）----
+// ---- world 与入口（代码侧注记）----
 // 本文件跑在 **MAIN world**（background.js 的 PAGE_OP_WORLD 决策表：challenge → MAIN）。
 // 原因：判定依赖站点自己挂在页面 window 上的全局 —— `window.turnstile`、
 // `window._cf_chl_opt`、hCaptcha 的 `__hcaptcha_cfg`。ISOLATED world 有独立的
@@ -107,7 +107,7 @@ function __abcChallenge(opts) {  opts = opts || {};
 
   /// CF 硬拦截页（"Sorry, you have been blocked"）：等多久都没用，不是「自动放行」类。
   ///
-  /// 审阅 旧判据只要正文里出现 "access denied" 就算硬拦截 —— 普通 403
+  /// 旧判据只要正文里出现 "access denied" 就算硬拦截 —— 普通 403
   /// （自建站 / Nginx 默认页 / Akamai 的拒绝页）全被归因成「CF 硬拦截」，
   /// hint 直接把用户引向「换出口 IP」，排查方向整体跑偏。
   /// 现在必须叠加 **CF 专属证据**：
@@ -715,7 +715,7 @@ function __abcChallenge(opts) {  opts = opts || {};
         done = true;
         cleanup();
         const payload = Object.assign({
-          // 审阅 `ok` 必须跟 `cleared` 走。
+          // `ok` 必须跟 `cleared` 走。
           // 旧实现无条件 ok:true —— 超时 / need_human 都报成功，直接消费者
           // （不经 daemon 补偿的调用方）会把「还在挑战页」当成「已通过」。
           ok: cleared === true,

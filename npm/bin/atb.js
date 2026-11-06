@@ -10,7 +10,7 @@ const BINARY_NAMES = ["atb"];
 /** 包根目录：<pkg>/npm/bin/atb.js → 上两级。 */
 const PACKAGE_DIR = path.resolve(__dirname, "..", "..");
 
-/** 平台清单唯一真相源（PKG-17）。发布包会带上 scripts/platforms.json；缺失时退回内置表。 */
+/** 平台清单唯一真相源。发布包会带上 scripts/platforms.json；缺失时退回内置表。 */
 function loadPlatforms() {
   const configPath = path.join(PACKAGE_DIR, "scripts", "platforms.json");
   try {
