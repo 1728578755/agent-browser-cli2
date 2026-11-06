@@ -29,7 +29,7 @@
 - 端口配置、`api-token`、`trust-extension` 等本地信任机制。
 - 平台打包、npm 分发与 CI。
 
-上游许可以其仓库声明为准，本文件不做转述。当前仓库内的派生文件没有内嵌上游版权头；再分发或大幅改造这些文件前，请先核对上游仓库的许可与署名要求。
+上游许可以其仓库声明为准，本文件不做转述。上游出处标注尚未在代码中落地（关于页、命令输出与派生文件头均未写入出处字符串），已列入未来工作；当前仓库内的派生文件没有内嵌上游版权头，再分发或大幅改造这些文件前，请先核对上游仓库的许可与署名要求。
 
 ## Rust 依赖
 
@@ -62,7 +62,7 @@
 | 脚本 | 作用 |
 | --- | --- |
 | `scripts/sync-version.mjs` | 以 `package.json` 为准，同步 `Cargo.toml`、README 版本行与徽章 |
-| `scripts/sync-version.mjs --deps` | 同步平台包的可选依赖 |
+| `scripts/sync-version.mjs` | 同步版本锚点、可选依赖与锁文件条目 |
 | `scripts/sync-extension-assets.mjs` | 同步扩展与页面脚本副本；`--check` 只校验 |
 | `scripts/package-platform.mjs` | 生成单平台 npm 包 |
 | `scripts/deploy-extension.mjs` | 把扩展部署到浏览器加载目录，逐文件原子替换并校验 |
@@ -83,7 +83,7 @@ npm 发布开启 provenance（`publishConfig.provenance = true`），主包通�
 
 ## 素材
 
-`assets/atb_bridge/icons/*.png` 为本项目自绘，随仓库以 MIT 分发。替换图标时保持 16/32/48/128 四个尺寸与对应文件名。
+`assets/atb_bridge/icons/atb-*.png`（16/32/48/128，源文件 `atb.svg`）是本项目自绘的几何图标（渐变方底 + 浏览器窗口 + 代理光标），随仓库以 MIT 分发。替换图标时保持这四个尺寸与文件名，`manifest.json` 的 `icons` / `action.default_icon` 要同步。
 
 ## 规范参考
 
@@ -104,7 +104,7 @@ npm 发布开启 provenance（`publishConfig.provenance = true`），主包通�
 
 新增或升级依赖、扩大上游派生范围、替换素材、变更许可证时，同步更新本文件。
 
-CI 不校验本文件内容，由维护者人工确认。
+CI 不校验本文件内容，由评审人工确认。
 
 ## 相关文档
 

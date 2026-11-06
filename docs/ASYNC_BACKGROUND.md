@@ -1,7 +1,7 @@
 # 后台运行与异步任务
 
 > 目标：让智能体在**不打断用户当前浏览**的前提下操作页面，并且不必阻塞等待长任务。
-> 本文描述其行为、用法与边界。实现集中在 `src/server/run.rs` / `src/server/state.rs` / `src/server/boot.rs`（任务队列、daemon 侧等待）、`src/cli/mod.rs` / `src/cli/cmd_pipeline.rs`（`--async` 分发、`job`）、`assets/atb_bridge/*`（后台保活、降低页面开销）。
+> 本文描述本次改造后的行为、用法与边界。实现集中在 `src/server/run.rs` / `src/server/state.rs` / `src/server/boot.rs`（任务队列、daemon 侧等待）、`src/cli/mod.rs` / `src/cli/cmd_pipeline.rs`（`--async` 分发、`job`）、`assets/atb_bridge/*`（后台保活、降低页面开销）。
 
 ---
 
@@ -204,10 +204,10 @@ while (Date.now() < deadline) {
 
 结果：后台标签页里 `--wait-js --wait-timeout 10` 往往只能轮询几次就超时，表现为"页面明明已经好了，但命令报 wait 超时"。
 
-现在：页面只负责**回答一次判断**，循环交给 daemon：
+改造后：页面只负责**回答一次判断**，循环交给 daemon：
 
 ```text
-daemon: 每 100ms 注入一次 wait_js → 读返回值 → 真值则返回
+daemon: 默认每 50ms 注入一次 wait_js（`ATB_WAIT_MIN_INTERVAL_MS`，值域 1..=60000）→ 读返回值 → 真值则返回
 页面:   每次注入都是同步执行，不受标签页可见性影响
 ```
 

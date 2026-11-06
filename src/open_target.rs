@@ -83,7 +83,7 @@ pub fn resolve_open_target(
     }
 
     // `C:report.html` 是 Windows 的「驱动器相对路径」，不是 scheme `c`。
-    // 旧逻辑把它交给 `explicit_scheme`，于是报 unsupported_scheme（P3）。
+    // 旧逻辑把它交给 `explicit_scheme`，于是报 unsupported_scheme。
     #[cfg(windows)]
     if is_windows_drive_relative(input) {
         return resolve_path_input(input, cwd);
@@ -138,7 +138,7 @@ pub fn resolve_open_target(
     }
 
     // 裸文件名不存在时不能静默改写成 `https://demo.html`：那条 URL 必然打不开，
-    // 用户只会在浏览器里看到一个与输入毫不相关的错误页（P3）。只有明确像域名时
+    // 用户只会在浏览器里看到一个与输入毫不相关的错误页。只有明确像域名时
     // 才回退到 https。
     if looks_like_web_target(input) {
         return resolve_implicit_web(input);
@@ -169,7 +169,7 @@ fn is_windows_drive_relative(input: &str) -> bool {
 
 /// 常见文件扩展名：用来区分「`demo.html` 这种文件名」和「`example.com` 这种域名」。
 ///
-/// 没有这张表就只能靠「有没有点号」判断，`demo.html` 会被误当成域名（P3）。
+/// 没有这张表就只能靠「有没有点号」判断，`demo.html` 会被误当成域名。
 const FILE_EXTENSIONS: &[&str] = &[
     "html", "htm", "xhtml", "txt", "md", "markdown", "pdf", "png", "jpg", "jpeg", "gif", "webp",
     "svg", "css", "js", "mjs", "cjs", "ts", "tsx", "jsx", "json", "jsonl", "xml", "csv", "tsv",
@@ -427,7 +427,7 @@ fn file_host_allowed(host: &str) -> bool {
     if host.is_empty() || host.eq_ignore_ascii_case("localhost") {
         return true;
     }
-    crate::settings::env_string("ATB_FILE_HOSTS", "")
+    crate::settings::file_hosts()
         .split(',')
         .map(str::trim)
         .filter(|entry| !entry.is_empty())
@@ -443,7 +443,7 @@ fn resolve_path_input(
     let path = if is_windows_drive_relative(input) {
         // `C:report.html` 相对「C: 盘的当前目录」，不能按进程 cwd 拼接（会得到
         // `cwd\C:report.html`）。`std::path::absolute` 走 GetFullPathNameW，能按
-        // Windows 自己的语义展开（P3）。
+        // Windows 自己的语义展开。
         std::path::absolute(&path).map_err(|err| {
             OpenTargetError::new(
                 "invalid_open_target",
@@ -660,7 +660,7 @@ mod tests {
 
     #[test]
     fn missing_bare_file_is_reported_as_file_not_found() {
-        // 旧行为是静默改写成 `https://demo.html`，浏览器里必然打不开（P3）。
+        // 旧行为是静默改写成 `https://demo.html`，浏览器里必然打不开。
         let dir = temp_dir();
         fs::write(dir.join("demo-old.html"), "ok").unwrap();
         let err = resolve_open_target("demo.html", Some(&dir)).unwrap_err();
@@ -700,7 +700,7 @@ mod tests {
         assert!(!is_windows_drive_relative("c://example.com"));
         assert!(!is_windows_drive_relative("https://example.com"));
 
-        // 关键是不能报 unsupported_scheme：它必须走本地路径分支（P3）。
+        // 关键是不能报 unsupported_scheme：它必须走本地路径分支。
         let err = resolve_open_target("C:definitely-missing-report.html", None).unwrap_err();
         assert_ne!(err.code, "unsupported_scheme");
         assert_eq!(err.code, "local_resource_not_found");

@@ -16,11 +16,15 @@ pub(crate) const TARGET_HELP: &str = "\
 
 先检查再执行:
   atb <命令> --dry-run   只解析目标、校验参数，输出计划，不动页面
+  atb <命令> --dry-run --async
+                         只输出后台任务计划（would.op / would.args），不创建 job
 
 退出码:
-  0 成功   1 执行失败（含普通 wait / challenge 超时）   2 命令写错（选择器/JS/参数/目标）
+  0 成功   1 执行失败（含普通 wait / challenge 超时；ws_backpressure / ws_disconnected 也归此档，稍后重试即可）
+  2 命令写错（选择器/JS/参数/目标）
   3 仅 job wait / download-wait 等待超时
   4 结果未知：POST 可能已执行但响应丢失（重试前先用 --idempotency-key 或查询）
+  每个 error_code 的处置建议见 `atb schema --json` 的 error_code_hints
 
 多智能体（互不影响默认标签页）:
   --agent <名字>                        显式身份；也可设 ATB_AGENT（旧名 AGENT_BROWSER_CLI_AGENT）
@@ -55,6 +59,9 @@ pub struct Cli {
     /// 幂等键：随请求头 `x-atb-idempotency-key` 发给 daemon。动作类命令
     /// （click/fill/…）在「请求已发出但响应丢失」时不要盲目重试，带上同一个 key
     /// 重发，daemon 会在 60 秒内回放首次响应，保证动作只执行一次。
+    ///
+    /// 多请求命令（close 多个标签、scrape 的 open+exec）会按「方法+URL+请求体」
+    /// 为每个子请求派生稳定子键（`<key>:<hash>`），不会因为同一个 key 撞出 409。
     #[arg(long = "idempotency-key", global = true)]
     pub idempotency_key: Option<String>,
     #[command(subcommand)]
@@ -186,7 +193,7 @@ pub(crate) enum CommandKind {
 /// `atb restart` 的参数。
 ///
 /// 旧实现是零参命令：daemon 活着但 token 不匹配时只会提示「结束占用 18767 的进程后
-/// 重试」然后退出，而 restart 本来就是干这件事的——提示重试等于自锁（P0 实测反馈）。
+/// 重试」然后退出，而 restart 本来就是干这件事的——提示重试等于自锁（实测反馈）。
 /// `--force` 把这条手工救援路径自动化。
 #[derive(Debug, Args)]
 pub(crate) struct RestartArgs {
@@ -319,7 +326,16 @@ pub(crate) struct ExecArgs {
     #[arg(long = "max-bytes")]
     pub(crate) max_bytes: Option<usize>,
     /// 执行环境：main（默认）或 isolated（不受页面 CSP 影响，但看不到页面变量）
-    #[arg(long, default_value = "main")]
+    ///
+    /// 以前是自由字符串，`--world isolated`（小写）在扩展侧落成 MAIN，
+    /// 用户以为绕过了 CSP、其实没有。现在解析期只接受这两个值（大小写不敏感），
+    /// 其它值直接 exit 2；下发前统一大写，与扩展的消息契约一致。
+    #[arg(
+        long,
+        default_value = "main",
+        value_parser = ["main", "isolated"],
+        ignore_case = true
+    )]
     pub(crate) world: String,
     /// 在指定 iframe 里执行（先用 frames 查 frame_id）
     #[arg(long)]
@@ -391,7 +407,7 @@ pub(crate) struct SnapshotArgs {
     #[arg(long = "max-nodes", default_value_t = 0)]
     pub(crate) max_nodes: usize,
     /// 保留无障碍树里的 generic 容器节点（默认跳过：它们既不可点也没有引用价值，
-    /// 只会把 @e 编号撑大）。调试无障碍树结构时才需要（X-15）
+    /// 只会把 @e 编号撑大）。调试无障碍树结构时才需要
     #[arg(long = "no-skip-generic")]
     pub(crate) no_skip_generic: bool,
     #[arg(long, default_value_t = 30.0)]

@@ -1,6 +1,7 @@
 use super::*;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ChallengeRequest {
     /// status（默认）| wait | focus
     pub(crate) action: Option<String>,
@@ -9,7 +10,7 @@ pub(crate) struct ChallengeRequest {
     #[serde(default)]
     pub(crate) interval: Option<f64>,
     /// 等多久还没过就把标签页带到前台交给人工（秒，0 表示不聚焦）
-    #[serde(default)]
+    #[serde(default, alias = "focusAfter")]
     pub(crate) focus_after: Option<f64>,
     /// 兼容字段：旧调用方只认识 `focus`。含义按 action 分叉：
     /// `action=focus` 时等价于 `focus_allow_system`，等待路径里等价于
@@ -17,39 +18,44 @@ pub(crate) struct ChallengeRequest {
     #[serde(default)]
     pub(crate) focus: Option<bool>,
     /// `action=focus`：是否允许抢占系统焦点（false = 只切标签、不抢前台窗口）。
-    #[serde(default)]
+    #[serde(default, alias = "focusAllowSystem")]
     pub(crate) focus_allow_system: Option<bool>,
     /// 等待路径：页面判定 `need_human` 时是否把标签页带到前台。
-    #[serde(default)]
+    #[serde(default, alias = "focusOnNeedHuman")]
     pub(crate) focus_on_need_human: Option<bool>,
     /// 等这么久仍被拦就整页 reload 一次再继续等（秒，0 = 不 reload）。
     /// 卡住的挑战页多半是服务端已经放了 cookie、页面脚本没走完，reload 一次比死等有效。
-    #[serde(default)]
+    #[serde(default, alias = "reloadAfter")]
     pub(crate) reload_after: Option<f64>,
     /// action=click 时直接点的页面坐标（x,y）：自动求解失败后由调用方自己点。
     #[serde(default)]
     pub(crate) point: Option<[f64; 2]>,
     /// 页面侧「判定清除需要稳定多久」（毫秒，`confirmMs`）。None 表示不下发，
     /// 保留页面默认 250ms。挑战页刚导航提交时是空白文档，确认窗口太短会把
-    /// 「还没渲染出挑战」当成「已经放行」（X-15）。
-    #[serde(default)]
+    /// 「还没渲染出挑战」当成「已经放行」。
+    #[serde(default, alias = "confirmMs")]
     pub(crate) confirm_ms: Option<f64>,
+    #[serde(alias = "switchTabId")]
     pub(crate) switch_tab_id: Option<String>,
     pub(crate) browser: Option<String>,
     pub(crate) profile: Option<String>,
+    #[serde(alias = "frameId")]
     pub(crate) frame_id: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct StealthRequest {
     /// audit（默认，识别页面可被站点读取的自动化痕迹）| scrub（清除本工具自身痕迹）
     #[serde(default)]
     pub(crate) action: Option<String>,
     #[serde(default)]
     pub(crate) timeout: Option<f64>,
+    #[serde(alias = "switchTabId")]
     pub(crate) switch_tab_id: Option<String>,
     pub(crate) browser: Option<String>,
     pub(crate) profile: Option<String>,
+    #[serde(alias = "frameId")]
     pub(crate) frame_id: Option<i64>,
 }
 
@@ -235,17 +241,53 @@ pub(crate) fn challenge_click_point(frame: &ChallengeFrame) -> (f64, f64) {
     }
 }
 
+/// 把「接近点」的局部坐标映射成屏幕坐标，越界时**沿接近方向缩短**而不是 clamp。
+///
+/// 接近点用的是负局部坐标（从组件外侧滑入，见 `challenge_click_widget` 的
+/// 说明），仿射变换后完全可能是负屏幕坐标 —— 挑战 iframe 贴着视口左缘/上缘时尤其
+/// 常见。负坐标直接发 CDP 会被部分版本静默拒绝（`mouseenter` 丢失，表现成
+/// 「点了没反应」），而简单 clamp 到 0 会把三个接近点压到同一条边上，
+/// 「由外向内」的向量消失，同样拿不到 mouseenter。
+///
+/// 这里在屏幕空间沿 `接近点 → 落点` 的线段缩短：映射是仿射的，线段插值在屏幕
+/// 空间与原空间等价，所以缩短后的点仍然在原来那条「滑入」路径上，只是离落点更近。
+/// 落点自身由调用方用 `to_screen_clamped` 处理，判据不变。
+fn approach_screen_point(
+    frame: &ChallengeFrame,
+    point: (f64, f64),
+    target: (f64, f64),
+) -> ((f64, f64), bool) {
+    let (sx, sy) = frame.to_screen(point.0, point.1);
+    if sx >= 0.0 && sy >= 0.0 {
+        return ((sx, sy), false);
+    }
+    let (tx, ty) = frame.to_screen(target.0, target.1);
+    // 每个轴各给一个上限 s：s <= t / (t - p)（p<0<t 时）。
+    let mut scale = 1.0_f64;
+    if sx < 0.0 && tx > 0.0 {
+        scale = scale.min(tx / (tx - sx));
+    }
+    if sy < 0.0 && ty > 0.0 {
+        scale = scale.min(ty / (ty - sy));
+    }
+    // 留 0.1% 余量：正好取到边界时浮点误差仍可能落回 -0.0。
+    let scale = (scale.clamp(0.0, 1.0) * 0.999).max(0.0);
+    ((sx + scale * (tx - sx), sy + scale * (ty - sy)), true)
+}
+
 /// 点组件里的一个局部坐标：**起点在组件外，轨迹跨边界进入组件，落点全部在组件内**。
 ///
 /// 起点必须在组件外：Turnstile 靠 mouseenter（跨越边界那一下）把勾选框从
 /// 「静态渲染」切到「可交互」。起点放在组件内部时，页面照样会进入「正在验证」，
 /// 但服务端始终不给结果 —— 这是实测出来的差别。因此中途点用负的局部坐标，
-/// 经仿射映射后落在组件左侧的页面空白处；**只有最终落点**做负数 clamp。
+/// 经仿射映射后落在组件外侧；越界（屏幕坐标为负）时沿接近方向缩短起点，
+/// **不做 clamp**：clamp 会把轨迹压到视口边缘，等于取消「从外滑入」。
+/// 最终落点仍然走 `to_screen_clamped`（判据不变）。
 ///
 /// 之前的轨迹从 `(x-90, y-60)` 起步，那已经在组件外甚至窗口外，Turnstile 看到的
 /// 是一次「凭空出现」的点击；现在改为从组件左外侧水平滑到目标。
 ///
-/// `diag` 只接收「落点被 clamp」这类几何异常，成功路径不产生噪音。
+/// `diag` 只接收「落点被 clamp」「接近点被缩短」这类几何异常，成功路径不产生噪音。
 pub(crate) async fn challenge_click_widget(
     state: &AppState,
     session_key: &str,
@@ -261,26 +303,10 @@ pub(crate) async fn challenge_click_widget(
     //     mousemove 的时间分布：一次性把 move/press/release 全打出去（<10ms）时，
     //     点击会被接收（页面照样进「正在验证」），但服务端始终不给结果。
     //     实测同一台机器、同一个 profile：带节奏 1.4s 通过，不带节奏永远卡住。
-    let points = [(-40.0, ly + 2.0), (-18.0, ly + 1.0), (-6.0, ly), (lx, ly)];
-    const MOUSE: &str = "Input.dispatchMouseEvent";
-    for (px, py) in points {
-        // 中途点保留负坐标：负数正是「从组件外滑入」所需要的，不能 clamp。
-        let (sx, sy) = frame.to_screen(px, py);
-        // 扩展回 `{ok:false}` 时必须停下 —— 鼠标没进到组件里，
-        // 后面的按下/抬起只会点在一个不存在的光标位置上。
-        cdp_call(
-            state,
-            session_key,
-            MOUSE,
-            json!({ "type": "mouseMoved", "x": sx, "y": sy, "button": "none", "buttons": 0, "pointerType": "mouse" }),
-            timeout,
-        )
-        .await?
-        .into_ok(MOUSE)?;
-        tokio::time::sleep(EVENT_GAP).await;
-    }
     // 落点必须在组件内且非负：仿射变换后的负坐标只可能来自组件被滚出视口，
     // 直接发给 CDP 在部分版本上会被静默拒绝。夹紧后写 diag，便于排查「点歪了」。
+    // 先算出落点，再发轨迹：`mouseMoved` 与 `mousePressed` 必须用**同一个**坐标，
+    // 旧实现 move 走未 clamp 的 `to_screen`、press 走 clamp 后的值，两者可能差一个像素。
     let ((sx, sy), clamped) = frame.to_screen_clamped(lx, ly);
     if clamped {
         diag.push(json!({
@@ -290,6 +316,42 @@ pub(crate) async fn challenge_click_widget(
             "screen": { "x": sx.round(), "y": sy.round() },
         }));
     }
+    const MOUSE: &str = "Input.dispatchMouseEvent";
+    // 接近点：局部坐标为负（组件外），映射后越界则沿方向缩短，见 `approach_screen_point`。
+    for (px, py) in [(-40.0, ly + 2.0), (-18.0, ly + 1.0), (-6.0, ly)] {
+        let ((ax, ay), shortened) = approach_screen_point(frame, (px, py), (lx, ly));
+        if shortened {
+            diag.push(json!({
+                "step": "click-approach",
+                "reason": "negative_approach_point_shortened",
+                "local": { "x": px.round(), "y": py.round() },
+                "screen": { "x": ax.round(), "y": ay.round() },
+            }));
+        }
+        // 扩展回 `{ok:false}` 时必须停下 —— 鼠标没进到组件里，
+        // 后面的按下/抬起只会点在一个不存在的光标位置上。
+        cdp_call(
+            state,
+            session_key,
+            MOUSE,
+            json!({ "type": "mouseMoved", "x": ax, "y": ay, "button": "none", "buttons": 0, "pointerType": "mouse" }),
+            timeout,
+        )
+        .await?
+        .into_ok(MOUSE)?;
+        tokio::time::sleep(EVENT_GAP).await;
+    }
+    // 最后一步移到落点上（与 press 同坐标），保持「滑入后停顿再按下」的节奏。
+    cdp_call(
+        state,
+        session_key,
+        MOUSE,
+        json!({ "type": "mouseMoved", "x": sx, "y": sy, "button": "none", "buttons": 0, "pointerType": "mouse" }),
+        timeout,
+    )
+    .await?
+    .into_ok(MOUSE)?;
+    tokio::time::sleep(EVENT_GAP).await;
     // 按下 → 保持 → 抬起这段时间里，只有 press 的成败会影响要不要抬起：
     // 按下成功就**一定**要释放（页面停在 mousedown 会让组件永远收不到 click）。
     // Rust 没有异步 Drop，所以用「显式收尾」实现 finally 语义：
@@ -448,7 +510,7 @@ fn challenge_blocked_verdict(
     })
 }
 
-/// 探测不可用时的统一结论（的「连续不可用」出口）。
+/// 探测不可用时的统一结论（「连续不可用」出口）。
 fn challenge_probe_failed_verdict(
     session_key: &str,
     action: &str,
@@ -501,7 +563,7 @@ pub(crate) fn challenge_status_usable(status: &Value) -> bool {
         .unwrap_or(false)
 }
 
-/// 把调用方给的确认时长（毫秒）塞进页面 op 参数（X-15）。
+/// 把调用方给的确认时长（毫秒）塞进页面 op 参数。
 ///
 /// 键名固定为 `confirmMs`（`page_challenge.js` 读的就是它，缺省 250ms）。
 /// `None` 时**不下发**该键：老页面脚本不认识它，多一个字段只会增加载荷。
@@ -539,7 +601,7 @@ pub(crate) async fn challenge_auto_solve(
     let started = Instant::now();
     // `budget` 是硬截止：每一轮探测前都按它算「还剩多少」，单次查询的超时也必须
     // 用剩余量截断。旧实现每次固定 6s(几何) + 8s(status)，只想在循环头判
-    // `elapsed < budget` —— 最后一轮可以轻松越过 --timeout（P3 预算越界）。
+    // `elapsed < budget` —— 最后一轮可以轻松越过 --timeout（预算越界）。
     let deadline = started + budget;
     let mut clicks = 0u32;
     let mut tried: Vec<Value> = Vec::new();
@@ -550,7 +612,7 @@ pub(crate) async fn challenge_auto_solve(
     let mut last_click_at: Option<Instant> = None;
     // 点击已被接收的证据：widget-removed / widget-replaced / verifying。
     let mut accepted: Option<&'static str> = None;
-    // B-07：页面上可能同时有两个（甚至更多）验证码组件（站点自己的检测框 +
+    // 页面上可能同时有两个（甚至更多）验证码组件（站点自己的检测框 +
     // 真正的组件，或两套验证码）。旧实现只点 `frames.first()`：第一个点不动时
     // 整段预算都耗在它身上，等大的第二个组件永远轮不到。
     // 现在按面积序（`challenge_frames` 已排好）取前 3 个可用组件**轮转**点击，
@@ -579,7 +641,7 @@ pub(crate) async fn challenge_auto_solve(
     let mut next_status_at = Instant::now();
     // `--frame` 下挑战在子框架里，而 challenge_frames 只走主文档的 pierce DOM：
     // 它给出的坐标是主框架元素的位置，点下去可能命中同位置的另一个元素。
-    // 这种场景只在该框架内做状态判定，绝不派发主框架坐标的点击（P3）。
+    // 这种场景只在该框架内做状态判定，绝不派发主框架坐标的点击。
     let frame_scoped = frame_id.is_some();
     if frame_scoped {
         diag.push(json!({ "step": "frame", "error": "frame-scope-unsupported" }));
@@ -632,7 +694,7 @@ pub(crate) async fn challenge_auto_solve(
                 }
                 // 「点击被接收」的证据必须建立在我们**确实点过**之上：页面自己进入
                 // 「正在验证」时把它算成 accepted，会让求解器一次都不点就停手，
-                // 然后耗完预算报 solved:false（P3）。
+                // 然后耗完预算报 solved:false。
                 if clicks > 0
                     && status.get("verifying").and_then(Value::as_bool) == Some(true)
                     && accepted.is_none()
@@ -665,7 +727,7 @@ pub(crate) async fn challenge_auto_solve(
         }
         // 状态机（组件签名 / 替换 / 尺寸 / 确认窗口）始终以**面积最大**的那个
         // 组件为准：它是主挑战，页面刷新、被摘掉、进入 verifying 都先体现在它身上。
-        // 点击目标则按 ⑥ 的轮转在前 3 个候选之间轮换（B-07）。
+        // 点击目标则按 ⑥ 的轮转在前 3 个候选之间轮换。
         let Some(frame) = frames.first() else {
             // 查询失败 ≠ 组件被摘掉。CDP 附不上 / DOM 域不可用时会返回空集合，
             // 那不是「点击被接收」的证据，只是这一轮没拿到几何 —— 继续下一轮，
@@ -679,7 +741,7 @@ pub(crate) async fn challenge_auto_solve(
                 continue;
             }
             // 组件消失只有在「我们点过」之后才算点击被接收：一次没点就出现/消失
-            // 是 CF 自己在刷新组件，当成证据会直接停手（P3）。
+            // 是 CF 自己在刷新组件，当成证据会直接停手。
             if clicks > 0 && saw_widget && accepted.is_none() {
                 accepted = Some("widget-removed");
             }
@@ -737,7 +799,7 @@ pub(crate) async fn challenge_auto_solve(
             break;
         }
         // 剩余预算不够走完一次「滑入 → 按下 → 抬起」（4×35ms + 80ms 的节奏），
-        // 就别起这个头：半截的点击拿不到结论，只会把最后一点预算烧掉（B-07）。
+        // 就别起这个头：半截的点击拿不到结论，只会把最后一点预算烧掉。
         if left < Duration::from_millis(300) {
             break;
         }
@@ -790,7 +852,7 @@ pub(crate) async fn challenge_auto_solve(
         tokio::time::sleep(CHALLENGE_POLL).await;
     }
 
-    // B-07：所有候选都没能推进时，把每个组件的失败原因交回去。只说
+    // 所有候选都没能推进时，把每个组件的失败原因交回去。只说
     // 「点了没反应」的话，调用方无从知道是哪个组件、卡在哪一步。
     if accepted.is_none() && saw_widget {
         for label in &clicked_frames {
@@ -947,7 +1009,7 @@ pub(crate) async fn challenge_value(state: &AppState, req: ChallengeRequest) -> 
         //
         // `--frame` 下这套几何探测仍然只看主文档：它给出的坐标是主框架元素的位置，
         // 与调用方指定的子框架无关。必须说清楚，否则调用方拿着这些坐标点击就可能
-        // 打到同位置的另一个元素（P3）。
+        // 打到同位置的另一个元素。
         let frame_note = req.frame_id.is_some();
         return Ok(json!({
             "tab_id": tab_id_of_session(&session_key),
@@ -1169,7 +1231,7 @@ pub(crate) async fn challenge_value(state: &AppState, req: ChallengeRequest) -> 
     let focus_on_need_human = req
         .focus_on_need_human
         .or(req.focus)
-        .unwrap_or_else(|| crate::settings::env_bool("ATB_CHALLENGE_FOCUS_ON_NEED_HUMAN", true));
+        .unwrap_or_else(crate::settings::challenge_focus_on_need_human);
     // 页面侧的计时基准是「本次注入的起点」，而单片最多只等 4s：
     // 固定下发 8000ms 时 `at - started` 永远到不了，`need_human` 从不返回，
     // 需要人工的验证码页会一路静默等到总超时。所以要下发「还差多久」，每片递减。
@@ -1234,7 +1296,7 @@ pub(crate) async fn challenge_value(state: &AppState, req: ChallengeRequest) -> 
                 // turnstile iframe，此刻 `detected:false, blocking:false,
                 // interactive:false` 是**假阴性**。旧实现据此直接返回
                 // `passed:true, via:"no-challenge"`，等于对一张正在变成拦截页的
-                // 文档说「没有挑战、已通过」（B-03）。pending 时跳过所有早退，
+                // 文档说「没有挑战、已通过」。pending 时跳过所有早退，
                 // 交给下面的 auto_solve / 等待循环继续观察。
                 let pending = status
                     .get("pending")
@@ -1287,7 +1349,7 @@ pub(crate) async fn challenge_value(state: &AppState, req: ChallengeRequest) -> 
     // 主动求解的结论要一直带着：后面接被动等待时，超时结果里也要能回答
     // 「到底点没点、点到哪一步」。
     // 预算必须从**真正的 deadline** 算：写死 timeout/2 再让 auto_solve 用自己的
-    // 计时器，等于把外层 deadline 推后到 auto_solve 返回之后才生效（P3）。
+    // 计时器，等于把外层 deadline 推后到 auto_solve 返回之后才生效。
     let mut solve_summary = Value::Null;
     if is_solve {
         // 探测不到状态时，solve/auto/click 一律不给 passed:true：没有证据就没有结论，
@@ -1341,7 +1403,7 @@ pub(crate) async fn challenge_value(state: &AppState, req: ChallengeRequest) -> 
     // 「已经拦了多久」只能由 daemon 记：页面脚本刻意不写 `window.*`（那会留下自动化
     // 指纹，实测注入过之后 CF 会卡在「正在验证」），所以 `stalledMs` 必须由这里下发。
     // 旧实现从不传，页面侧 `stalled` 恒 false，`turnstile_not_rendered` 的快速失败
-    // 与归因整条链路都是死代码，`--challenge-timeout` 只能被完整耗光（B-05）。
+    // 与归因整条链路都是死代码，`--challenge-timeout` 只能被完整耗光。
     let mut first_blocking_at: Option<Instant> = None;
     // 连续拿不到可用载荷的次数。偶尔一次扩展抖动不该收手，
     // 但连续两次说明探测通道确实坏了，继续等只会把 --timeout 耗完。
@@ -1383,7 +1445,7 @@ pub(crate) async fn challenge_value(state: &AppState, req: ChallengeRequest) -> 
                         .max(1)
                 },
             }),
-            // X-15：确认窗口由调用方决定；None 不下发，页面沿用默认 250ms。
+            // 确认窗口由调用方决定；None 不下发，页面沿用默认 250ms。
             req.confirm_ms,
         );
         match challenge_page_call(
@@ -1419,7 +1481,7 @@ pub(crate) async fn challenge_value(state: &AppState, req: ChallengeRequest) -> 
                     // wait 的目标是离开挑战页。旧实现只在 `is_solve` 时写 `passed`，
                     // 而 CLI 对 `action=="wait"` 只读 `/result/passed`、不回落
                     // `/result/cleared`，于是**成功清除被判成 challenge_timeout**
-                    // （退出码 1）——功能是好的，报告说它坏了（B-25）。
+                    // （退出码 1）——功能是好的，报告说它坏了。
                     result["passed"] = json!(true);
                     result["via"] = json!(via);
                     if let Some(reason) = &reload_error {
@@ -1622,7 +1684,7 @@ pub(crate) async fn stealth_page_call(
 ///
 /// 只认两类：扩展不认识这个 op（版本过旧），或连接已经断了。除此之外的错误
 /// （exec_timeout、上下文销毁、页面脚本自身报错）都应该如实返回或重试——
-/// 退到 MAIN world 会留下站点可读的注入痕迹（B-04）。
+/// 退到 MAIN world 会留下站点可读的注入痕迹。
 fn is_extension_channel_unavailable(message: &str) -> bool {
     const MARKERS: &[&str] = &[
         "unknown cmd",
@@ -1662,7 +1724,7 @@ pub(crate) async fn challenge_page_call(
         // 只有「扩展根本不支持这个 op / 连不上」才退回 eval。以前是**任何** Err 都退，
         // 于是 exec_timeout（挑战页导航期间是常态）、执行上下文被销毁、扩展抖动
         // 全都会把整轮等待变成 MAIN world 注入 —— 而注入痕迹站点读得到，实测会让
-        // CF 卡在「正在验证」再也放行不了（B-04）。超时应当重试扩展通道，
+        // CF 卡在「正在验证」再也放行不了。超时应当重试扩展通道，
         // 不该换一条更危险的通道。
         Err(err) if is_extension_channel_unavailable(&err.to_string()) => {
             eprintln!("challenge: 扩展通道不可用（{err}），退回 eval 读取挑战状态");

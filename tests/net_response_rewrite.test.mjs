@@ -294,7 +294,7 @@ function loadPageNet(originalFetch, XhrClass) {
   }
 
   // A) 规则只改 status、响应体读不出来（accessor 直接抛错）
-  //    的新契约：只改 status/headers 时**不读 body**，status 照样改写生效，
+  // 的新契约：只改 status/headers 时**不读 body**，status 照样改写生效，
   //    responseText / response 原样透传（这里就是继续抛错），日志标 response_modified=true
   //    且**没有** response_rewrite_skipped —— 旧实现因为读不出 body 就把整条改写
   //    （含 status）都作废，等于「只想要一个 204」也永远改不掉。
@@ -330,7 +330,7 @@ function loadPageNet(originalFetch, XhrClass) {
 
   // B) blob 响应 + 只改 status → 不 decode / 不 encode 二进制，只改 status。
   //    旧实现会去 TextDecoder 解码 arraybuffer、对 blob 直接放弃整条改写；
-  //    要求二进制体保持原样，访问器放行原生 response。
+  // 要求二进制体保持原样，访问器放行原生 response。
   class BlobXhr extends XhrBase {
     constructor() {
       super();

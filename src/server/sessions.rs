@@ -4,7 +4,7 @@ use super::*;
 /// 类型别名只是为了让 `apply_tabs_snapshot` 里的 `Vec<...>` 可读。
 pub(crate) type TabCandidate = (
     String,
-    mpsc::UnboundedSender<String>,
+    mpsc::Sender<String>,
     String,
     String,
     Option<String>,
@@ -58,16 +58,11 @@ struct PreferredMiss {
 static PREFERRED_MISS: std::sync::Mutex<Option<PreferredMiss>> = std::sync::Mutex::new(None);
 
 fn preferred_miss_limit() -> u32 {
-    crate::settings::env_u64_clamped("ATB_PREFERRED_MISS_LIMIT", 3, 1, 1000) as u32
+    crate::settings::preferred_miss_limit()
 }
 
 fn preferred_miss_ttl() -> Duration {
-    Duration::from_secs(crate::settings::env_u64_clamped(
-        "ATB_PREFERRED_MISS_TTL_SEC",
-        120,
-        1,
-        86_400,
-    ))
+    Duration::from_secs(crate::settings::preferred_miss_ttl_sec())
 }
 
 /// preferred 重新出现在快照里：未命中记账归零。
@@ -128,7 +123,7 @@ fn preferred_belongs_to_snapshot(preferred: &str, browser_id: &str, profile_id: 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn apply_tabs_snapshot(
     state: &AppState,
-    sender: &mpsc::UnboundedSender<String>,
+    sender: &mpsc::Sender<String>,
     // 这份快照由哪条连接推送：写进每个 Session，供断开清理比对代际。
     conn_id: u64,
     browser_id: String,
@@ -141,11 +136,27 @@ pub(crate) async fn apply_tabs_snapshot(
     tabs: Vec<crate::protocol::ExtTab>,
     registered: &std::sync::Mutex<HashSet<String>>,
 ) {
+    // 先复核"这份快照的主人还活着吗"。
+    //
+    // 时序竞态：扩展回了 `tabs`（连接还活着）→ 扩展随即断开 → `handle_socket` 收尾把
+    // 旧会话全标断开 → refresh 任务**此时才**执行本函数。此时登记表里已经没有这条连接，
+    // `conn_id` 要么是个已注销的 id，要么是 refresh 兜底出来的 0。旧实现照样按
+    // `disconnected_at: None` 插入，于是产生一个**永远 active 的幽灵会话**：
+    // `prune_sessions` 只清有 disconnected_at 的，daemon 也就永远不空闲退出。
+    //
+    // 判据放在取 driver 写锁**之前**：登记表是 std Mutex，与 driver 锁不嵌套
+    // （与 `cleanup_conn_sessions` 的锁序约定一致）。
+    let conn_alive = if conn_id == 0 {
+        // 0 = refresh 路径在登记表里没找到连接时的占位值：按通道再确认一次。
+        connection_conn_id(state, sender).is_some()
+    } else {
+        ws_connections_lock(state).contains_key(&conn_id)
+    };
     let mut driver = state.driver.write().await;
     // 先净化身份分量，后续所有 session_key / TabInfo 都用净化后的值。
     let browser_id = sanitize_identity_component(&browser_id);
     let profile_id = sanitize_identity_component(&profile_id);
-    // A2：过期的「待生效默认目标」在这里统一清一次（6h TTL）；之后所有读取
+    // 过期的「待生效默认目标」在这里统一清一次（6h TTL）；之后所有读取
     // 都走 `preferred_default_session()`，读到的都是仍然有效的记忆。
     driver.expire_preferred_default_session();
     let mut newly_registered: Vec<String> = Vec::new();
@@ -174,24 +185,28 @@ pub(crate) async fn apply_tabs_snapshot(
         }
     }
     let now_epoch = epoch_secs();
-    for session in driver.sessions.values_mut() {
-        if session.info.tab_type == "ext_ws"
-            && session.browser_id == browser_id
-            && session.profile_id == profile_id
-            && !current.contains(&session.session_key)
-        {
-            // 刚打开不到 5 秒的标签页给一个宽限期：扩展的标签列表可能慢一拍，
-            // 立刻标成断开会让「open 之后马上 read」偶发失败。
-            let fresh = session
-                .info
-                .connected_at
-                .map(|at| now_epoch - at < 5.0)
-                .unwrap_or(false);
-            // 只在**首次**断开时写入时间戳：每次快照都覆盖成 now，
-            // 会让 prune_sessions 的「断开超过 STALE_SESSION_TTL」永远为 0，
-            // sessions 与 snapshots（整页 HTML）于是只增不减。
-            if !fresh && session.disconnected_at.is_none() {
-                session.disconnected_at = Some(Instant::now());
+    // 连接已注销时这份快照**不是权威事实**（它是"连接收尾之后才到"的旧数据），
+    // 不能再拿它去把别人（新连接）刚登记的同 profile 会话标成断开。
+    if conn_alive {
+        for session in driver.sessions.values_mut() {
+            if session.info.tab_type == "ext_ws"
+                && session.browser_id == browser_id
+                && session.profile_id == profile_id
+                && !current.contains(&session.session_key)
+            {
+                // 刚打开不到 5 秒的标签页给一个宽限期：扩展的标签列表可能慢一拍，
+                // 立刻标成断开会让「open 之后马上 read」偶发失败。
+                let fresh = session
+                    .info
+                    .connected_at
+                    .map(|at| now_epoch - at < 5.0)
+                    .unwrap_or(false);
+                // 只在**首次**断开时写入时间戳：每次快照都覆盖成 now，
+                // 会让 prune_sessions 的「断开超过 STALE_SESSION_TTL」永远为 0，
+                // sessions 与 snapshots（整页 HTML）于是只增不减。
+                if !fresh && session.disconnected_at.is_none() {
+                    session.disconnected_at = Some(Instant::now());
+                }
             }
         }
     }
@@ -220,11 +235,15 @@ pub(crate) async fn apply_tabs_snapshot(
                 .unwrap_or_else(epoch_secs),
         );
         newly_registered.push(session_key.clone());
-        driver.latest_session_key = Some(session_key.clone());
-        if should_set_default_session(&driver, &session_key) {
-            driver.default_session_key = Some(session_key.clone());
-            if driver.preferred_default_session() == Some(session_key.as_str()) {
-                driver.clear_preferred_default_session();
+        // 已注销连接带来的会话不参与「最近/默认目标」选举：默认目标指向一条
+        // 立刻会被 prune 的幽灵会话，会让后续命令全部 target_lost。
+        if conn_alive {
+            driver.latest_session_key = Some(session_key.clone());
+            if should_set_default_session(&driver, &session_key) {
+                driver.default_session_key = Some(session_key.clone());
+                if driver.preferred_default_session() == Some(session_key.as_str()) {
+                    driver.clear_preferred_default_session();
+                }
             }
         }
         driver.sessions.insert(
@@ -240,7 +259,14 @@ pub(crate) async fn apply_tabs_snapshot(
                 file_scheme_access,
                 info,
                 sender: sender.clone(),
-                disconnected_at: None,
+                // 主人已经不在了就**不要**插成 active——那是一条没有清理路径的
+                // 幽灵会话。按"已断开"落库，`prune_sessions` 会在 STALE_SESSION_TTL 后
+                // 自然回收，期间的 `active_tabs` / `/health.ready` 也不会谎报。
+                disconnected_at: if conn_alive {
+                    None
+                } else {
+                    Some(Instant::now())
+                },
                 // 每次快照都覆写：同一 key 被**新连接**重注册后，归属就转到新代际，
                 // 旧连接的断开清理会因此跳过它。
                 conn_id,
@@ -338,6 +364,33 @@ pub(crate) async fn register_opened_session(
     title: &str,
 ) -> bool {
     let agent = current_agent();
+    // 执行者的身份先在一次读锁里整份取出——之后要在写锁**之外**查
+    // `ws_connections`（锁序 driver → registry，不能在持 driver 写锁时取登记表）。
+    let Some(executor) = ({
+        let driver = state.driver.read().await;
+        driver
+            .sessions
+            .get(executor_key)
+            .map(|executor| OpenedExecutor {
+                sender: executor.sender.clone(),
+                conn_id: executor.conn_id,
+                browser_id: executor.browser_id.clone(),
+                profile_id: executor.profile_id.clone(),
+                profile_label: executor.profile_label.clone(),
+                extension_version: executor.extension_version.clone(),
+                extension_protocol: executor.extension_protocol,
+                file_scheme_access: executor.file_scheme_access,
+            })
+    }) else {
+        // 执行者会话不存在 = 登记失败。早期返回前**不写**任何归属/默认，
+        // 否则失败路径会留下一条指向不存在会话的幽灵默认（下一条命令直接
+        // target_lost，且没有任何调用方知道它从哪来）。
+        return false;
+    };
+    // 执行者那条连接是否还在登记表里。不在 = 这次 open 的回包是"连接收尾
+    // 之后才到"的，落库必须直接标成断开，不能插成 active 的幽灵会话。
+    let executor_conn_alive = ws_connections_lock(state).contains_key(&executor.conn_id);
+
     let mut driver = state.driver.write().await;
     // 用 bool 先取值再改，避免 `if let Some(x) = map.get(..)` 的临时借用
     // 覆盖整个分支体（NLL 下无法在分支里再改 map）。
@@ -354,16 +407,11 @@ pub(crate) async fn register_opened_session(
         persist_agent_opened(state);
         return true;
     }
-    let Some(executor) = driver.sessions.get(executor_key) else {
-        // 执行者会话不存在 = 登记失败。早期返回前**不写**任何归属/默认，
-        // 否则失败路径会留下一条指向不存在会话的幽灵默认（下一条命令直接
-        // target_lost，且没有任何调用方知道它从哪来）。
+    // 执行者在读锁与写锁之间消失了（并发关闭）时同样按失败处理，
+    // 否则我们会给一个已经没有执行者的浏览器登记会话。
+    if !driver.sessions.contains_key(executor_key) {
         return false;
-    };
-    let executor_sender = executor.sender.clone();
-    // 新会话挂在执行者那条连接上，代际必须一致：
-    // 否则执行者连接断开时，这条「手工登记」的会话会因为 conn_id 不等而被漏清理。
-    let executor_conn_id = executor.conn_id;
+    }
     let session = Session {
         session_key: new_key.to_string(),
         tab_id: tab_id.to_string(),
@@ -390,11 +438,19 @@ pub(crate) async fn register_opened_session(
             connected_at: Some(epoch_secs()),
         },
         sender: executor.sender.clone(),
-        disconnected_at: None,
-        conn_id: executor_conn_id,
+        // 连接已注销 → 直接按断开落库。
+        disconnected_at: if executor_conn_alive {
+            None
+        } else {
+            Some(Instant::now())
+        },
+        // 新会话挂在执行者那条连接上，代际必须一致：
+        // 否则执行者连接断开时，这条「手工登记」的会话会因为 conn_id 不等而被漏清理。
+        conn_id: executor.conn_id,
     };
+    let became_active = session.is_active();
     driver.sessions.insert(new_key.to_string(), session);
-    if agent == "default" {
+    if agent == "default" && became_active {
         driver.default_session_key = Some(new_key.to_string());
         driver.clear_preferred_default_session();
     }
@@ -406,14 +462,29 @@ pub(crate) async fn register_opened_session(
     persist_agent_opened(state);
     // 这条会话挂在执行者的通道上，但没有经过任何一次快照，所以必须手工登记到
     // 该连接的登记表（与 同源）：否则扩展断开时它永远不会被标断开/清理。
-    if let Some(registry) = connection_session_registry(state, &executor_sender) {
-        let mut keys = registry
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        keys.insert(new_key.to_string());
+    if executor_conn_alive {
+        if let Some(registry) = connection_session_registry(state, &executor.sender) {
+            let mut keys = registry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            keys.insert(new_key.to_string());
+        }
     }
     state.sessions_ready.notify_waiters();
     true
+}
+
+/// `register_opened_session` 从执行者会话里需要的字段（一次读锁取全，避免
+/// 持写锁时再去碰连接登记表 —— 锁序 driver → registry）。
+struct OpenedExecutor {
+    sender: mpsc::Sender<String>,
+    conn_id: u64,
+    browser_id: String,
+    profile_id: String,
+    profile_label: Option<String>,
+    extension_version: Option<String>,
+    extension_protocol: u32,
+    file_scheme_access: Option<bool>,
 }
 
 pub(crate) async fn refresh_tabs_via_extension(
@@ -468,24 +539,46 @@ pub(crate) async fn refresh_tabs_via_extension(
 
     let mut last_error: Option<String> = None;
     let mut timed_out = false;
+    // 候选循环吃**整体**预算，而不是每个候选各等一个完整 `timeout`。
+    // 旧实现最坏 5 个候选 × 1500ms + 800ms 收尾 ≈ 8.3s，`atb tabs` 直接卡到 CLI
+    // 超时边缘；而刷新失败本来就允许"沿用现有快照"，多等几个候选毫无收益。
+    //
+    // 预算口径：`timeout`（调用方给的 1500ms）覆盖**全部**候选；最后一个候选额外
+    // 给一次 `REFRESH_TAIL_GRACE`（800ms）收尾，避免前面的候选把预算吃光后
+    // 「一次完整尝试都没有」——这时扩展往往只是排队，不是死了。
+    let deadline = Instant::now() + timeout;
+    let candidate_count = candidates.len();
     for (
-        key,
-        sender,
-        browser_id,
-        profile_id,
-        profile_label,
-        ext_version,
-        ext_protocol,
-        file_access,
-    ) in candidates
+        index,
+        (
+            key,
+            sender,
+            browser_id,
+            profile_id,
+            profile_label,
+            ext_version,
+            ext_protocol,
+            file_access,
+        ),
+    ) in candidates.into_iter().enumerate()
     {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let is_last = index + 1 == candidate_count;
+        let wait = if is_last {
+            remaining.max(REFRESH_TAIL_GRACE)
+        } else {
+            remaining
+        };
+        if wait.is_zero() {
+            break;
+        }
         // 外层再套一层超时：`extension_control` 自己的 timeout 只包住
         // 「最后等回包」，前面的 `session_lock(...).await` 与 `serial.lock().await`
         // 没有超时。后台 job / 长 `exec`（hold_lock=true，最长 600s）通常正持有那把
         // 锁，于是 `tabs` 会跟着卡到 CLI 的 30s 请求超时——用户看到超时，daemon 却正常。
         let outcome = tokio::time::timeout(
-            timeout,
-            extension_control(state, &key, "tabs", json!({}), timeout),
+            wait,
+            extension_control(state, &key, "tabs", json!({}), wait),
         )
         .await;
         let value = match outcome {
@@ -499,7 +592,7 @@ pub(crate) async fn refresh_tabs_via_extension(
                 timed_out = true;
                 last_error = Some(format!(
                     "刷新标签列表超时（{}ms 内含等待会话锁），沿用现有快照",
-                    timeout.as_millis()
+                    wait.as_millis()
                 ));
                 continue;
             }
@@ -562,6 +655,13 @@ pub(crate) async fn refresh_tabs_via_extension(
     ))
 }
 
+/// 刷新标签列表时给**最后一个**候选的额外收尾预算。
+///
+/// 整体预算（调用方传入的 1500ms）被前面的候选吃光后，最后一个候选仍要完整试一次：
+/// 扩展通常只是排队（会话锁/串行锁），不是死了。给 800ms 足够覆盖一次已就绪连接
+/// 的往返，同时把最坏耗时从「5 × 1500ms + 800ms」压到「1500 + 800ms」。
+pub(crate) const REFRESH_TAIL_GRACE: Duration = Duration::from_millis(800);
+
 /// 这条下行通道所属连接登记过的会话表。
 ///
 /// refresh 路径手上只有 `Session.sender`，而「这条连接登记过哪些会话」在 `WsConn` 里；
@@ -569,7 +669,7 @@ pub(crate) async fn refresh_tabs_via_extension(
 /// 正常不会发生）。
 pub(crate) fn connection_session_registry(
     state: &AppState,
-    sender: &mpsc::UnboundedSender<String>,
+    sender: &mpsc::Sender<String>,
 ) -> Option<Arc<std::sync::Mutex<HashSet<String>>>> {
     let conns = ws_connections_lock(state);
     conns
@@ -583,10 +683,7 @@ pub(crate) fn connection_session_registry(
 /// refresh 路径只有 `Session.sender`，但写快照时必须带上 `conn_id`：否则
 /// 「由 refresh 首次登记的会话」代际是 0，连接断开时会被当成别人的会话跳过，
 /// 于是永远留在 sessions 里（`/health.ready` 谎报 + 空闲自杀判不出来）。
-pub(crate) fn connection_conn_id(
-    state: &AppState,
-    sender: &mpsc::UnboundedSender<String>,
-) -> Option<u64> {
+pub(crate) fn connection_conn_id(state: &AppState, sender: &mpsc::Sender<String>) -> Option<u64> {
     let conns = ws_connections_lock(state);
     conns
         .iter()
@@ -775,6 +872,9 @@ pub(crate) async fn extension_profile_capabilities(state: &AppState) -> Vec<Valu
             .or_insert_with(|| {
                 json!({
                     "browser_id": session.browser_id,
+                    // 可读标签带品牌与版本（如「Chrome 156.0.8078.79 · Windows · #cac3」），
+                    // 智能体在 status / tabs / browsers 里都能直接区分是哪个浏览器。
+                    "browser_label": session.info.browser_label,
                     "profile_id": session.profile_id,
                     "profile_label": session.profile_label,
                     "extension_version": session.extension_version,
@@ -802,7 +902,7 @@ pub(crate) async fn request_extension_reload(
     browser_id: &str,
     version: &str,
     tab_id: Option<String>,
-    sender: mpsc::UnboundedSender<String>,
+    sender: mpsc::Sender<String>,
 ) {
     let key = format!("{browser_id}:{version}");
     {
@@ -825,7 +925,11 @@ pub(crate) async fn request_extension_reload(
     tokio::spawn(async move {
         // 让刚建立的连接先完成 tabs 同步，避免重载打断握手。
         tokio::time::sleep(Duration::from_secs(2)).await;
-        let _ = sender.send(payload);
+        // 有界通道 + 结构化错误。这里是"锦上添花"的自动重载，
+        // 发不出去只记一行日志（下一次握手还会再请求一次）。
+        if let Err(err) = send_downstream(&sender, payload).await {
+            eprintln!("[ext] 请求浏览器重载扩展的下行消息未送达: {err}");
+        }
     });
     eprintln!(
         "[ext] 扩展版本 {version} 低于随包版本 {}，已请求浏览器重载扩展",
@@ -1016,7 +1120,7 @@ pub(crate) async fn forget_session(state: &AppState, session_key: &str) {
     forget_session_inner(state, session_key, false).await;
 }
 
-/// 扩展连接断开时的回收：与 [`forget_session`] 只差**默认目标的记忆**（A2）。
+/// 扩展连接断开时的回收：与 [`forget_session`] 只差**默认目标的记忆**。
 ///
 /// `session_key` 是确定性拼接（`browser:profile:tabId`），断线重连后同一个 key 会回来。
 /// 真实关闭（`close --tab` / 标签关闭事件 / prune）用 `forget_session`，把默认目标彻底忘掉；
@@ -1029,7 +1133,7 @@ pub(crate) async fn forget_session_after_disconnect(state: &AppState, session_ke
     forget_session_inner(state, session_key, true).await;
 }
 
-/// 断线时是否要把「当前默认目标」记进 preferred（A2）。
+/// 断线时是否要把「当前默认目标」记进 preferred。
 ///
 /// 只有「这条会话就是默认」且「还没有别的待生效目标」时才记：
 /// 已经有一个 preferred 时说明用户刚 `open` 了另一个标签，那个意图更晚、更明确。
@@ -1158,7 +1262,7 @@ pub(crate) async fn select_tab(state: &AppState, selector: SessionSelector) -> R
     Ok(session_key)
 }
 
-/// 多浏览器并存时的「隐式默认」提示（A2）。
+/// 多浏览器并存时的「隐式默认」提示。
 ///
 /// 只在「本次没有显式指定目标」（没有 --tab / --browser / --profile）**且**当前同时连着
 /// ≥2 个浏览器时返回一句话；其它情况返回 `None`。纯说明性字段：不改变选标签结果、
@@ -1660,7 +1764,7 @@ pub(crate) fn resolve_session(
     if selector.browser.is_some() || selector.profile.is_some() {
         // 选择必须是确定的：`matches` 来自 HashMap::values()，旧的 `matches.first()`
         // 会随迭代顺序变化——同一 profile 开多个标签时，同一条命令在 daemon 重启
-        // 前后可能打到不同标签，而且这个随机结果还会被写成 default 让错误「粘住」（C-08）。
+        // 前后可能打到不同标签，而且这个随机结果还会被写成 default 让错误「粘住」。
         // 固定顺序：default_session_key → latest_session_key
         //          → connected_at 最大（最近连接）→ session_key 字典序最小。
         let preferred = driver
@@ -1776,10 +1880,26 @@ pub(crate) fn resolve_session(
             })
         })
         .or_else(|| {
+            // 最终兜底必须**确定**。旧实现取 `values.find(is_active)`，
+            // 结果随 HashMap 迭代顺序变化：同一条命令在 daemon 重启前后可能落到不同
+            // 标签，而且这个随机结果还会被 `select_tab` 写成 default「粘住」。
+            // 复用与 `sort_tabs_canonical` 相同的比较口径（browser → profile →
+            // tab id → session_key），取最小者。
             driver
                 .sessions
                 .values()
-                .find(|s| s.is_active())
+                .filter(|s| s.is_active())
+                .min_by(|left, right| {
+                    left.browser_id
+                        .cmp(&right.browser_id)
+                        .then_with(|| left.profile_id.cmp(&right.profile_id))
+                        .then_with(|| {
+                            tab_numeric_order(&left.tab_id).cmp(&tab_numeric_order(&right.tab_id))
+                        })
+                        .then_with(|| left.tab_id.cmp(&right.tab_id))
+                        // 完整总序，避免 `min_by` 在完全平手时又依赖迭代顺序。
+                        .then_with(|| left.session_key.cmp(&right.session_key))
+                })
                 .map(|s| s.session_key.clone())
         })
         .ok_or_else(|| {

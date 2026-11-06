@@ -219,7 +219,7 @@ pub(crate) async fn resolve_targets(
     match spec {
         TargetSpec::Default => {
             // 真实执行路径（`select_tab`）优先用「本智能体的默认目标」，dry-run 也必须
-            // 用同一个，否则报告的目标与真正打的目标不是同一个（P3 CLI 一致性）。
+            // 用同一个，否则报告的目标与真正打的目标不是同一个（CLI 一致性）。
             let agent = current_agent();
             let agent_key = {
                 let defaults = state.agent_defaults.lock().await;
@@ -287,7 +287,7 @@ pub(crate) async fn resolve_targets(
                 match matches.len() {
                     0 => missing.push(id.clone()),
                     // 同一个 tab_id 可能同时属于多个 profile；单目标端点会报歧义，
-                    // `/multi` 以前静默取首个，导致「同一写法、不同目标」（P3 CLI 一致性）。
+                    // `/multi` 以前静默取首个，导致「同一写法、不同目标」（CLI 一致性）。
                     1 => resolved.push(resolved_from_tab(resolved.len(), matches[0])),
                     _ => ambiguous.push(format!(
                         "{id}（{} 个会话：{}）",
@@ -443,7 +443,7 @@ pub(crate) async fn resolve_targets(
                 .iter()
                 .filter(|tab| {
                     // `wanted` 已经是小写；`eq_ignore_ascii_case` 只处理 ASCII，
-                    // 非 ASCII 大写标题（CAFÉ / ЗАКАЗ）永远匹配不上（P3）。
+                    // 非 ASCII 大写标题（CAFÉ / ЗАКАЗ）永远匹配不上。
                     // 正确做法：两组都用 `to_lowercase()`（Unicode 感知）比较。
                     tab.group_title
                         .as_deref()

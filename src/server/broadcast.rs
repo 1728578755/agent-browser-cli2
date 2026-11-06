@@ -1,6 +1,7 @@
 use super::*;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct BroadcastRequest {
     pub(crate) op: String,
     #[serde(default)]
@@ -18,7 +19,7 @@ pub(crate) async fn broadcast(
 ) -> Json<Value> {
     touch(&state).await;
     // 广播的结论在 `failed == 0`（内层 ok）上，外层恒 true 会让「全部目标都失败」
-    // 也退出 0（v5 C-14 复发点）。
+    // 也退出 0（v5 复发点）。
     Json(json_result_with_inner_ok(
         broadcast_value(&state, req).await,
     ))

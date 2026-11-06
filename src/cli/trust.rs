@@ -339,7 +339,7 @@ pub(crate) fn print_trust_state(
         "extension_ids": ids,
         "token_required": token_required,
         "enforcing": enforcing,
-        // `json!({"path": &Path})` 在非 UTF-8 路径上会 panic（serde 不支持 Path）。
+        // `json!({"path": &Path})` 在非 路径上会 panic（serde 不支持 Path）。
         // 与其它输出口径一致，统一转成 display 字符串。
         "path": path.display().to_string(),
         "message": message,

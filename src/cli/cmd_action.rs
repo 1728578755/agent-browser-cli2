@@ -3,7 +3,6 @@ use super::*;
 use clap::{Args, Parser, Subcommand};
 
 pub(crate) fn run_action_command(op: &str, args: ActionArgs, is_async: bool) -> Result<()> {
-    ensure_server()?;
     if args.target.is_none() && op != "scroll" {
         // 文案必须和预检一致：`text=` 是 Playwright 语法，preflight 必然拒绝，
         // 旧文案却写着「支持 text=可见文本」，用户照着写只会拿到 invalid_selector。
@@ -37,6 +36,11 @@ pub(crate) fn run_action_command(op: &str, args: ActionArgs, is_async: bool) -> 
         "profile": args.profile,
         "timeout": args.timeout,
     });
+    // dry-run + async 必须在 ensure_server/HTTP 之前短路。
+    if async_dry_run_plan(op, &payload, is_async)? {
+        return Ok(());
+    }
+    ensure_server()?;
     if is_async {
         print_json(submit_job(op, payload)?);
     } else {
@@ -86,8 +90,6 @@ pub(crate) fn cmd_mouse_click(args: TargetCommandArgs, is_async: bool) -> Result
 }
 
 pub(crate) fn cmd_wait(args: WaitArgs, is_async: bool) -> Result<()> {
-    let _ = is_async;
-    ensure_server()?;
     let payload = json!({
         "selector": args.selector,
         "text": args.text,
@@ -100,6 +102,11 @@ pub(crate) fn cmd_wait(args: WaitArgs, is_async: bool) -> Result<()> {
         "browser": args.browser,
         "profile": args.profile,
     });
+    // dry-run + async 必须在 ensure_server/HTTP 之前短路。
+    if async_dry_run_plan("wait", &payload, is_async)? {
+        return Ok(());
+    }
+    ensure_server()?;
     if is_async {
         print_json(submit_job("wait", payload)?);
     } else {
@@ -171,6 +178,17 @@ pub(crate) fn cmd_challenge(args: ChallengeArgs, is_async: bool) -> Result<()> {
         ));
     }
     // 坐标是纯本地解析（不碰 daemon），dry-run 也要照常校验。
+    //
+    // `--at` 以前对所有 action 生效，`challenge status --at 1,2`
+    // 会在识别阶段意外点一次鼠标（坐标点击是不可撤销的副作用）。只有 click
+    // 需要坐标；其它 action 带了就直接判用法错误，而不是静默忽略。
+    if args.at.is_some() && action != "click" {
+        return Err(usage_failure(
+            "unsupported_combination",
+            format!("challenge {action} 不接受 --at（只有 click 按坐标点击）"),
+            "去掉 --at；需要按坐标点击时用 `challenge click --at x,y --tab <id>`",
+        ));
+    }
     let point = args.at.as_deref().map(parse_point).transpose()?;
     if DRY_RUN.load(Ordering::Relaxed) {
         // dry-run 的承诺是「什么动作都不做」：目标标签页解析需要 daemon 往返，
@@ -241,19 +259,49 @@ pub(crate) fn cmd_challenge(args: ChallengeArgs, is_async: bool) -> Result<()> {
     // 超时 / 未通过不是成功：把顶层 ok 改成 false，统一由 print_json 的
     // 「ok:false → 退出码 1」处理，避免这类命令只能靠 cleared/passed 字段判断。
     if long_running && value.get("ok").and_then(Value::as_bool) == Some(true) {
-        // `passed` 是主判据，`cleared` 是兜底：wait 的目标就是「离开挑战页」，
-        // 而 daemon 曾经只在 solve 分支写 `passed`，于是成功清除被判成
-        // challenge_timeout（B-25）。两道口径都接受，避免再被单侧改动打穿。
-        let achieved = value
-            .pointer("/result/passed")
-            .or_else(|| value.pointer("/result/cleared"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        // `passed` 是 wait/solve 的主判据，`cleared` 是兜底：wait 的目标就是
+        // 「离开挑战页」，而 daemon 曾经只在 solve 分支写 `passed`，于是成功清除
+        // 被判成 challenge_timeout。
+        //
+        // click 是「派发一次点击」，它不是等待类动作 —— daemon 的 click
+        // 分支只回 `clicked` + `cleared`，没有 `passed`。旧实现用 passed/cleared
+        // 判 click，点击成功后 `cleared` 仍为 false（页面不可能一次点击就通过），
+        // 于是把成功改写成 challenge_timeout。现在 click 只看 `clicked`，
+        // `cleared` 仅作为独立诊断字段透传。
+        let achieved = if action == "click" {
+            // 两种 click 回包形状都要接受：
+            // - `click --at x,y`：坐标分支回 `clicked`（点了就算达成，页面不会瞬间通过）；
+            // - `click`（无 --at）：走一次性 auto_solve 分支，回 `passed`/`cleared`。
+            // 只看 `clicked` 会把后者的成功也改写成 challenge_timeout。
+            value
+                .pointer("/result/clicked")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                || value
+                    .pointer("/result/passed")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                || value
+                    .pointer("/result/cleared")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+        } else {
+            value
+                .pointer("/result/passed")
+                .or_else(|| value.pointer("/result/cleared"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        };
         if !achieved {
             value["ok"] = json!(false);
             value["error_code"] = json!("challenge_timeout");
             value["error"] = json!(format!(
-                "challenge {action}: 超时未达成目标（页面仍被挑战页拦截），可用 --timeout 延长等待"
+                "challenge {action}: {}",
+                if action == "click" {
+                    "点击未能派发（坐标越界 / CDP 不可用，见 result.diag）"
+                } else {
+                    "超时未达成目标（页面仍被挑战页拦截），可用 --timeout 延长等待"
+                }
             ));
         }
     }

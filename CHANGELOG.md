@@ -8,12 +8,97 @@
 
 | 版本线 | 当前 | 真相源 |
 | --- | --- | --- |
-| CLI / daemon | `0.7.3` | `package.json` / `Cargo.toml` |
+| CLI / daemon | `0.7.4` | `package.json` / `Cargo.toml` |
 | CLI ↔ daemon API 协议 | `5` | `atb status` |
-| Chrome 扩展 | `5.3.0` | `assets/atb_bridge/manifest.json` |
+| Chrome 扩展 | `5.4.2` | `assets/atb_bridge/manifest.json` |
 | 扩展 ↔ daemon 消息协议 | `4` | `atb status` |
 
 0.3.7 及更早版本、以及重构前的逐条修复记录，见 [docs/CHANGELOG_ARCHIVE.md](docs/CHANGELOG_ARCHIVE.md)。
+
+## [0.7.4] - 2026-11-06
+
+0.7.3 之后的功能与修复版本。CLI 升到 `0.7.4`，配套扩展升到 `5.4.2`（CLI ↔ daemon 协议 `5`、扩展消息协议 `4`）。
+所有改动向后兼容：只增字段、不改已有字段语义；0.7.3 的 `file:` 相对路径与挑战等待修复一并包含在本版。
+
+### Added
+
+- **WS 双向鉴权**：daemon 在 upgrade 后下发 `ws_hello`（nonce + HMAC-SHA256 proof）；
+  扩展配了 token 时先验 proof 再发 `ext_ready`，失败记 `daemon_auth_failed`。防本机进程
+  抢占 18765 冒充 daemon 获取标签数据。配 token 才生效，`compat` 无 token 时行为不变。
+- **`atb status` 的 `security` 块**与 **`doctor` 的 `ws_trust` 检查**：显示信任档位、
+  token 是否配置、双向鉴权是否开启。
+- **`ATB_EXEC_MAX_BYTES`**（默认 1MiB，0=不限）：`exec` 回包的 daemon 侧默认大小预算。
+- **`ATB_NET_RULE_MAX_RULES`**（默认 64）：page 引擎与 CDP 引擎同源的规则条数上限，
+  超限返回 `too_many_rules`。
+
+### Changed
+
+- `--dry-run --async` 统一为「只出计划」：输出 `{ok:true,dry_run:true,async:true,would:{op,args}}`，
+  不建 job、不拉起 daemon。此前除 `exec` 外的命令会真实执行。
+- `read` / `find` 的页面 `ok:false` 上浮：非法选择器/文档不可读不再报 `ok:true` + exit 0。
+- `--world` 解析期只接受 `main` / `isolated`（大小写不敏感），非法值 exit 2；
+  扩展侧统一大小写，`isolated` 不再静默落 MAIN。
+- `challenge --at` 只允许 `click`；其它 action 带 `--at` 直接 exit 2（此前会意外点击）。
+- `--idempotency-key` 对多请求命令按「方法+URL+请求体」派生稳定子键，`close --tab a,b`
+  与 `scrape` 不再因同 key 撞 409。
+- 请求 DTO 全面 `deny_unknown_fields`（历史 camelCase 字段保留 alias），字段名写错不再静默丢弃。
+- `net reset` 的 `ok` 计入持久注入删除结果；失败返回 `hook_remove_failed`。
+- 扩展 `captureVisibleTabThrottled` 改 promise 链排队；WS 命令账本对 running 重复改为
+  等原命令结束再回放。
+- `net hook --persist` 的规则重放上限与配置上限统一为 64 条。
+
+### Fixed
+
+- 页面脚本 `find` / `snapshot` / `action` 顶层 `const`/`let` 导致第二次注入 SyntaxError；
+  统一 IIFE + 不可枚举 `defineProperty`。
+- `page_action.setValue` 内层 `base` 遮蔽外层结果对象，`fill` 成功却丢 `ok`。
+- `challenge` 仅凭 reCAPTCHA/hCaptcha 脚本标签判 `interactive`，`challenge wait` 耗满预算。
+- 扩展 restore × `enableFetchInterception` 锁序交叉死锁；断线快速重连不重跑 debug restore。
+- daemon 快照落库与 WS 收尾竞态产生永久 active 的幽灵会话。
+- WS 下行命令通道无界 → 有界，满时返回结构化 `ws_backpressure` / `ws_disconnected`。
+- `tabs` 刷新候选逐个等 1500ms → 整体预算；cleanup 任务 panic 归 `task_panicked` 并补 hint。
+- `tabs --ids --limit 0` 与 full 视图语义统一；`absolutize_path` 支持 `C:foo` 盘符相对路径。
+- `publish.yml` 构建加 `--locked`，发布前跑 lock/资产/测试门禁；平台包 integrity 发布后按
+  registry 校验；npm 发布加 provenance，Release 支持可选 GPG 签名。
+- CI：扩展 JS 语法门禁覆盖 `options.js` 与 `ui/**`；新增 `windows-latest` Node 测试；
+  `npm ci --dry-run --ignore-scripts`。
+
+### 扩展 5.4.2（2026-11-05）
+
+扩展文件版本 `5.4.2`，消息协议保持 `4`，可与 0.7.x 的 daemon 配套；旧 daemon 不认识的新帧只会被忽略，不会让命令失败。
+
+- **popup 界面重做**：全站 `12px monospace` 换成 13px 系统字体（中文此前被压成一团），分区改为「状态 / 数据 / 设置」，头部与分区条固定、只有内容区滚动；连接状态改成状态点 + 药丸，Cookie 改成列表行（名称 / 标记 / 值），值默认打码。`popupWidthMode` 三档（340 / 420 / 560）保留。
+- **新增管理页面**：`options.html`，manifest 声明 `options_ui.open_in_tab`。七个分区：概览、连接（端口 / token / 信任档位）、身份（Profile Label 与只读标识）、Cookies（筛选 / 二次确认显示 / 复制 TTL）、外观（主题 / 弹窗宽度 / 间距 / 角标）、诊断（心跳、最近错误、自检）、关于（版本 / 权限 / 数据边界）。
+- **主题与间距可选**：新增 `themeMode`（auto / light / dark）与 `uiDensity`（standard / compact），存在 `storage.local`，popup 与管理页面通过 `storage.onChanged` 实时同步；深色变量只有一套（`ui/tokens.css` 的 `[data-resolved="dark"]`），不再写媒体查询副本。
+- **图标重绘**：渐变方底 + 浏览器窗口 + 代理光标，16 / 32 / 48 / 128 四套（`icons/atb-*.png`），替换旧的拟物 `bot-*.png`。
+- **页面角标重绘**：深色半透明胶囊、品牌色状态点，文案改为「ATB 已连接」；closed Shadow DOM、默认关闭、10s 无命令隐藏、30s 轮询等行为不变。
+- **新增 `cmd:"reconnect"`**：popup 与管理页面的「重新连接」直接复用 `reconnectWS()`，不引入第二套重连路径；调用方轮询 `status` 判断结果，避免拿到「刚置空 socket」的误导性 `wsConnected:false`。
+- **管理页面 Cookie 目标**：管理页面自身是 `chrome-extension://` 标签页，不能用「当前活动标签页」取 Cookie；改为在本窗口里挑最近访问的 http(s)/file 标签页，并在标题栏标出站点。
+- **popup 页面模式**：`popup.html?page=1` 时切 780px 居中列 + 整页滚动（管理页的「打开弹窗页面预览」带这个参数）；工具栏弹窗仍按 340/420/560 三档宽度（默认 420）。早期实现用 `chrome.tabs.getCurrent` 猜上下文，该 API 在部分场景返回 tab，会把工具栏弹窗误判成页面、宽度反而被压窄，现已改为显式参数。
+- **弹窗宽度固定为像素**：`body` 原来写 `min(420px, 100vw)`，在扩展弹窗里 `100vw` 会按内容宽度解析，`min()` 把宽度收缩回窄条；改为固定像素宽度（默认 `width: 420px`）并在 `<html>` 上同步 `min-width` 兜底，紧凑 340 / 标准 420 / 宽松 560 三档。
+- **浏览器型号与版本**：popup「环境」、管理页「概览 / 关于」显示当前浏览器（Chrome / Edge / Chromium / Brave / Opera / Firefox）与完整版本（`navigator.userAgentData.getHighEntropyValues(['fullVersionList'])`，不可用时回退 UA 主版本），并展示平台与完整 User-Agent；复制诊断信息里带 `browser` 字段。
+- **浏览器标签带型号与版本**：扩展握手时用 UA-CH `fullVersionList` 解析品牌与完整版本，`browser_label` 从「Chrome · Windows · #cac3」变成「Chrome 156.0.8078.79 · Windows · #cac3」；daemon 的 `status.connection.profiles[]` 现在也回传 `browser_label`，`tabs` / `browsers` 同步生效。重建 daemon 后 `bundled_version` 一并更新为 5.4.2。
+- **管理页面收成居中面板**：宽屏（1920 / 2560）下侧栏贴最左、正文在 1100px 处"浮"着，整页显得空而散；`.shell` 改为 `max-width: 1180px` 居中、正文列 860px，外层用 `--bg-page` 区分，窄屏（≤860px）仍铺满。
+- **浏览器标识可重置**：`browserId` / `profileId` 首次启动生成后落 `storage.local`，**跨重载刻意保持不变**（session_key 是 `browser_id:profile_id:tab`，一换全部失联）。管理页「身份」新增「重置」（两次点击确认），只在整份浏览器 profile 被克隆到另一台机器、两个实例撞同一个 id 时才需要；重置后扩展自行重载并生成新 UUID。
+- **管理页显示磁盘构建**：关于页新增「磁盘构建」行，读 `.atb-build.json` 的 `builtAt` + 版本 + digest 前 8 位，用来区分「磁盘已部署新版」与「浏览器还在跑旧版」。
+- **扩展自检改用整包指纹**：`deploy-extension.mjs` 部署完写 `.atb-build.json`（manifest + 全部 js/html/css 的 `rel:sha256` 排序哈希），扩展每分钟比对 digest 并在空闲时 `chrome.runtime.reload()`；此前只哈希 `background.js`，改 popup/options/css/manifest 永远不重载，表现为"改了没生效"。没有指纹文件的老目录自动退回旧逻辑。
+- **弹窗宽度只认固定像素**：三档 340 / 420 / 560（默认 420）全部写死，`<html>` 同步 `min-width`；`min(…, 100vw)` 在弹窗里会被内容宽度反压，是"改成 680 却显示 420"的根因。
+
+#### 沿用 5.4.0 之前的能力
+
+以下改动在 5.4.0 之前就已具备，本次界面重构原样保留。
+
+- **`challenge` 入口不可枚举**：`page_challenge.js` 整体包进 IIFE，入口 `window.__abcChallenge` 改用 `Object.defineProperty(..., {enumerable:false, configurable:true})` 挂载。页面侧 `Object.keys(window)` 看不到它，`stealth scrub` 也能真正 `delete` 掉；旧的顶层函数声明会留下不可删除、可枚举的全局，是稳定的自动化指纹。
+- **open shadow DOM 支持**：`find` / `snapshot` / `read` 递归收集 open shadow root，返回项带 `scope:"shadow"`、`host_selector`、`shadow_path`，选择器写成 `宿主 >>> 相对路径`；回包给出 `scope` / `frame_count` / `shadow_roots` / `shadow_skipped` / `shadow_closed_unreachable`。closed shadow root 明确标注不可达（不伪造结果）。
+- **断线重连兜底**：`onclose` 的清理步骤逐个 `try/catch`，`scheduleProbe()` 与 `scheduleFastReconnect()` 放进 `finally`，任一步抛错都不再导致「永久断连」。
+- **socket 换代守卫**：`reconnectWS` 先摘掉旧 socket 的 `onopen/onmessage/onclose` 再关闭；`onopen/onmessage` 首层加 `ws !== socket` 守卫，过期连接的迟到帧一律丢弃。
+- **命令幂等**：WS 命令按 `id` 记 60 秒终态账本（上限 256 条）。同 id 在跑时只回 `duplicate_inflight`，已完成则直接回放原 payload，超时重试不再重复执行副作用。
+- **拼接内存预算**：整页拼接在建画布前按 `宽 × 高 × dpr` 预估像素，超过 `captureMaxPixels`（默认 8000 万，可用 `ATB_CAPTURE_MAX_PIXELS` 调整）返回结构化 `capture_too_large`，不再把 MV3 Service Worker 撑到 OOM。
+- **剪贴板 TTL**：popup「复制 cookies」写入剪贴板后按 `clipboardTtlSec`（默认 30 秒）自动清空，清除前尽量 `readText()` 比对，`pagehide` 时再清一次。
+- **popup 默认掩码**：Cookie 值默认渲染为 `•••`，必须点「显示值」并二次确认才展示；打开 popup 不再自动拉取 Cookie。
+- **网络/console 缓冲上限**：`networkStart` / `consoleStart` 接受 `max_entries`（默认 5000，clamp 100–100000），超出丢最旧；`idempotent:true` 时重复 start 只更新配置并裁剪缓冲，不清空已捕获条目。
+- **exec 取消帧**：新增 `cmd:"cancel"` 处理，按 `execId` 释放 daemon 已超时/取消的那次 CDP attach；被 network/console/Fetch 复用的 attach 回 `cancelled:false, reason:"in_use"`，不打断正在用的采集。
+
 
 ## [0.7.3] - 2026-11-05
 
@@ -36,7 +121,7 @@
 
 ## [0.7.2] - 2026-11-04
 
-截至 2026-11-04，CLI 为 `0.7.2`；扩展同步升到 `5.3.0`（消息协议仍为 `4`）。本节汇总 0.7.1 之后已合并的 CLI/daemon 改动与 5.3.0 扩展改动；向后兼容，不删除、不改名已有字段。
+CLI 为 `0.7.2`，扩展为 `5.3.0`（消息协议仍为 `4`）。本节汇总 0.7.1 之后已合并的 CLI/daemon 改动；向后兼容，不删除、不改名已有字段。
 
 ### Added
 
@@ -77,9 +162,18 @@
 - **挑战页（0.7.1 之后）**：识别与求解不再向页面写任何 `window.__abc*` 全局；求解器改为按元素证据推进（token、是否离开挑战页、组件是否存在），不再按固定偏移和固定节奏点击；Turnstile 组件在 closed shadow root 内也能被识别；点完不再死等固定秒数；页面存在其他扩展的 `chrome-extension://` iframe 时自动绕过 CDP 限制。
 - **`install-skill` 在 Windows 上更新软链接失败**：指向目录的软链以前一律用 `remove_file` 删除，Windows 返回「拒绝访问 (os error 5)」，于是主目录已更新、命令却以失败退出。改为先 `remove_file`、失败再 `remove_dir`，并补一条回归测试（无建链权限的环境自动跳过）。
 
-### Added / Fixed (2026-11-04)
+### 订正
 
-本节修复以下问题：
+- **挑战入口仍挂 `window`（不可枚举）**：上文「挑战页（0.7.1 之后）」条目所称「识别与求解不再向页面写任何
+  `window.__abc*` 全局」不准确——`page_challenge.js` 的入口 `window.__abcChallenge` 仍以
+  `Object.defineProperty(..., {enumerable:false})` 挂载：`Object.keys(window)` 与 `for...in`
+  不可见，`stealth scrub` 可删；`net` / `stealth` 同在 MAIN world，口径相同。read / find /
+  snapshot / action / wait 注入 ISOLATED world，对页面完全不可见。0.6.0 条目「不再把
+  `window.__abcRead` 之类的全局写进页面」同此口径：不写**可枚举**全局。
+
+### Added / Fixed（2026-11-04 收尾）
+
+早期列为「边界与限制 / 未完成」的 11 项全部落地：
 
 - **受限页面不再等于不能截图**：新增扩展命令 `captureFullPage`（`chrome.scripting.executeScript`
   逐屏滚动 + `chrome.tabs.captureVisibleTab` + `OffscreenCanvas` 拼接，**全程不 attach 调试器**）。
@@ -109,14 +203,15 @@
 - **端到端受控页面**：`tests/e2e/pages/`（basic / spa / form / iframe-blocked / download）+
   `scripts/e2e.mjs` 六个场景 29 条断言，跑真实 daemon + 扩展，不依赖外网。
 
-### Fixed (2026-11-04)
+### Fixed（2026-11-04 分区修复）
 
-本节修复以下问题：
+本章节汇总一轮分区排查的修复。除下列条目外，还修掉了冒烟中实测到的
+「文档/注释说已修、实际没生效」问题，均带复现路径：
 
-- **幂等**：`x-atb-idempotency-key` 现在绑定「agent + method + path + query + body 指纹」。
+- **幂等（阻断级）**：`x-atb-idempotency-key` 现在绑定「agent + method + path + query + body 指纹」。
   同 key 换 body 返回 **409 `idempotency_key_reused`**；同 key 并发只执行一次（in-flight 占位，
   其余请求等待结果回放，超时 504 `idempotency_in_flight_timeout`）；dry-run 与空 body 不入缓存。
-- **脚本重复执行**：`exec` 的「SyntaxError 后换 AsyncFunction 重跑」改为**先编译再决定通道**；
+- **脚本重复执行（阻断级）**：`exec` 的「SyntaxError 后换 AsyncFunction 重跑」改为**先编译再决定通道**；
   扩展侧用前置探针区分「编译期语法错误」与「用户自己 throw SyntaxError」，后者不再二次执行
   （副作用翻倍）。实测 `window.__n++` 在抛错场景只加 1。
 - **restart 必然失败**：daemon 每次启动都会轮换 token 文件，而 CLI 进程内缓存了旧 token，
@@ -157,35 +252,20 @@
 - **`@0` / `@0-MAX`**：序号 0 明确拒绝（退出 2），区间跨度用受检算术，不再溢出 panic。
 - **进程身份核对**：`restart --force` / `doctor --fix` 强杀前逐个 PID 核对可执行路径与命令行，不符则跳过并给 `skipped_reason`。
 
-### Fixed (2026-11-04)
+### Fixed（2026-11-04 收尾）
 
-本节修复以下问题：
+本批共处理 96 条问题（基线 26 条 + 新发现 67 条 + 跨分区更正 3 条），逐条核验后全部落地，其中 5 条高优先级：
 
-- **挑战链路**：`auto_wait_challenge` 的识别重试循环改为受 `--challenge-timeout` 总预算约束（扩展挂死时不再空耗约 99s）；`challenge_auto_solve` 的轮询补上 `challenge_status_usable` 守卫，空载荷不再被报成 `solved:true`。同时：`role=textbox` 写入后读回校验、`reload` 成功才置 `reloaded`、`cdp_call` 缺 `ok` 且载荷非对象时报错、`challenge click --at` 尊重 `--timeout`、切标签失败写入 `diag`、裸 objectId 点击合并为单次往返；双组件场景按面积轮转前 3 个，不再只点第一个。
-- **下载**：`download && download-wait` 不再必然假超时 —— 认领在跑条目后按 id 跟踪到终态，另加「10s 内开始的终态条目」窗口（扩展新增 `startTimeMs`/`endTimeMs`），历史旧记录仍不会被当成本次产物。
-- **全局 flag**：`--dry-run` 对 `challenge` / `stealth` 真正生效（零 HTTP、只输出计划），对 `net fetch/hook/mock/unroute/reset`、`network`/`console` 的 start/stop、`download`、`broadcast`、`profile-label`、`launch` 明确拒绝（`unsupported_flag`，退出码 2）；`--async` 在 12 条不支持的命令上不再静默同步执行。
-- **扩展持久化拦截**：`ws-close` / `keepalive-lost` 不再逐个删除持久化快照条目；重连与冷启动会对快照里的 tab **重新 attach** 再 `Fetch.enable`，DevTools 占用时保留条目下次重试（此前「保留快照」没有真正的恢复路径）。
+- **挑战链路（高优先级）**：`auto_wait_challenge` 的识别重试循环改为受 `--challenge-timeout` 总预算约束（扩展挂死时不再空耗约 99s）；`challenge_auto_solve` 的轮询补上 `challenge_status_usable` 守卫，空载荷不再被报成 `solved:true`。同时：`role=textbox` 写入后读回校验、`reload` 成功才置 `reloaded`、`cdp_call` 缺 `ok` 且载荷非对象时报错、`challenge click --at` 尊重 `--timeout`、切标签失败写入 `diag`、裸 objectId 点击合并为单次往返；双组件场景按面积轮转前 3 个，不再只点第一个。
+- **下载（高优先级）**：`download && download-wait` 不再必然假超时 —— 认领在跑条目后按 id 跟踪到终态，另加「10s 内开始的终态条目」窗口（扩展新增 `startTimeMs`/`endTimeMs`），历史旧记录仍不会被当成本次产物。
+- **全局 flag（高优先级）**：`--dry-run` 对 `challenge` / `stealth` 真正生效（零 HTTP、只输出计划），对 `net fetch/hook/mock/unroute/reset`、`network`/`console` 的 start/stop、`download`、`broadcast`、`profile-label`、`launch` 明确拒绝（`unsupported_flag`，退出码 2）；`--async` 在 12 条不支持的命令上不再静默同步执行。
+- **扩展持久化拦截（高优先级）**：`ws-close` / `keepalive-lost` 不再逐个删除持久化快照条目；重连与冷启动会对快照里的 tab **重新 attach** 再 `Fetch.enable`，DevTools 占用时保留条目下次重试（此前「保留快照」没有真正的恢复路径）。
 - **服务端生命周期**：撤销断开的 Close 帧带超时；发送等待期间仍每 500ms 检查撤销；在途请求改为「每条请求进入时刷新起点」，`MAX_INFLIGHT_STALL` 提到 3900s（单条 3600s 长请求不再被误杀）；`open` 的 refresh 失败写明 `refresh_error`/`refresh_error_code`；并发许可获取失败不再无许可继续；batch 的 `JoinError` 带原因；关机清理写入的 `daemon_shutdown` 终态不再被完成回写覆盖。
 - **CLI 契约**：`--challenge-timeout` / `--confirm-ms` / `download-wait --timeout,interval` 全部做有限值校验；`net --body`、`broadcast --args` 的非法 JSON 统一 `invalid_json`（退出码 2）；重复 `--header` 报错；`exec` 同时给脚本与 `--file` 报错；`run` 的 `stop_on_error` 冲突报错并回显生效值；`run`/`batch` 的 HTTP 超时按步骤预算求和（上限 24h，不再被 1h 截断）；`close --tab current/window:` 先解析再关；`print_logs` 走 EPIPE 安全输出；`status` 的 `/health` 探测放宽到 3s 并区分 `health_timeout` 与 token 失配。
 - **根级健壮性**：HTML 优化入口加 8MB 上限并迭代拆链（超深嵌套不再栈溢出）；`launch` 强杀前逐个 PID 复核身份、等待期进程枚举带 5s 超时；`config` 回滚失败上抛、`.bak` 与主文件同样收紧 ACL；preflight 数值字段补齐并下沉到 `steps[*]`；`ExtTab.id` 非字符串/整数时丢弃该条；panic 输出结构化 JSON 并以退出码 1 结束。
 - **快照与网络**：`snapshot` 输出 `ref_scheme`（`operable-only` / `all-named`），JS 侧角色集与 CDP 对齐到 18 个；JS 快照的可操作元素判定前置，深分页不再对前缀元素做布局读；`net --max-log` 两处 clamp；`net log --clear` 失败透出 `cdp_clear_error`。
 - **扩展并发与竞态**：持久注入去重串行化；`connectWS` 单飞（不再建两条 WebSocket）；建连即排 keepalive（CONNECTING 卡死可被 15s 超时清掉）；断线期间不再入队 `result`/`error`/`ack`；base64 响应体按 4 字节对齐截断；`batch` 的 `$N` 引用改为结构化精确匹配；标签上报按 URL 过滤 Streamlit 内部端点，不再误伤同标题网页。
 - **新增可选参数（此前的不可达项）**：`snapshot --no-skip-generic`、`read --inner-text-limit`、`challenge --confirm-ms`、`net fetch --credentials / --no-parse-json`。
-
-### 扩展 5.3.0（2026-11-04）
-
-扩展文件版本 `5.3.0`，消息协议保持 `4`，可与 0.7.x 的 daemon 配套；旧 daemon 不认识的新帧只会被忽略，不会让命令失败。
-
-- **`challenge` 入口不可枚举**：`page_challenge.js` 整体包进 IIFE，入口 `window.__abcChallenge` 改用 `Object.defineProperty(..., {enumerable:false, configurable:true})` 挂载。页面侧 `Object.keys(window)` 看不到它，`stealth scrub` 也能真正 `delete` 掉；旧的顶层函数声明会留下不可删除、可枚举的全局，是稳定的自动化指纹。
-- **open shadow DOM 支持**：`find` / `snapshot` / `read` 递归收集 open shadow root，返回项带 `scope:"shadow"`、`host_selector`、`shadow_path`，选择器写成 `宿主 >>> 相对路径`；回包给出 `scope` / `frame_count` / `shadow_roots` / `shadow_skipped` / `shadow_closed_unreachable`。closed shadow root 明确标注不可达（不伪造结果）。
-- **断线重连兜底**：`onclose` 的清理步骤逐个 `try/catch`，`scheduleProbe()` 与 `scheduleFastReconnect()` 放进 `finally`，任一步抛错都不再导致「永久断连」。
-- **socket 换代守卫**：`reconnectWS` 先摘掉旧 socket 的 `onopen/onmessage/onclose` 再关闭；`onopen/onmessage` 首层加 `ws !== socket` 守卫，过期连接的迟到帧一律丢弃。
-- **命令幂等**：WS 命令按 `id` 记 60 秒终态账本（上限 256 条）。同 id 在跑时只回 `duplicate_inflight`，已完成则直接回放原 payload，超时重试不再重复执行副作用。
-- **拼接内存预算**：整页拼接在建画布前按 `宽 × 高 × dpr` 预估像素，超过 `captureMaxPixels`（默认 8000 万，可用 `ATB_CAPTURE_MAX_PIXELS` 调整）返回结构化 `capture_too_large`，不再把 MV3 Service Worker 撑到 OOM。
-- **剪贴板 TTL**：popup「复制 cookies」写入剪贴板后按 `clipboardTtlSec`（默认 30 秒）自动清空，清除前尽量 `readText()` 比对，`pagehide` 时再清一次。
-- **popup 默认掩码**：Cookie 值默认渲染为 `•••`，必须点「显示值」并二次确认才展示；打开 popup 不再自动拉取 Cookie。
-- **网络/console 缓冲上限**：`networkStart` / `consoleStart` 接受 `max_entries`（默认 5000，clamp 100–100000），超出丢最旧；`idempotent:true` 时重复 start 只更新配置并裁剪缓冲，不清空已捕获条目。
-- **exec 取消帧**：新增 `cmd:"cancel"` 处理，按 `execId` 释放 daemon 已超时/取消的那次 CDP attach；被 network/console/Fetch 复用的 attach 回 `cancelled:false, reason:"in_use"`，不打断正在用的采集。
 
 ## [0.7.1] - 2026-11-03
 
@@ -215,7 +295,7 @@
 
 ### Changed
 
-- **命令改名为 `atb`**：Cargo `[[bin]]`、clap `name` / `bin_name`、npm `bin` 同步。
+- **命令改名为 `atb`**：Cargo `[[bin]]`、clap `name` / `bin_name`、npm `bin` 同步；npm 仍保留 `atb2` 兼容别名。
 - **环境变量新前缀 `ATB_*`**：`ATB_AGENT` / `ATB_EXIT0` / `ATB_IDLE_TTL` / `ATB_NO_DEBUGGER` / `ATB_BIN` / `ATB_PACKAGE_DIR`；旧前缀继续生效，新名优先。
 - **配置目录保持 `~/.atb`**：有意不改。换目录会让新旧 daemon 各用一套配置与端口，同时运行更难排查。
 - **CLI ↔ daemon 协议 4 → 5**：升级二进制后必须 `atb restart`；新版 CLI 拒绝连旧 daemon，并给出修复路径。扩展协议仍为 4。
@@ -291,7 +371,9 @@
 
 0.3.x 的最后一个版本。该版本及更早的逐条记录见 [docs/CHANGELOG_ARCHIVE.md](docs/CHANGELOG_ARCHIVE.md)。
 
-[Unreleased]: https://github.com/1728578755/atb-cli/compare/v0.7.3...HEAD
+[Unreleased]: https://github.com/1728578755/atb-cli/compare/v0.7.4...HEAD
+[0.7.4]: https://github.com/1728578755/atb-cli/compare/v0.7.3...v0.7.4
+[0.7.3]: https://github.com/1728578755/atb-cli/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/1728578755/atb-cli/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/1728578755/atb-cli/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/1728578755/atb-cli/compare/v0.6.0...v0.7.0

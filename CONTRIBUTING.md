@@ -57,7 +57,7 @@ cargo run -- tabs
 
 daemon 由 CLI 按需拉起：`tabs`、`open`、`exec`、`scan` 会自动启动。改过 daemon 代码后先 `cargo run -- stop`，再跑下一条命令，确认新进程生效。日志在 `~/.atb/logs/daemon.log`。
 
-扩展：改 `assets/atb_bridge/` 下的文件后，到 `chrome://extensions` 点该扩展的「重新加载」。后台脚本不重载不生效。
+扩展：改 `assets/atb_bridge/` 下的文件后，先用 `node scripts/deploy-extension.mjs --to "<你的扩展目录>"` 原子替换（逐字节校验），再到 `chrome://extensions` 点该扩展的「重新加载」。后台脚本不重载不生效；具体目录见 `docs/EDGE_TROUBLESHOOTING.md`。
 
 页面脚本：只改 `assets/page_*.js`，然后执行：
 
@@ -75,17 +75,20 @@ npm run sync:extension
 | --- | --- | --- |
 | `cargo fmt --all -- --check` | Rust 格式 | 提交前、CI |
 | `cargo clippy --all-targets --all-features -- -D warnings` | 静态检查，告警即失败 | 提交前、CI |
-| `cargo check --all-targets` | 全 target 可编译 | 提交前、CI |
-| `cargo test --all-targets --all-features` | Rust 单元测试 | 提交前、CI |
-| `node --check assets/atb_bridge/background.js`（`content.js`、`popup.js` 同理） | 扩展脚本语法 | 改扩展后、CI |
+| `cargo check --all-targets --locked` | 全 target 可编译，锁文件与 `Cargo.toml` 同步 | 提交前、CI |
+| `cargo test --all-targets --all-features --locked` | Rust 单元测试 | 提交前、CI |
+| `cargo build --release --locked`（`npm run build` 的 cargo 部分） | release profile 可链接（LTO / panic=abort 等差异） | 发布前、CI |
+| 对 `assets/atb_bridge` 下全部 `.js` 逐个 `node --check`（含 `options.js` 与 `ui/**`） | 扩展脚本语法 | 改扩展后、CI |
 | `node tests/check_page_script.mjs` | 页面脚本可解析、入口齐全 | 改页面脚本后、CI |
-| `node --test tests/*.test.mjs` | 页面脚本与接口契约回归 | 提交前、CI |
+| `npm test`（等价 `node --test tests/*.test.mjs`） | 页面脚本与接口契约回归 | 提交前、CI |
 | `node tests/mock_extension.mjs --self-test` | 真 daemon + 假扩展端到端 | 改 daemon 或协议后、CI |
+| `node scripts/e2e.mjs`（CI 只跑 `ATB_E2E=smoke`） | 真 Chrome + 真扩展场景 | 仅 CI Linux（xvfb）；本地手动全量 |
 | `node scripts/sync-version.mjs --check` | 版本号在各处一致 | 改版本后、CI |
 | `node scripts/sync-extension-assets.mjs --check` | `ops/` 与主副本逐字节一致 | 改页面脚本后、CI |
-| `npm ci --dry-run` | `package-lock.json` 与 `package.json` 一致 | 改依赖后、CI |
+| `npm run check:lock`（`node scripts/check-lock.mjs`） | `Cargo.lock` / `package-lock.json` 与清单一致 | 改依赖或版本后、CI |
+| `npm ci --dry-run --ignore-scripts` | `package-lock.json` 与 `package.json` 一致 | 改依赖后、CI |
 
-`node --test tests/*.test.mjs` 只收 `*.test.mjs`。`live_*` 需要真浏览器，`*_bench` 是压测，都不在 CI 里跑。
+`npm test` 只收 `*.test.mjs`。`live_*` 需要真浏览器，`*_bench` 是压测，都不在 CI 里跑。
 
 E2E 占用 `18766` 与 `18767` 端口，必须串行执行。并行会互相抢端口，产生假红或假绿。
 
@@ -131,20 +134,22 @@ docs(skill): rewrite failure handling table
 
 - [ ] `cargo fmt --all -- --check` 通过
 - [ ] `cargo clippy --all-targets --all-features -- -D warnings` 通过
-- [ ] `cargo test --all-targets --all-features` 通过
-- [ ] `node --test tests/*.test.mjs` 通过
+- [ ] `cargo test --all-targets --all-features --locked` 通过
+- [ ] `npm test` 通过
 - [ ] `node scripts/sync-version.mjs --check` 通过
+- [ ] `npm run check:lock` 通过
 - [ ] 改过页面脚本时，`npm run sync:extension` 已执行且 `npm run check:extension` 通过
 - [ ] 文档里的版本锚点逐字未变，或已随版本一起更新
 - [ ] 中英 README 同步：改一边就改另一边
+- [ ] 行为、命令、契约、扩展或构建流程有变化时，README / AI_INSTALL / docs 与 skills 已同步更新
 
 PR 描述写清三件事：改了哪一层、为什么改、怎么验证。输出或行为有变化时贴前后对比。
 
 ## 版本与发布
 
 - 版本唯一真相源是 `package.json`。
-- 改版本后跑 `npm run sync-version`，它写 `Cargo.toml`、`README.md`、`README_EN.md`，并 `git add`。
-- 平台包清单必须四处一致：`package.json` 的 `optionalDependencies`、`node scripts/sync-version.mjs --deps`、`.github/workflows/publish.yml` 的 matrix、`npm/bin/atb.js` 的 `platformPackageName`。
+- 改版本后跑 `npm run sync-version`，它按 [`scripts/version-docs.json`](./scripts/version-docs.json) 的落点清单改写 `Cargo.toml`、`README.md`、`README_EN.md` 等当前真相文档，并 `git add`；新增“当前版本”文档时必须把落点加进清单，否则守卫会空转。
+- 平台包清单必须四处一致：`package.json` 的 `optionalDependencies`、`scripts/platforms.json`、`.github/workflows/publish.yml` 的 matrix、`npm/bin/atb.js` 的平台解析。
 - 扩展版本独立维护：改 `assets/atb_bridge/manifest.json`，同步文档里的版本断言。
 - 发布由 push tag `v*` 触发，也可手动 dispatch。workflow 构建 5 个平台包后发布 npm。
 

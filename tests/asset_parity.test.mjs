@@ -111,7 +111,7 @@ if (!existsSync(challengePath)) {
 
 // 扩展版本漂移守卫：manifest.json 是唯一真相源。
 //
-// v6 P3 的实锤：manifest 早已是 5.2.1，README 三处仍写「扩展 5.0.0」，用户按文档
+// v6 的实锤：manifest 早已是 5.2.1，README 三处仍写「扩展 5.0.0」，用户按文档
 // 判断「我装的是不是新的」会得到错误结论。这里直接拿 manifest 的版本去比对文案。
 const manifest = JSON.parse(readFileSync(join(ASSETS, 'atb_bridge', 'manifest.json'), 'utf8'));
 const extVersion = manifest.version;
@@ -136,8 +136,8 @@ for (const [label, ok] of versionChecks) {
 }
 
 // 更强的守卫：**当前文档**里出现的任何 `5.x.y` 都必须等于 manifest 版本。
-// 只查固定句式会漏掉「安装文档里多处旧版本号」这种整篇漂移。
-// 历史快照不在此列。
+// 只查固定句式会漏掉「安装文档里 7 处 5.2.5」这种整篇漂移（实测踩到）。
+// 历史记录（CHANGELOG_ARCHIVE）不在此列。
 //
 // 清单来源：
 //   1. scripts/version-docs.json 的 extension[] —— 打包脚本与文档共用同一份落点，

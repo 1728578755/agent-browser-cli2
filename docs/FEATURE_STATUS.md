@@ -1,6 +1,6 @@
 # 能力现状：已实现 / 下一步 / 边界
 
-更新时间：2026-11-04（扩展 5.3.0 ATB，CLI 0.7.3，CLI↔daemon 协议 5，扩展协议 4）
+更新时间：2026-11-06（扩展 5.4.2 ATB，CLI 0.7.4，CLI↔daemon 协议 5，扩展协议 4）
 
 顶层命令 **55 个**（`atb --help`，不含 `help`；另有 `net` / `job` / `challenge` / `stealth` / `network` / `console` / `lookup` / `profile-label` / `trust-extension` 等子命令）。主命令名为 `atb`。
 
@@ -19,7 +19,7 @@
 | 诊断自动修复 | `atb doctor --fix [--force]` | 旧 daemon 占端口（netstat/lsof 找 PID；`--force` 才 taskkill，否则只打印命令）、API token 失配（删 `~/.atb/api-token`）、扩展过旧（打印带实际路径的重载指引）；每条输出 `{fix, executed, result}` |
 | 批量抓取 | `atb scrape` | `--urls` 文件/逗号列表（去重）→ 分批后台开页（`--batch`，默认 4）→ 并发执行 JS（`--concurrency`，默认 4）→ 结果写 `--out`（JSONL：`{url, tab_id, ok, data, error, elapsed_ms, attempts, outcome_unknown}`）→ 批完关页 → 失败退避重试（3s/5s/7s，`--retry` 默认 3 轮）→ 摘要；默认每个 URL 只写一条最终记录（诊断「第几次才成功」用 `--record-attempts` 逐次写）；`outcome_unknown` 的 URL 不重试、最终退出码 4；`--batch/--concurrency` 超出 1..=32 退出 2；`--js-file` 缺省取 `{title,url,text(前9000字)}`；全部 CLI 侧编排，复用 open/exec/close，不改 daemon |
 
-### 当前能力（CLI 0.7.3 / 扩展 5.3.0）
+### 当前能力（CLI 0.7.4 / 扩展 5.4.2）
 
 | 能力 | 命令/字段 | 说明 |
 |---|---|---|
@@ -29,7 +29,7 @@
 | PDF / 截图体积护栏 | `ATB_IO_MAX_OUTPUT_MB` / `ATB_CAPTURE_MAX_PIXELS` | 编码前按 base64 长度比对预算，超限返回结构化 `capture_too_large`；拼接按像素总量判断，默认 8000 万，不再 OOM |
 | 下载名净化 | `download --filename` / daemon | 拒绝绝对路径、分隔符、`..`、空名、Windows 保留名、尾部点空格；取 basename，超 180 字符截断保留扩展名。回包 `filename_sanitized{requested,applied,changed,warnings}`；`--dir` 拒绝 `..` 段 |
 | 下载取消与归属 | `download-wait` | `ATB_DOWNLOAD_CANCEL_ON_TIMEOUT` / `ATB_DOWNLOAD_CANCEL_ERASE` 控制超时是否取消/擦除；`ATB_DOWNLOAD_AUTO_CLAIM=false` 且无 `--id` 时回 `download_id_required`；每 agent 记住最近 N 条（`ATB_DOWNLOAD_REGISTRY_DEPTH`，默认 8），回包 `claimed_from` |
-| WS 四档信任 | `ATB_WS_TRUST_MODE` | `compat`（默认）/ `whitelist` / `token` / `both`；非 compat 档 fail-closed，缺配置或校验失败直接拒绝握手（`ws_whitelist_not_configured` / `ws_untrusted_extension` / `ws_token_not_configured` / `ws_token_invalid`）。`/health.ws_security` 与 `atb status` 透出 `mode` + `warning` |
+| WS 四档信任 + 双向鉴权 | `ATB_WS_TRUST_MODE` | `compat`（默认）/ `whitelist` / `token` / `both`；非 compat 档 fail-closed（`ws_whitelist_not_configured` / `ws_untrusted_extension` / `ws_token_not_configured` / `ws_token_invalid`）。配 token 后 daemon 在 upgrade 后下发 `ws_hello`（nonce + HMAC-SHA256 proof），扩展验证通过才发 `ext_ready`，失败记 `daemon_auth_failed`；`/health.ws_security`、`atb status.security` 与 `doctor.ws_trust` 透出 `mode` / `token_configured` / `mutual_auth` |
 | cancel 帧 | `exec` 超时/取消 | daemon 向扩展发 `{cmd:"cancel", execId, tabId}`，扩展按 `execId` 释放这次 attach；被 network/console/Fetch 复用时不打断，回 `cancelled:false, reason:"in_use"` |
 | 幂等落盘收敛 | `--idempotency-key` | 默认 `ATB_IDEMPOTENCY_PERSIST=redacted`，只写 `{key,scope,at,status}`；`full` 才写响应体（单条 256KB），`off` 不落盘。错误响应（4xx/`ok:false`）不再进缓存；`Pending` 占位有 Drop 守卫，取消/panic 不会让同 key 永久 504 |
 | 网络/console 上限 | `network list` / `console list` | `limit` clamp 到 1–500 并回显 `clamped`；`networkStart` / `consoleStart` 下发 `max_entries`（默认 5000）与 `idempotent:true`，重复 start 不清空缓冲；单条日志 `url`/`body`/`headers` 超 `ATB_NET_LOG_ITEM_CHARS`（默认 8192）截断并标 `truncated` |
@@ -40,11 +40,11 @@
 | `tabs --limit 0` | `tabs` | `0` 表示**不截断**（返回全部），不是空列表；`tabs_count` 保持原始总数，另给 `returned_count` 与 `total_before_limit` |
 | 组合命令结果语义 | `--wait-js` / `scrape` / `broadcast` | `wait.ok=false` 或 `matched=false` 时写 `wait_js_failed`，顶层 `ok:false` + 退出码 1；`scrape` 的传输层失败标 `outcome_unknown`（退出码 4）且不重试；`ATB_RESULT_STRICT=strict` 可让组合命令任一子结论失败即整体失败 |
 
-### 反检测与挑战自动等待（0.6.0 新增）
+### 反检测与挑战自动等待（0.6.0 新增，后续修订）
 
 | 能力 | 命令 | 说明 |
 |---|---|---|
-| 命令改名 | `atb` | Cargo `[[bin]]`、clap `name`/`bin_name` 均为 `atb`；npm `bin` 为 `atb`；配置目录仍为 `~/.atb`（有意不改，避免新旧 daemon 各用一套目录与端口） |
+| 命令改名 | `atb` | Cargo `[[bin]]`、clap `name`/`bin_name` 均为 `atb`；npm `bin` 只提供 `atb`，指向 `npm/bin/atb.js`；配置目录仍为 `~/.atb`（有意不改，避免新旧 daemon 各用一套目录与端口） |
 | 环境变量新前缀 | `ATB_AGENT` / `ATB_EXIT0` / `ATB_IDLE_TTL` / `ATB_NO_DEBUGGER` / `ATB_BIN` / `ATB_HOME` / `ATB_WS_TRUST_MODE` 等 | 新名优先，旧前缀 `AGENT_BROWSER_CLI_*` 继续生效；完整的 65 个 `ATB_*`（56 个用户可见 + 9 个测试/CI）按主题分组列在 README「环境变量」章节 |
 | 痕迹审计 | `stealth audit`（默认） | MAIN world 审计站点可读信号，输出 `score`(0-100) / `level`(clean/low/medium/high) / `headline` / `findings[]` / `env` / `self_fixable` / `extension_version` / `extension_ok` / `fixes` |
 | 审计项 scope | `findings[].scope` | `self`=本工具自身（own_globals / own_dom_badge / own_net_hook）；`browser`=启动方式与窗口状态（webdriver / Headless UA / plugins 空 / 窗口 0 / SwiftShader / 时区空 / Notification 权限不一致 / **tab_hidden 后台标签**）；`unknown`=框架残留与被他人改写的 fetch/XHR |
@@ -139,7 +139,7 @@
 |---|---|---|
 | 结构化读取 | `read [--selector] [--max-chars] [--links] [--no-forms] [--include-hidden] [--budget-ms N] [--max-nodes N] [--frame N]` | 标题/URL/正文/元信息/标题层级/各类计数/表单结构；单遍遍历 + 时间预算，超大页面不卡 |
 | 隐藏文本 | `read --include-hidden` | 走 `textContent` 语义，把 `display:none` / `hidden` / `aria-hidden` / CSS 隐藏的内容也返回；默认仍只返回可见文本（`text_mode` 标明 `visible` / `visible-approx` / `all`） |
-| 元素查找 | `find <selector>` / `find --text <文本>` / `find --xpath <expr>` | 命中数 + 每个元素的可操作信息（tag/text/value/href/rect/disabled/checked/selector）；`selector` 保证文档内**唯一**；口令/支付类字段的 `value` 返回 `•••` 并标 `redacted:true` |
+| 元素查找 | `find <selector>` / `find --text <文本>` / `find --xpath <expr>` | 命中数 + 每个元素的可操作信息（tag/text/value/href/rect/disabled/checked/selector）；`selector` 为命中元素的 CSS 选择器（`find` 命中多个时全部返回，动作类命令取第一个）；口令/支付类字段的 `value` 返回 `•••` 并标 `redacted:true` |
 | 页面扫描 | `scan [--tabs-only] [--text-only] [--fast] [--max-nodes N]` | 精简 HTML、纯文本或快速文本；超大页面（>6 万元素）自动改走文本并注明；固定浮层广告/被遮挡层会被剔除，超 512 层嵌套截断并注明 |
 | 页面网络 | `net fetch <url> [--method] [-H k:v] [--body] [--response-type]` | 在页面上下文发请求（带 cookie / 同源策略 / 页面 CSP 视角），返回 status/headers/body/json |
 | 网络 hook | `net hook [--capture-bodies] [--persist] [--match <pattern>]` / `net log` / `net reset` | 包装 `fetch` 与 `XMLHttpRequest`，记录 URL/方法/状态/耗时；`--persist` 把「库 + 规则」注册成 document_start 注入，**刷新/跳转后自动重装** |
@@ -188,7 +188,7 @@
 | 跨浏览器广播 | `broadcast <op> [--script S\|--args JSON] [--browser B] [--profile P] [--concurrency N]` | 一次在**所有**匹配的 browser/profile 上并发执行同一操作，逐目标返回结果与耗时 |
 | 下载监听 | `downloads [--limit] [--state] [--id]` / `download <url> [--filename] [--dir]` / `download-wait [--id] [--timeout]` | 扩展 `chrome.downloads`，list/start/wait；wait 在 daemon 侧轮询 |
 
-同一标签的命令在 daemon 内**串行排队**（每会话一把异步锁），不同标签各自并发；这样同一标签 50+ 并发不会互相踩踏，也不会拖慢其它标签。
+同一标签的命令在 daemon 内**串行排队**（每会话一把异步锁，仅「注入」这一步持锁；等回包 / `wait --js` 轮询期间主动放锁，不空占锁），不同标签各自并发；这样同一标签 50+ 并发不会互相踩踏，也不会拖慢其它标签。
 
 `batch` 的可用 op：`exec / read / find / action / wait / scan / snapshot / click / fill / mouse-click / send-keys / upload / screenshot / save-pdf / cookies`。
 
@@ -214,7 +214,8 @@
 - `doctor`：`extension_fresh` 等检查项。
 - daemon 发现扩展版本落后会主动发 `management.reload`（同版本只发一次）。
 - 扩展每 60 秒比对 `background.js` 哈希，磁盘有改动且空闲时自我重载。
-- popup 有「运行版本 + 重新加载扩展」按钮。
+- `status` / `tabs` / `browsers` 的 `browser_label` 带品牌与完整版本（`Chrome 156.0.8078.79 · Windows · #cac3`），多浏览器并行时可直接区分。
+- popup 有「连接状态 / 数据 / 设置」三段，右上角进入管理页面（`options.html`）：端口、token、信任档位、主题、弹窗宽度、间距、角标开关、Cookie 与诊断；「运行版本」与「重新加载扩展」在设置段里。
 - 诊断命令：`injectProbe`（三种注入路径）、`selfCheck`（哈希基线/定时器状态）。
 
 ---
@@ -277,7 +278,7 @@
 | P2 | 下载进度事件 | 现在是轮询 `chrome.downloads.search`；高频进度可用 `onChanged` 推送 |
 | P2 | 统一响应信封 + `timing` 字段 | 现在 `/tabs`、`/scan` 仍是 `{ok,result:{...}}` 双层 |
 | P2 | `snapshot` 增量与分页游标 | 大页面一次返回全部引用仍然偏大 |
-| P2 | 单 tab 并发上限与背压 | 同一标签 50+ 并发时缺少排队策略 |
+| P2 | 单 tab 并发背压 | 排队已实现（每会话一把串行锁，同标签命令排队执行）；背压 / 优先级策略待定 |
 | P3 | `click`/`fill` 全面改页面内动作 | 现在只有 `@e`（JS 快照）与 `--frame` 走页面内；CSS 选择器仍默认 CDP |
 
 > **2026-11-01 更新（已变更）**：上表 `net` 规则那一行已不成立——`net` 规则现在按 `browser:profile` 共享（见 §1「网络 mock」），同 profile 下任意标签的 `net routes` / `net mock` / `net reset` 作用于同一套规则，`--persist` 注册的规则在新标签加载时自动生效，换标签不需要重新 hook。另：`net unroute` 现支持 `--engine page|cdp`，CDP 规则可单独删除，不必 `net reset` 全清；CDP 引擎的「放行」默认不再写日志，`net log` 里留下的是真正被拦的请求。
@@ -318,10 +319,9 @@
 - **隐式默认目标有粘性**：默认标签所在连接断开时，daemon 会把这条标签记进 `preferred_default_session_key`（6 小时 TTL），同一标签重连后自动恢复为默认；只有标签真的关了才会永久切走。`read` 在「≥2 个浏览器 + 未显式指定目标」时会附带 `multi_browser_hint`；`/health.connection` 的 `default_session_key` 与 `profiles[].is_default` 可查当前默认落在哪个浏览器。
 - 具名 agent（`--agent`）的默认标签失效时，**动作类命令**直接报 `target_lost` 而不是回退到别人的标签（多智能体不串线）；`open` 例外：它会先清掉失效默认再开新页，所以 `cleanup` 之后仍能继续 `open`。
 
-**明确保留的限制**
+**当前明确保留的限制**
 
 - **closed shadow root 不可达**：`find` / `snapshot` / `read` 只能递归 open shadow root；closed shadow root 内的节点页面 JS 与扩展注入都取不到，回包用 `shadow_closed_unreachable:true` 明示。CF 的 Turnstile 就常在 closed shadow root 里，所以 `challenge` 改用 CDP `DOM.getDocument{pierce:true}` 而不是页面查询。
 - **Chrome match pattern 不支持端口**：`net hook --persist` 的 `*://host/*` 无法表达 `host:port`，同一 host 的不同端口会互相命中；回包会带 `warning`，要按端口隔离只能用 `--match` 显式指定或改 `net route --engine cdp`。
-- **WS 无 TLS**：daemon 与扩展之间的 WebSocket 是明文回环连接，`ATB_WS_TRUST_MODE` 只能约束「谁能连」，不能让扩展证明「对端是真 daemon」。要完全闭合需要 daemon 侧 HMAC 挑战，当前未实现；默认 `compat` 档下同机进程可伪造 `Origin`。
-- **`e2e-live` 未在本机验证**：CI 新增的 `e2e-live`（xvfb + Chrome for Testing + `--load-extension`）已接入工作流，但本机没有 Chrome/xvfb，未实跑；Chrome 137+ 对 `--load-extension` 的支持需首次 CI 验证。
+- **WS 是明文回环（残余风险）**：daemon 与扩展之间的 WebSocket 没有 TLS。配置 `ws-trust.json` 的 token 后，握手会做 HMAC 双向证明（`ws_hello`），拿不到 token 的本机进程无法冒充 daemon；未配 token（默认 `compat`）时仍是单向信任，同机进程可伪造 `Origin`。需要传输层加密时应在回环外另行封装。
 - **`snapshot --js` 的 shadow 覆盖依赖脚本版本**：旧扩展不回 `scope` / `shadow_*` 字段，此时 `coverage_complete` 不出现（形状保持兼容），不能据此判断「已覆盖 shadow」。

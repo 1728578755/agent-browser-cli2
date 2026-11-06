@@ -16,10 +16,16 @@
 // 之前只认 README 的两种固定句式，README 表格行、AI_INSTALL、SECURITY、PRIVACY、
 // FEATURE_STATUS、BEST_PRACTICES、skills/** 的版本串完全无守卫，实测已漂移到 5.2.5。
 //
+// 两条防线：
+//   1. 规则层面：每条 pattern 必须至少命中一次，0 命中即失败（以前只打 stderr 提示、
+//      --check 照样 exit 0，规则可以从半失效烂到全失效）；
+//   2. 兜底层面：sweep.files 里出现的任何 x.y.z 都必须等于当前 CLI/扩展版本，或在
+//      sweep.allow / allowByFile 显式登记。README 标题里的版本号就是靠这条覆盖的。
+//
 // 写入模式是事务式的：任何一步失败（含结尾复核发现的 package-lock 漂移）都会把**所有**
 // 改过的文件按原内容写回，不会留下半成品。
 //
-// 退出码：0 一致 / 已写入；1 不一致或文件缺失（CI 直接失败）。
+// 用法/退出码不变：0 一致或已写入；1 不一致、规则失效或出现未登记版本串（CI 直接失败）。
 
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
@@ -121,11 +127,12 @@ function withVersion(match, version, target) {
 }
 
 /// 扫描一组文档规则。
-/// 返回 { problems, changes }：problems 是「不一致 / 守卫失效」，changes 是待写入的新全文。
+/// 返回 { problems, changes, found }：problems 是「不一致 / 守卫失效」，changes 是待写入的新全文，
+/// found 是命中的 { file, line, value }（用来给兜底扫描判断「哪些旧版本号该被改写」）。
 function scanDocs(root, entries, target) {
   const problems = [];
   const changes = [];
-  const notes = [];
+  const found = [];
   for (const entry of entries) {
     const path = join(root, entry.file);
     if (!existsSync(path)) {
@@ -136,7 +143,7 @@ function scanDocs(root, entries, target) {
     const exclude = (entry.exclude ?? []).map((source) => new RegExp(source));
     const patterns = (entry.patterns ?? []).map((source) => new RegExp(source, 'g'));
     const hits = patterns.map(() => 0);
-    const found = [];
+    const entryFound = [];
     const lines = text.split('\n');
     const nextText = lines
       .map((line, index) => {
@@ -145,7 +152,7 @@ function scanDocs(root, entries, target) {
         for (let p = 0; p < patterns.length; p += 1) {
           next = next.replace(patterns[p], (match, version) => {
             hits[p] += 1;
-            found.push({ line: index + 1, value: version });
+            entryFound.push({ line: index + 1, value: version });
             return withVersion(match, version, target);
           });
         }
@@ -155,23 +162,82 @@ function scanDocs(root, entries, target) {
 
     // 守卫空转是这一批缺陷的通病（同源）：一条都匹配不上时必须报错，
     // 不能让「文档改了措辞」静默变成「版本永远一致」。
-    if (found.length === 0) {
+    if (entryFound.length === 0) {
       problems.push(`${entry.file} 里没有任何可校验的版本串（规则失效，见 scripts/version-docs.json）`);
-      continue;
     }
-    for (const item of found) {
+    // 单条规则 0 命中同样是失守。以前只打一行 stderr 注意、--check 仍 exit 0，
+    // 规则可以从「半失效」烂到「全失效」才被拦住。
+    for (let p = 0; p < patterns.length; p += 1) {
+      if (hits[p] === 0) {
+        problems.push(
+          `${entry.file} 的第 ${p + 1} 条规则（${entry.patterns[p]}）没有命中：文档措辞可能已改，版本守卫失效`,
+        );
+      }
+    }
+    for (const item of entryFound) {
+      found.push({ file: entry.file, ...item });
       if (item.value !== target) {
         problems.push(`${entry.file}:${item.line} 的版本 = ${item.value} ≠ ${target}`);
       }
     }
-    for (let p = 0; p < patterns.length; p += 1) {
-      if (hits[p] === 0) {
-        notes.push(`${entry.file} 的第 ${p + 1} 条规则（${entry.patterns[p]}）没有命中，可能已被改写`);
-      }
-    }
     if (nextText !== text) changes.push({ file: entry.file, text: nextText, target });
   }
-  return { problems, changes, notes };
+  return { problems, changes, found };
+}
+
+/// 兜底扫描：规则清单之外出现的任何 `x.y.z` 都必须有归属。
+///
+/// 为什么规则清单不够：README / README_EN 的章节标题「### 0.7.2 / 扩展 5.4.2 的新增能力」
+/// 从来没有任何 pattern 覆盖，升版本后它会安静地停在旧号上——`--check` 全绿，用户看到两个版本。
+/// 这里把所有文档里的版本号捞出来，只有「等于当前版本」「显式登记为历史/外部版本」才放行；
+/// 写入模式下，等于**旧版本号**（本次要升掉的那个）的会被一起改写。
+function scanSweep(root, sweep, target) {
+  if (!sweep || !Array.isArray(sweep.files) || sweep.files.length === 0) {
+    return { problems: ['scripts/version-docs.json 缺少 sweep.files：版本兜底扫描失效'], changes: [] };
+  }
+  const problems = [];
+  const changes = [];
+  const allowed = new Set(sweep.allow ?? []);
+  const allowPatterns = (sweep.allowPatterns ?? []).map((source) => new RegExp(source));
+  const allowByFile = sweep.allowByFile ?? {};
+  const rewriteable = new Map([
+    ...[...(target.oldCliVersions ?? [])].map((version) => [version, target.cli]),
+    ...[...(target.oldExtVersions ?? [])].map((version) => [version, target.ext]),
+  ]);
+
+  for (const rel of sweep.files) {
+    const path = join(root, rel);
+    if (!existsSync(path)) {
+      problems.push(`兜底扫描：文档 ${rel} 不存在（恢复文件，或从 scripts/version-docs.json 的 sweep.files 移除）`);
+      continue;
+    }
+    const fileAllowed = new Set(allowByFile[rel] ?? []);
+    const text = readFileSync(path, 'utf8');
+    let changed = false;
+    const nextText = text
+      .split('\n')
+      .map((line, index) => {
+        return line.replace(/\b(\d+\.\d+\.\d+)\b/g, (match, version, offset, whole) => {
+          if (version === target.cli || version === target.ext) return match;
+          if (allowed.has(version) || fileAllowed.has(version)) return match;
+          if (allowPatterns.some((pattern) => pattern.test(version))) return match;
+          const replacement = rewriteable.get(version);
+          if (replacement) {
+            changed = true;
+            return withVersion(match, version, replacement);
+          }
+          problems.push(
+            `${rel}:${index + 1} 的版本串 ${version} 既不是 CLI ${target.cli}、也不是扩展 ${target.ext}：` +
+              '如果是历史/外部版本，请登记到 scripts/version-docs.json 的 sweep.allow 或 allowByFile；' +
+              '如果是漏改的版本号，请补一条 cli/extension 规则',
+          );
+          return match;
+        });
+      })
+      .join('\n');
+    if (changed) changes.push({ file: rel, text: nextText, target: target.cli });
+  }
+  return { problems, changes };
 }
 
 // ---------------------------------------------------------------------------
@@ -187,7 +253,7 @@ function compareList(actual, expected) {
 
 /// package-lock 的一致性校验：npm ci 在 version 漂移时会直接 EUSAGE（v5）。
 ///
-/// v6 P3 只比版本号； 起连平台条目的 os/cpu/resolved 一起比——这几个字段错了
+/// v6 只比版本号； 起连平台条目的 os/cpu/resolved 一起比——这几个字段错了
 /// npm 会「安装成功」但把错误的架构装进来（或直接跳过该 optional 依赖），
 /// 用户要等到运行时 native binary not found 才发现。
 function checkLock(root, pkg, platforms, registry) {
@@ -271,7 +337,7 @@ function checkLock(root, pkg, platforms, registry) {
 }
 
 /// Cargo.lock 也要跟着 package.json 走：`cargo build --locked` 以 lock 为准，
-/// 漏改会让下游构建直接失败（v6 P3）。
+/// 漏改会让下游构建直接失败（v6）。
 ///
 /// `sourceLabel` 只影响报错措辞：写入前的自检比较的是「lock vs 当前 Cargo.toml」，
 /// 说成「≠ package.json」会把人引向错误的文件。
@@ -416,12 +482,12 @@ function main() {
   const docRules = loadDocRules();
   const problems = [];
   const changes = [];
-  const notes = [];
   const collect = (result) => {
     problems.push(...result.problems);
     changes.push(...result.changes);
-    notes.push(...result.notes);
   };
+  const cliFound = [];
+  const extFound = [];
 
   let cargoPath = null;
   let cargoName = null;
@@ -448,15 +514,28 @@ function main() {
     }
     problems.push(...checkLock(root, pkg, platforms, registry));
     problems.push(...checkCargoLock(cargoPath, cargoName, packageVersion));
-    collect(scanDocs(root, docRules.cli, packageVersion));
+    const cliScan = scanDocs(root, docRules.cli, packageVersion);
+    collect(cliScan);
+    cliFound.push(...cliScan.found);
   }
   if (args.ext) {
-    collect(scanDocs(root, docRules.extension, extVersion));
+    const extScan = scanDocs(root, docRules.extension, extVersion);
+    collect(extScan);
+    extFound.push(...extScan.found);
   }
 
-  for (const note of notes) console.error(`注意: ${note}`);
+  // 兜底扫描：规则清单之外的版本串必须有归属。只在 --check 分支里算问题；
+  // 写入模式在改完规则命中的版本串之后再扫一遍（否则两个改动会互相覆盖）。
+  const sweepTarget = {
+    cli: packageVersion,
+    ext: extVersion,
+    oldCliVersions: new Set(cliFound.filter((item) => item.value !== packageVersion).map((item) => item.value)),
+    oldExtVersions: new Set(extFound.filter((item) => item.value !== extVersion).map((item) => item.value)),
+  };
 
   if (args.check) {
+    const sweepResult = scanSweep(root, docRules.sweep, sweepTarget);
+    problems.push(...sweepResult.problems);
     if (problems.length === 0) {
       const scope = [args.cli ? `CLI ${packageVersion}` : null, args.ext ? `扩展 ${extVersion}` : null]
         .filter(Boolean)
@@ -473,6 +552,12 @@ function main() {
     }
     if (problems.some((line) => /\.md:/.test(line) || line.includes('没有可校验的版本串'))) {
       console.error('文档版本串：运行 `node scripts/sync-version.mjs`（或 --ext）自动改写，规则在 scripts/version-docs.json');
+    }
+    if (problems.some((line) => line.includes('没有命中') || line.includes('既不是 CLI'))) {
+      console.error(
+        '文档守卫失效：脚本里新增了规则却没命中、或出现了未登记的版本串 —— ' +
+          '补 cli/extension 规则，或把历史/外部版本登记到 scripts/version-docs.json 的 sweep.allow / allowByFile',
+      );
     }
     process.exit(1);
   }
@@ -574,6 +659,17 @@ function main() {
     }
   }
 
+  // 规则命中改写完之后再跑兜底扫描：此时磁盘上是新内容，旧版本号可以安全地一并改掉，
+  // 两轮改动不会互相覆盖。
+  const sweepWrite = scanSweep(root, docRules.sweep, sweepTarget);
+  for (const change of sweepWrite.changes) {
+    const path = join(root, change.file);
+    if (writeTracked(path, change.text)) {
+      console.log(`已把 ${change.file} 里未登记的旧版本串改写为 ${change.target}`);
+      written.push(change.file);
+    }
+  }
+
   // 结尾复核用**写完之后**的状态：前面的 problems 是写入前算的。
   // 这里必须也走 rollback：否则「Cargo.toml 升了、package-lock 漂了」会留下
   // 一个既不能用 `npm ci` 也不能用 `cargo build --locked` 的半成品工作区。
@@ -586,6 +682,10 @@ function main() {
   if (args.ext) {
     remainingProblems.push(...scanDocs(root, docRules.extension, extVersion).problems);
   }
+  // 写完后的兜底扫描不再有「旧版本可改写」，任何残留都是真问题。
+  remainingProblems.push(
+    ...scanSweep(root, docRules.sweep, { ...sweepTarget, oldCliVersions: new Set(), oldExtVersions: new Set() }).problems,
+  );
   if (remainingProblems.length > 0) {
     const restored = rollback();
     for (const line of remainingProblems) console.error(`版本不一致: ${line}`);

@@ -91,7 +91,7 @@
       .map(([name, entry]) => ({ name, code: entry.code, world: entry.world || 'MAIN' }));
     if (!hits.length) return;
 
-    // 旧实现 `sendMessage(...).catch(=>{})` —— 既不 await 也不看回包。
+    // 审阅 旧实现 `sendMessage(...).catch(=>{})` —— 既不 await 也不看回包。
     // document_start 阶段 SW 常常还在启动（或刚被回收），消息会失败；
     // 那时这页的持久注入就**永久丢失**了，连一条日志都没有。
     // 现在：await + 校验 ok / applied，本地重试 2 次（50/150ms 退避），

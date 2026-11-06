@@ -1,7 +1,7 @@
-// popup 的 UI 逻辑。
+// popup 的 UI 逻辑（v5.4.0 视觉重构；安全语义与消息契约保持不变）。
 //
 // 安全前提：
-//   * 打开 popup **不再自动拉取并明文渲染 cookie**；只有点「刷新」才请求，
+//   * 打开 popup **不自动拉取并明文渲染 cookie**；只有点「刷新」才请求，
 //     且默认只显示 name + [H]/[S]/[P] 标记，值一律 •••；
 //   * 「显示值」需要二次点击确认；popup 关闭 / 页面隐藏时立即恢复掩码；
 //   * 「复制 cookies」写入系统剪贴板后按 TTL（默认 30s，范围 30..300）自动清除，
@@ -9,212 +9,444 @@
 //     并在 UI 上如实说明）。
 //
 // 可访问性：状态区 role=status + aria-live=polite，错误区 role=alert；
-// 底层 JS 异常先经 friendlyError() 映射成人能读懂的提示，不直接回显裸 message。
+// 底层 JS 异常先经 ATB.friendlyError() 映射成人能读懂的提示，不直接回显裸 message。
+//
+// 布局：顶部品牌栏 + 三段分区（状态 / 数据 / 设置），只有内容区滚动；
+// 所有颜色与间距来自 ui/tokens.css，浅色深色同一套结构。
 
-const MSG_TTL_OK_MS = 4000;
 const COOKIE_TTL_MIN_SEC = 30;
 const COOKIE_TTL_MAX_SEC = 300;
 const COOKIE_TTL_DEFAULT_SEC = 30;
+const STATUS_POLL_MS = 5000;
 
 let lastCookieData = [];
-let lastCookieText = '点击「刷新」获取 cookies（默认只显示名称与标记）...';
+let lastCookieText = '点「刷新」读取当前站点的 cookies。值默认打码，仅在本机显示。';
+// 3：默认必须是掩码状态，任何「重新打开 / 重新读取」都要回到这里。
 let cookieRevealed = false;
 let revealArmedAt = 0;
 let clipboardTimer = null;
 let lastCopiedText = '';
 let clipboardTtlSec = COOKIE_TTL_DEFAULT_SEC;
+let filterText = '';
+let activeTab = 'status';
+let statusTimer = null;
+let lastStatus = null;
 
-const msgTimers = new WeakMap();
+const $ = (id) => document.getElementById(id);
 
-/**
- * 把底层异常映射成用户能行动的中文提示。
- * raw message 里带 "Could not establish connection" 这类字眼时，
- * 直接展示等于让用户面对一条 chrome 内部错误，完全无法自查。
- */
-function friendlyError(error) {
-  const raw = String((error && error.message) || error || '');
-  if (!raw) return '未知错误';
-  if (/Could not establish connection|Receiving end does not exist/i.test(raw)) {
-    return '扩展后台正在重启，请稍后重试，或点「重新加载扩展」';
-  }
-  if (/message port closed|The message port closed/i.test(raw)) {
-    return '扩展后台没有响应，请稍后重试，或点「重新加载扩展」';
-  }
-  if (/Extension context invalidated|context invalidated/i.test(raw)) {
-    return '扩展已更新，请关闭并重新打开这个 popup';
-  }
-  if (/Cannot access contents of|chrome:\/\/|chrome-extension:\/\//i.test(raw)) {
-    return '当前标签页不允许访问（chrome:// 或扩展页），请先切到普通网页';
-  }
-  if (/No tab with id|Invalid tab ID/i.test(raw)) {
-    return '当前标签页已关闭，请重新打开一个网页';
-  }
-  if (/Clipboard|clipboard/i.test(raw)) {
-    return '剪贴板操作被浏览器拒绝（需要焦点与用户手势），请重试';
-  }
-  if (/^unknown$/i.test(raw.trim())) return '扩展后台返回未知错误';
-  return raw;
+// 的回归：本文件所有反馈都调 toastMsg(元素 id, 文案, 类型, ttl)，
+// 而 ui/common.js 导出的是 ATB.setMsg(元素, ...)。缺这一层时每次反馈都会抛
+// ReferenceError —— 调用点大多在 try 里，表现是「操作成功却报失败」且数据被清空
+// （fetchCookies 的 catch 会把 lastCookieData 清掉），复制后的剪贴板定时清除也不会启动。
+const toastMsg = (id, text, kind, ttlMs) => ATB.setMsg($(id), text, kind, ttlMs);
+
+// 页面模式：只有显式带 ?page=1 时才启用（管理页的「打开弹窗页面预览」会带这个参数）。
+// 不再用 chrome.tabs.getCurrent 猜上下文——这个 API 在部分版本/场景下会返回 tab，
+// 把工具栏弹窗误判成页面，弹窗宽度反而被压窄。
+const pageMode = new URLSearchParams(location.search).has('page');
+
+function applyMode() {
+  document.documentElement.dataset.mode = pageMode ? 'page' : 'popup';
+  document.body.dataset.mode = pageMode ? 'page' : 'popup';
 }
 
-/** 统一的提示写入：成功 4s 后自动清空，错误保留（用户需要读完）。 */
-function setMsg(el, text, kind, ttlMs) {
-  if (!el) return;
-  const previous = msgTimers.get(el);
-  if (previous) { clearTimeout(previous); msgTimers.delete(el); }
-  el.textContent = text || '';
-  el.className = kind === 'error' ? 'error' : 'status';
-  // 错误用 alert（屏幕阅读器立即播报），其余用 status（polite）。
-  el.setAttribute('role', kind === 'error' ? 'alert' : 'status');
-  el.setAttribute('aria-live', kind === 'error' ? 'assertive' : 'polite');
-  if (text && kind !== 'error') {
-    const ttl = ttlMs > 0 ? ttlMs : MSG_TTL_OK_MS;
-    msgTimers.set(el, setTimeout(() => { el.textContent = ''; }, ttl));
-  }
-}
+applyMode();
 
-function clearMsg(el) {
-  if (!el) return;
-  const previous = msgTimers.get(el);
-  if (previous) { clearTimeout(previous); msgTimers.delete(el); }
-  el.textContent = '';
-}
+document.addEventListener('DOMContentLoaded', init);
 
-document.addEventListener('DOMContentLoaded', () => {
-  const refreshBtn = document.getElementById('refresh');
-  if (refreshBtn) refreshBtn.addEventListener('click', fetchCookies);
-  document.getElementById('savePort').addEventListener('click', savePort);
-  document.getElementById('saveProfileLabel').addEventListener('click', saveProfileLabel);
-  document.getElementById('clearProfileLabel').addEventListener('click', clearProfileLabel);
-  // 输入即清旧提示：否则上一次「保存失败」会一直挂在那儿误导用户。
-  const portInput = document.getElementById('port');
-  if (portInput) portInput.addEventListener('input', () => clearMsg(document.getElementById('portMsg')));
-  const labelInput = document.getElementById('profileLabel');
-  if (labelInput) labelInput.addEventListener('input', () => clearMsg(document.getElementById('profileMsg')));
-  initWidthMode();
-  initReloadButton();
-  initWsTokenRow();
-  initBadgeToggle();
-  initCookieTools();
-  initClipboardLifecycle();
+async function init() {
+  const settings = await ATB.readSettings();
+  applyWidth(settings.popupWidthMode);
+  ATB.applyAppearance(settings);
+  clipboardTtlSec = clampTtl(settings.clipboardTtlSec);
+  syncSettingsUI(settings);
+
+  bindTabs(settings.popupActiveTab);
+  bindHeader();
+  bindConnectionActions();
+  bindIdentityActions();
+  bindAppearanceActions();
+  bindBadgeToggle();
+  bindCookieTools();
+  bindClipboardLifecycle();
+
+  renderBuildInfo();
+  fillBrowserInfo();
   refreshBridgeStatus();
-  // 注意：这里**不**调用 fetchCookies —— 打开 popup 不产生任何 cookie 读取/渲染。
-});
+  statusTimer = setInterval(() => {
+    if (document.hidden) return;
+    refreshBridgeStatus({ quiet: true });
+  }, STATUS_POLL_MS);
 
-/** 宽度档位：存 storage.local.popupWidthMode，缺省 standard。 */
-async function initWidthMode() {
-  const select = document.getElementById('widthMode');
-  if (!select) return;
-  const apply = (mode) => {
-    const value = mode === 'compact' || mode === 'wide' ? mode : 'standard';
-    document.body.dataset.width = value;
-    select.value = value;
-    return value;
-  };
-  let current = 'standard';
-  try {
-    const got = await chrome.storage.local.get({ popupWidthMode: 'standard' });
-    current = apply(got.popupWidthMode);
-  } catch (_) {
-    current = apply('standard');
+  // 注意：这里**不**调用 fetchCookies —— 打开 popup 不产生任何 cookie 读取/渲染。
+}
+
+// ---------------------------------------------------------------------------
+// 分区 / 外观
+// ---------------------------------------------------------------------------
+
+function bindTabs(initial) {
+  activeTab = initial === 'data' || initial === 'settings' ? initial : 'status';
+  const buttons = Array.from(document.querySelectorAll('.tab'));
+  for (const button of buttons) {
+    button.addEventListener('click', () => activateTab(button.dataset.tab, true));
+    // 左右方向键在分区之间移动，符合 WAI-ARIA tablist 习惯。
+    button.addEventListener('keydown', (event) => {
+      if (event.key !== 'ArrowRight' && event.key !== 'ArrowLeft') return;
+      const index = buttons.indexOf(button);
+      const next = buttons[(index + (event.key === 'ArrowRight' ? 1 : buttons.length - 1)) % buttons.length];
+      next.focus();
+      activateTab(next.dataset.tab, true);
+    });
   }
-  select.addEventListener('change', async () => {
-    const mode = apply(select.value);
-    if (mode === current) return;
-    current = mode;
-    try {
-      await chrome.storage.local.set({ popupWidthMode: mode });
-    } catch (_) {}
+  activateTab(activeTab, false);
+}
+
+function activateTab(tab, persist) {
+  const name = tab === 'data' || tab === 'settings' ? tab : 'status';
+  activeTab = name;
+  for (const button of document.querySelectorAll('.tab')) {
+    const selected = button.dataset.tab === name;
+    button.setAttribute('aria-selected', selected ? 'true' : 'false');
+    button.tabIndex = selected ? 0 : -1;
+  }
+  for (const panel of document.querySelectorAll('.panel')) {
+    panel.hidden = panel.id !== 'panel-' + name;
+  }
+  if (name === 'data') renderCookies();
+  if (persist) ATB.writeSetting('popupActiveTab', name);
+}
+
+function applyWidth(mode) {
+  const value = mode === 'compact' || mode === 'wide' ? mode : 'standard';
+  // 页面模式（标签页里打开）按 900px 列渲染，紧凑/宽松只影响工具栏弹窗；
+  // 下拉框仍显示用户保存的档位，避免「设置被悄悄改掉」的错觉。
+  document.body.dataset.width = pageMode ? 'standard' : value;
+  // 双保险：body 固定宽度之外，再给 <html> 一个 min-width。
+  // 弹窗的窗口尺寸按文档首选宽度计算，任何“内容收缩”都不会把它压回窄条。
+  const px = value === 'compact' ? 340 : value === 'wide' ? 560 : 420;
+  document.documentElement.style.minWidth = pageMode ? '' : px + 'px';
+  const select = $('widthMode');
+  if (select) select.value = value;
+}
+
+/** 把 storage 里的设置同步到控件（popup 与 options 同时打开时保持一致）。 */
+function syncSettingsUI(settings) {
+  const theme = $('themeMode');
+  if (theme) theme.value = settings.themeMode === 'light' || settings.themeMode === 'dark' ? settings.themeMode : 'auto';
+  const density = $('densityMode');
+  if (density) density.value = settings.uiDensity === 'compact' ? 'compact' : 'standard';
+  if (settings.popupWidthMode) applyWidth(settings.popupWidthMode);
+  const badge = $('showBadge');
+  if (badge) badge.checked = settings.showBadge === true;
+  const ttl = $('clipboardTtl');
+  if (ttl) ttl.value = String(clampTtl(settings.clipboardTtlSec));
+}
+
+function bindAppearanceActions() {
+  $('themeMode')?.addEventListener('change', async (event) => {
+    const mode = event.target.value;
+    ATB.applyAppearance({ themeMode: mode, uiDensity: document.documentElement.dataset.density });
+    await ATB.writeSetting('themeMode', mode);
+  });
+
+  $('widthMode')?.addEventListener('change', async (event) => {
+    applyWidth(event.target.value);
+    await ATB.writeSetting('popupWidthMode', event.target.value);
+  });
+
+  $('densityMode')?.addEventListener('change', async (event) => {
+    const density = event.target.value === 'compact' ? 'compact' : 'standard';
+    document.documentElement.dataset.density = density;
+    await ATB.writeSetting('uiDensity', density);
+  });
+
+  // 另一个页面改了设置：主题 / 宽度 / 间距 / 角标 / 剪贴板 TTL 都要跟着走。
+  ATB.onSettingsChanged((changed) => {
+    if (changed.themeMode || changed.uiDensity) {
+      ATB.applyAppearance({
+        themeMode: changed.themeMode || $('themeMode')?.value || 'auto',
+        uiDensity: changed.uiDensity || document.documentElement.dataset.density || 'standard',
+      });
+    }
+    if (changed.popupWidthMode) applyWidth(changed.popupWidthMode);
+    if (changed.showBadge != null) {
+      const badge = $('showBadge');
+      if (badge) badge.checked = changed.showBadge === true;
+    }
+    if (changed.clipboardTtlSec != null) {
+      clipboardTtlSec = clampTtl(changed.clipboardTtlSec);
+      const ttl = $('clipboardTtl');
+      if (ttl) ttl.value = String(clipboardTtlSec);
+    }
   });
 }
 
-/**
- * WS token 输入行（popup.html 里预留了 #wsTokenRow 容器）。
- * 保存后交给 background 落 storage 并由 storage.onChanged 重连。
- */
-function initWsTokenRow() {
-  const host = document.getElementById('wsTokenRow');
-  if (!host || document.getElementById('wsToken')) return;
-  const row = document.createElement('div');
-  row.className = 'row';
-  const label = document.createElement('label');
-  label.textContent = 'Token ';
-  const input = document.createElement('input');
-  input.id = 'wsToken';
-  input.type = 'password';
-  input.autocomplete = 'off';
-  input.placeholder = '未设置';
-  // 360px 宽度下把「保存并重连 / 清空」作为一组保持在同一行：
-  // 旧实现两个按钮直接挂在 .row 上，窄窗口会把「清空」单独挤到下一行，
-  // 视觉上像是另一个操作的入口（视觉检查）。
-  input.style.width = '120px';
-  label.appendChild(input);
-  const save = document.createElement('button');
-  save.id = 'saveWsToken';
-  save.textContent = '保存并重连';
-  const clear = document.createElement('button');
-  clear.id = 'clearWsToken';
-  clear.textContent = '清空';
-  const actions = document.createElement('span');
-  actions.className = 'btn-group';
-  actions.appendChild(save);
-  actions.appendChild(clear);
-  row.appendChild(label);
-  row.appendChild(actions);
-  const msg = document.createElement('div');
-  msg.id = 'wsTokenMsg';
-  msg.className = 'status';
-  msg.setAttribute('role', 'status');
-  msg.setAttribute('aria-live', 'polite');
-  host.appendChild(row);
-  host.appendChild(msg);
-  input.addEventListener('input', () => clearMsg(msg));
-
-  const apply = async (token) => {
-    save.disabled = true;
-    clear.disabled = true;
+function bindHeader() {
+  const open = () => {
     try {
-      const resp = await chrome.runtime.sendMessage({ cmd: 'setWsToken', token });
-      if (!resp || !resp.ok) throw new Error((resp && resp.error) || 'unknown');
-      // 不在 popup 里回显 token：保存后立刻清空输入框。
-      input.value = '';
-      await refreshBridgeStatus();
-      setMsg(msg, resp.data && resp.data.wsTokenSet
-        ? '已保存 token，正在重连'
-        : '已清空 token，正在重连', 'status');
-    } catch (e) {
-      setMsg(msg, '保存失败: ' + friendlyError(e), 'error');
-    } finally {
-      save.disabled = false;
-      clear.disabled = false;
+      chrome.runtime.openOptionsPage();
+    } catch (_) {
+      // 没有 openOptionsPage（极少见）时退回到直接打开管理页 URL。
+      try { chrome.tabs.create({ url: chrome.runtime.getURL('options.html') }); } catch (_) {}
     }
   };
-  save.addEventListener('click', () => apply(input.value.trim()));
-  clear.addEventListener('click', () => apply(''));
+  $('openOptions')?.addEventListener('click', open);
+  $('openOptionsBottom')?.addEventListener('click', open);
+  // 弹窗太窄时的稳妥出口：同一份界面在标签页里按 860px 铺开。
+  $('openPage')?.addEventListener('click', () => {
+    try { chrome.tabs.create({ url: chrome.runtime.getURL('popup.html?page=1') }); } catch (_) {}
+  });
 }
+
+async function refreshBridgeStatus(options) {
+  const quiet = !!(options && options.quiet);
+  const pill = $('connPill');
+  try {
+    const data = await ATB.send({ cmd: 'status' });
+    lastStatus = data || {};
+    renderStatus(lastStatus);
+    return lastStatus;
+  } catch (e) {
+    const friendly = ATB.friendlyError(e);
+    if (!quiet) {
+      if (pill) {
+        pill.className = 'pill err';
+        $('connText').textContent = '读取失败';
+      }
+      const dot = $('statusDot');
+      if (dot) dot.dataset.state = 'err';
+      const title = $('statusTitle');
+      if (title) title.textContent = '状态读取失败';
+      const url = $('statusUrl');
+      if (url) url.textContent = friendly;
+      const detail = $('wsConnectError');
+      if (detail) {
+        detail.hidden = false;
+        detail.textContent = '读取扩展状态失败：' + friendly;
+      }
+    }
+    return null;
+  }
+}
+
+function renderStatus(data) {
+  const connected = !!data.wsConnected;
+  // 三种状态与状态点同色：已连接(绿) / 连接失败(红) / 未连接(灰)。
+  const failed = !connected && !!data.lastConnectError;
+  const pill = $('connPill');
+  if (pill) {
+    pill.className = 'pill ' + (connected ? 'ok' : failed ? 'err' : '');
+    $('connText').textContent = connected ? '已连接' : '未连接';
+  }
+
+  const dot = $('statusDot');
+  if (dot) dot.dataset.state = connected ? 'ok' : failed ? 'err' : 'off';
+  $('statusTitle').textContent = connected ? '已连接' : '未连接';
+  $('statusUrl').textContent = data.wsUrl || '尚未建立 WebSocket 连接';
+
+  $('profileLabelText').textContent = data.profileLabel || '未设置';
+  const browserId = String(data.browserId || '');
+  const browserNode = $('browserIdText');
+  browserNode.textContent = browserId ? ATB.shorten(browserId, 18) : '-';
+  browserNode.title = browserId;
+  $('portText').textContent = data.wsPort ? String(data.wsPort) : '-';
+
+  const trust = data.wsTrustMode === 'strict' ? '严格' : '兼容';
+  $('trustText').textContent = data.wsTokenSet ? trust : `${trust}（未设 token）`;
+
+  const fileNode = $('fileAccessStatus');
+  fileNode.textContent = data.fileSchemeAccess ? '已启用' : '未启用';
+  fileNode.className = data.fileSchemeAccess ? 'positive' : 'negative';
+
+  const hb = data.heartbeat || {};
+  $('rttText').textContent = Number.isFinite(hb.lastRttMs) && hb.lastRttMs >= 0
+    ? `${Math.round(hb.lastRttMs)} ms`
+    : '-';
+  $('lastCommandText').textContent = ATB.fmtAgo(data.lastCommandAt);
+
+  $('buildInfo').textContent = `v${getManifestVersion()}`;
+
+  renderAuthWarning(data);
+  renderConnectError(data);
+
+  const labelInput = $('profileLabel');
+  if (labelInput && document.activeElement !== labelInput) {
+    labelInput.value = data.profileLabel || '';
+  }
+  const modeSelect = $('wsTrustMode');
+  if (modeSelect && document.activeElement !== modeSelect) {
+    modeSelect.value = data.wsTrustMode === 'strict' ? 'strict' : 'compat';
+  }
+}
+
+/**
+ * 认证告警。
+ * 兼容档（未配置 wsToken）下 daemon 运行期接受任何本机进程的连接，
+ * 对方可以直接发命令接管本浏览器，不需要等端口空出来。
+ */
+function renderAuthWarning(data) {
+  const box = $('authWarning');
+  if (!box) return;
+  if (!data || data.wsTokenSet) {
+    box.hidden = true;
+    box.textContent = '';
+    return;
+  }
+  box.hidden = false;
+  box.textContent = '当前为兼容档：任何本机进程都可能连入 daemon 并接管本浏览器。'
+    + '建议执行 atb trust-extension --token 切到 token 档。';
+}
+
+function renderConnectError(data) {
+  const box = $('wsConnectError');
+  if (!box) return;
+  const err = data && !data.wsConnected ? data.lastConnectError : null;
+  if (!err) {
+    box.hidden = true;
+    box.textContent = '';
+    return;
+  }
+  box.hidden = false;
+  const when = err.at ? ATB.fmtClock(err.at) : '';
+  const tokenNote = err.hadToken ? '已带 token' : '未带 token';
+  const times = err.repeats ? `，重复 ${err.repeats} 次` : '';
+  box.textContent = `连接失败（${when}${when ? '，' : ''}${tokenNote}${times}）：${err.message || '未知原因'}`;
+}
+
+// ---------------------------------------------------------------------------
+// 连接 / 身份
+// ---------------------------------------------------------------------------
+
+function bindConnectionActions() {
+  $('reconnect')?.addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    await ATB.withBusy(button, async () => {
+      try {
+        await ATB.send({ cmd: 'reconnect' });
+        // 重建连接是异步的：连续探几次状态，别立刻报「还在重连」。
+        let data = null;
+        for (let i = 0; i < 4; i += 1) {
+          await sleep(350);
+          data = await refreshBridgeStatus({ quiet: true });
+          if (data && data.wsConnected) break;
+        }
+        if (data && data.wsConnected) {
+          ATB.toast('已重新连接', 'ok');
+        } else {
+          const box = $('wsConnectError');
+          if (box && !box.hidden) ATB.toast('重连请求已发出，仍在连接中', '');
+          else ATB.toast('重连请求已发出，仍在连接中', '');
+        }
+      } catch (e) {
+        ATB.toast('重连失败：' + ATB.friendlyError(e), 'err');
+      }
+    });
+  });
+
+  $('port')?.addEventListener('input', () => ATB.clearMsg($('portMsg')));
+  $('savePort')?.addEventListener('click', savePort);
+  $('wsToken')?.addEventListener('input', () => ATB.clearMsg($('wsTokenMsg')));
+  $('saveWsToken')?.addEventListener('click', (event) => applyWsToken(event.currentTarget, $('wsToken').value.trim()));
+  $('clearWsToken')?.addEventListener('click', (event) => applyWsToken(event.currentTarget, ''));
+  $('wsTrustMode')?.addEventListener('change', saveTrustMode);
+  $('reloadExt')?.addEventListener('click', (event) => {
+    const button = event.currentTarget;
+    button.disabled = true;
+    button.textContent = '正在重载…';
+    try { chrome.runtime.reload(); } catch (_) {}
+  });
+}
+
+function bindIdentityActions() {
+  $('profileLabel')?.addEventListener('input', () => ATB.clearMsg($('profileMsg')));
+  $('saveProfileLabel')?.addEventListener('click', () => setProfileLabel($('profileLabel').value));
+  $('clearProfileLabel')?.addEventListener('click', () => {
+    $('profileLabel').value = '';
+    setProfileLabel(null);
+  });
+}
+
+async function savePort() {
+  const input = $('port');
+  const button = $('savePort');
+  await ATB.withBusy(button, async () => {
+    try {
+      const port = Number(input ? input.value : NaN);
+      if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('端口必须是 1-65535');
+      if (port === 18767) throw new Error('18767 是 atb API 端口，请换一个插件端口');
+      await ATB.send({ cmd: 'setPort', port });
+      const data = await refreshBridgeStatus({ quiet: true });
+      const connected = !!(data && data.wsConnected);
+      toastMsg('portMsg', `已保存端口 ${port}，${connected ? '已连接' : '正在重连（当前未连接）'}`, 'ok');
+    } catch (e) {
+      toastMsg('portMsg', '保存失败：' + ATB.friendlyError(e), 'err');
+    }
+  });
+}
+
+async function applyWsToken(button, token) {
+  await ATB.withBusy(button, async () => {
+    try {
+      const resp = await ATB.send({ cmd: 'setWsToken', token });
+      // 不在 popup 里回显 token：保存后立刻清空输入框。
+      const input = $('wsToken');
+      if (input) input.value = '';
+      await refreshBridgeStatus({ quiet: true });
+      toastMsg('wsTokenMsg', resp.wsTokenSet ? '已保存 token，正在重连' : '已清空 token，正在重连', 'ok');
+    } catch (e) {
+      toastMsg('wsTokenMsg', '保存失败：' + ATB.friendlyError(e), 'err');
+    }
+  });
+}
+
+async function saveTrustMode() {
+  const select = $('wsTrustMode');
+  const mode = select.value === 'strict' ? 'strict' : 'compat';
+  try {
+    const data = await ATB.send({ cmd: 'setWsTrustMode', mode });
+    await refreshBridgeStatus({ quiet: true });
+    if (data && data.effective === false) {
+      toastMsg('trustMsg', '已切换为严格档，但还没设置 token：严格档要等 token 设置后才真正生效', 'err');
+    } else {
+      toastMsg('trustMsg', `已切换为${mode === 'strict' ? '严格' : '兼容'}档`, 'ok');
+    }
+  } catch (e) {
+    toastMsg('trustMsg', '切换失败：' + ATB.friendlyError(e), 'err');
+  }
+}
+
+async function setProfileLabel(label) {
+  try {
+    const data = await ATB.send({ cmd: 'setProfileLabel', label });
+    await refreshBridgeStatus({ quiet: true });
+    toastMsg('profileMsg', `Profile Label：${(data && data.profileLabel) || '已清空'}`, 'ok');
+  } catch (e) {
+    toastMsg('profileMsg', '保存失败：' + ATB.friendlyError(e), 'err');
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 角标
+// ---------------------------------------------------------------------------
 
 /**
  * 「在页面上显示状态角标」开关（storage.local.showBadge，缺省 false）。
  * 默认关：角标是页面里可见的 DOM，站点 querySelector 一下就能判定访客是自动化工具。
  */
-async function initBadgeToggle() {
-  const box = document.getElementById('showBadge');
-  const msg = document.getElementById('showBadgeMsg');
+function bindBadgeToggle() {
+  const box = $('showBadge');
   if (!box) return;
-  try {
-    const got = await chrome.storage.local.get({ showBadge: false });
-    box.checked = got.showBadge === true;
-  } catch (e) {
-    setMsg(msg, '读取角标开关失败: ' + friendlyError(e), 'error');
-  }
+
   box.addEventListener('change', async () => {
     const showBadge = box.checked;
     try {
-      await chrome.storage.local.set({ showBadge });
+      await ATB.writeSetting('showBadge', showBadge);
     } catch (e) {
-      setMsg(msg, '保存角标开关失败: ' + friendlyError(e), 'error');
+      toastMsg('showBadgeMsg', '保存角标开关失败：' + ATB.friendlyError(e), 'err');
       return;
     }
-    setMsg(msg, showBadge ? '角标已开启（已打开的标签页即时生效）' : '角标已关闭', 'status');
+    toastMsg('showBadgeMsg', showBadge ? '角标已开启（已打开的标签页即时生效）' : '角标已关闭', 'ok');
     // 拿不到活动标签页（chrome://、扩展页、无活动窗口）时直接忽略：
     // storage.onChanged 已经覆盖了绝大多数页面。
     try {
@@ -228,23 +460,28 @@ async function initBadgeToggle() {
 // Cookie 区
 // ---------------------------------------------------------------------------
 
-function initCookieTools() {
-  const copy = document.getElementById('copyCookies');
-  if (copy) copy.addEventListener('click', copyCookies);
-  const toggle = document.getElementById('toggleCookies');
-  if (toggle) toggle.addEventListener('click', toggleCookieValues);
-  const select = document.getElementById('clipboardTtl');
+function bindCookieTools() {
+  $('refresh')?.addEventListener('click', fetchCookies);
+  $('copyCookies')?.addEventListener('click', copyCookies);
+  $('toggleCookies')?.addEventListener('click', toggleCookieValues);
+
+  const select = $('clipboardTtl');
   if (select) {
-    chrome.storage.local.get({ clipboardTtlSec: COOKIE_TTL_DEFAULT_SEC }).then((got) => {
-      clipboardTtlSec = clampTtl(got.clipboardTtlSec);
-      select.value = String(clipboardTtlSec);
-    }).catch(() => { select.value = String(clipboardTtlSec); });
+    select.value = String(clipboardTtlSec);
     select.addEventListener('change', async () => {
       clipboardTtlSec = clampTtl(Number(select.value));
       select.value = String(clipboardTtlSec);
-      try { await chrome.storage.local.set({ clipboardTtlSec }); } catch (_) {}
+      await ATB.writeSetting('clipboardTtlSec', clipboardTtlSec);
       // 已经复制过：按新的 TTL 重新计时，别让旧的长 TTL 继续生效。
       if (lastCopiedText) armClipboardClear();
+    });
+  }
+
+  const filter = $('cookieFilter');
+  if (filter) {
+    filter.addEventListener('input', () => {
+      filterText = filter.value.trim();
+      renderCookies();
     });
   }
 }
@@ -255,105 +492,212 @@ function clampTtl(value) {
   return Math.min(COOKIE_TTL_MAX_SEC, Math.max(COOKIE_TTL_MIN_SEC, raw));
 }
 
+function flagsOf(cookie) {
+  return (cookie.httpOnly ? 'H' : '') + (cookie.secure ? 'S' : '') + (cookie.partitionKey ? 'P' : '');
+}
+
+function visibleCookies() {
+  if (!filterText) return lastCookieData;
+  const q = filterText.toLowerCase();
+  return lastCookieData.filter((c) => {
+    const hay = `${c.name || ''} ${flagsOf(c)}`.toLowerCase();
+    return hay.includes(q);
+  });
+}
+
+/** 默认只渲染 name + 标记 + 条数，值用 ••• 掩码。 */
+function renderCookies() {
+  const list = $('cookieList');
+  const empty = $('cookieEmpty');
+  if (!list || !empty) return;
+
+  const count = $('cookieCount');
+  if (count) {
+    count.textContent = String(lastCookieData.length);
+    count.hidden = lastCookieData.length === 0;
+  }
+
+  list.textContent = '';
+  const rows = visibleCookies();
+
+  if (!lastCookieData.length) {
+    empty.hidden = false;
+    empty.textContent = lastCookieText;
+    return;
+  }
+  if (!rows.length) {
+    empty.hidden = false;
+    empty.textContent = `没有匹配「${filterText}」的 cookie`;
+    return;
+  }
+  empty.hidden = true;
+
+  const fragment = document.createDocumentFragment();
+  for (const c of rows) {
+    const item = document.createElement('li');
+    item.className = 'cookie-item' + (c.httpOnly || c.secure ? ' is-secret' : '');
+
+    const name = document.createElement('span');
+    name.className = 'cookie-name';
+    name.textContent = c.name || '(未命名)';
+    name.title = c.name || '';
+
+    const flags = document.createElement('span');
+    flags.className = 'cookie-flags';
+    if (c.httpOnly) flags.appendChild(makeFlag('H', 'httpOnly'));
+    if (c.secure) flags.appendChild(makeFlag('S', 'secure'));
+    if (c.partitionKey) flags.appendChild(makeFlag('P', '分区'));
+
+    const value = document.createElement('span');
+    value.className = 'cookie-value';
+    // 3：掩码只由 cookieRevealed 决定，默认永远是 •••。
+    const shown = cookieRevealed ? String(c.value == null ? '' : c.value) : '•••';
+    value.textContent = shown;
+
+    item.append(name, flags, value);
+    fragment.appendChild(item);
+  }
+  list.appendChild(fragment);
+}
+
+function makeFlag(text, title) {
+  const node = document.createElement('span');
+  node.className = 'flag' + (text === 'H' ? ' h' : '');
+  node.textContent = text;
+  node.title = title;
+  return node;
+}
+
 /** 「显示值」二次确认：第一次点击只是解锁 5 秒，第二次才真的展开。 */
 function toggleCookieValues() {
-  const btn = document.getElementById('toggleCookies');
-  const msg = document.getElementById('cookieMsg');
+  const button = $('toggleCookies');
   if (!lastCookieData.length) {
-    setMsg(msg, '先点「刷新」获取 cookies', 'status');
+    toastMsg('cookieMsg', '先点「刷新」获取 cookies', '');
     return;
   }
   if (cookieRevealed) {
     cookieRevealed = false;
     revealArmedAt = 0;
-    if (btn) btn.textContent = '显示值';
+    if (button) button.textContent = '显示值';
     renderCookies();
-    setMsg(msg, '已恢复掩码显示', 'status');
+    toastMsg('cookieMsg', '已恢复打码显示', 'ok');
     return;
   }
   const now = Date.now();
   if (!revealArmedAt || now - revealArmedAt > 5000) {
     revealArmedAt = now;
-    if (btn) btn.textContent = '再次点击确认显示';
-    setMsg(msg, '明文会把 cookie 值画到屏幕上（含 httpOnly/secure），5 秒内再点一次确认', 'status', 5000);
+    if (button) button.textContent = '再次点击确认';
+    toastMsg('cookieMsg', '明文会把 cookie 值画到屏幕上（含 httpOnly/secure），5 秒内再点一次确认', '', 5000);
     return;
   }
   cookieRevealed = true;
   revealArmedAt = 0;
-  if (btn) btn.textContent = '隐藏值';
+  if (button) button.textContent = '隐藏值';
   renderCookies();
-  setMsg(msg, '已显示明文；关闭 popup 会自动恢复掩码', 'status');
-}
-
-/** 默认只渲染 name + 标记 + 条数，值用 •••。 */
-function renderCookies() {
-  const out = document.getElementById('out');
-  if (!out) return;
-  if (!lastCookieData.length) {
-    out.textContent = lastCookieText;
-    return;
-  }
-  const lines = lastCookieData.map((c) => {
-    const flags = (c.httpOnly ? ' [H]' : '') + (c.secure ? ' [S]' : '') + (c.partitionKey ? ' [P]' : '');
-    const value = cookieRevealed ? String(c.value == null ? '' : c.value) : '•••';
-    // 默认只藏**值**：name 与 [H]/[S]/[P] 标记是判断「这条 cookie 该不该复制」的依据。
-    return c.name + '=' + value + flags;
-  });
-  const header = cookieRevealed
-    ? `共 ${lastCookieData.length} 条（明文显示中，关闭 popup 恢复掩码）`
-    : `共 ${lastCookieData.length} 条（值已隐藏；点「显示值」查看）`;
-  out.textContent = header + '\n' + lines.join('\n');
+  toastMsg('cookieMsg', '已显示明文；关闭 popup 会自动恢复打码', 'ok');
 }
 
 /** 关闭 popup / 页面隐藏时恢复掩码（不重新请求，避免多余 IO）。 */
 function hideCookieValues() {
-  if (!cookieRevealed) return;
-  cookieRevealed = false;
+  const button = $('toggleCookies');
+  // 同 options：待确认态也要复位，避免切分区回来还挂着「再次点击确认」。
   revealArmedAt = 0;
-  const btn = document.getElementById('toggleCookies');
-  if (btn) btn.textContent = '显示值';
+  if (!cookieRevealed) {
+    if (button) button.textContent = '显示值';
+    return;
+  }
+  cookieRevealed = false;
+  if (button) button.textContent = '显示值';
   renderCookies();
 }
 
+async function fetchCookies() {
+  const button = $('refresh');
+  await ATB.withBusy(button, async () => {
+    try {
+      // 页面模式（popup.html?page=1）本身就是 active 的扩展标签页，
+      // query({active:true}) 只会拿到自己 → Cookies 分区把扩展 ID 当站点、永远查不到。
+      // 复用 options 的选取口径：按 lastAccessed 选最近的 http(s)/file 标签页。
+      const tab = pageMode
+        ? await ATB.pickCookieTab()
+        : (await chrome.tabs.query({ active: true, currentWindow: true }))[0];
+      if (!tab || !tab.url) {
+        lastCookieData = [];
+        lastCookieText = pageMode
+          ? '当前窗口没有 http/https/file 标签页，先打开一个网页再试'
+          : '当前没有可读取的标签页';
+        $('siteHost').textContent = '-';
+        renderCookies();
+        toastMsg('cookieMsg', lastCookieText, 'err');
+        return;
+      }
+      $('siteHost').textContent = ATB.hostOf(tab.url);
+      $('siteHost').title = tab.url;
+      const resp = await ATB.send({ cmd: 'cookies', url: tab.url });
+      // 后台回包是数组；空数组与「没有 cookies」是两种不同文案，别混。
+      const items = Array.isArray(resp) ? resp : (Array.isArray(resp && resp.data) ? resp.data : []);
+      if (!items.length) {
+        lastCookieData = [];
+        lastCookieText = '该站点没有 cookies';
+        renderCookies();
+        toastMsg('cookieMsg', '该站点没有 cookies', '');
+        return;
+      }
+      lastCookieData = items;
+      cookieRevealed = false;
+      revealArmedAt = 0;
+      const toggle = $('toggleCookies');
+      if (toggle) toggle.textContent = '显示值';
+      renderCookies();
+      toastMsg('cookieMsg', `已读取 ${items.length} 条（值默认打码）`, 'ok');
+    } catch (e) {
+      lastCookieData = [];
+      lastCookieText = '读取失败：' + ATB.friendlyError(e);
+      renderCookies();
+      toastMsg('cookieMsg', '读取 cookies 失败：' + ATB.friendlyError(e), 'err');
+    }
+  });
+}
+
 async function copyCookies() {
-  const out = document.getElementById('out');
-  const include = document.getElementById('includeHttpOnly');
-  const msg = document.getElementById('cookieMsg');
+  const include = $('includeHttpOnly');
   const includeSensitive = !!(include && include.checked);
   if (!lastCookieData.length) {
-    setMsg(msg, '没有可复制的 cookies，先点「刷新」', 'status');
+    toastMsg('cookieMsg', '没有可复制的 cookies，先点「刷新」', '');
     return;
   }
   // 默认只复制普通 cookie；httpOnly/secure 必须显式勾选（二者都视作敏感条目）。
   const picked = lastCookieData.filter((c) => includeSensitive || !(c.httpOnly || c.secure));
   const skipped = lastCookieData.length - picked.length;
   if (!picked.length) {
-    setMsg(msg, `未复制：${skipped} 条全是 httpOnly/secure，请勾选「包含 httpOnly/secure」`, 'status');
+    toastMsg('cookieMsg', `未复制：${skipped} 条全是 httpOnly/secure，请勾选「含 httpOnly/secure」`, 'err');
     return;
   }
-  try {
-    lastCopiedText = picked.map((c) => `${c.name}=${c.value}`).join('; ');
-    await navigator.clipboard.writeText(lastCopiedText);
-    const note = `已复制 ${picked.length} 条${includeSensitive ? '（含 httpOnly/secure）' : ''}`
-      + (skipped ? `，跳过 ${skipped} 条 httpOnly/secure` : '')
-      + `，${clipboardTtlSec} 秒后自动清除`;
-    setMsg(msg, note, 'status', clipboardTtlSec * 1000);
-    armClipboardClear();
-    if (out) renderCookies();
-  } catch (e) {
-    setMsg(msg, '复制失败: ' + friendlyError(e), 'error');
+  lastCopiedText = picked.map((c) => `${c.name}=${c.value}`).join('; ');
+  const ok = await ATB.copyText(lastCopiedText);
+  if (!ok) {
+    lastCopiedText = '';
+    toastMsg('cookieMsg', '复制失败：浏览器拒绝了剪贴板写入，请重试', 'err');
+    return;
   }
+  const note = `已复制 ${picked.length} 条${includeSensitive ? '（含 httpOnly/secure）' : ''}`
+    + (skipped ? `，跳过 ${skipped} 条敏感项` : '')
+    + `，${clipboardTtlSec} 秒后自动清除`;
+  toastMsg('cookieMsg', note, 'ok', clipboardTtlSec * 1000);
+  armClipboardClear();
 }
 
-/** 复制后启动定时清除。重复复制时重置计时。 */
+/** 复制后启动定时清除（SEC-10）。重复复制时重置计时。 */
 function armClipboardClear() {
-  if (clipboardTimer) { clearTimeout(clipboardTimer); clipboardTimer = null; }
+  if (clipboardTimer) {
+    clearTimeout(clipboardTimer);
+    clipboardTimer = null;
+  }
   if (!lastCopiedText) return;
-  const ttlMs = clampTtl(clipboardTtlSec) * 1000;
   clipboardTimer = setTimeout(() => {
     clipboardTimer = null;
     clearClipboard('timeout');
-  }, ttlMs);
+  }, clampTtl(clipboardTtlSec) * 1000);
 }
 
 /**
@@ -364,7 +708,6 @@ function armClipboardClear() {
  * 只能盲清（安全优先），并在 UI 上说明「无法校验」。
  */
 async function clearClipboard(reason) {
-  const msg = document.getElementById('cookieMsg');
   if (!lastCopiedText) return;
   let verified = false;
   let same = true;
@@ -379,33 +722,38 @@ async function clearClipboard(reason) {
   }
   if (verified && !same) {
     lastCopiedText = '';
-    setMsg(msg, '剪贴板内容已被你替换，未清空（原 cookie 副本已被覆盖）', 'status');
+    toastMsg('cookieMsg', '剪贴板内容已被你替换，未清空（原副本已被覆盖）', '');
     return;
   }
-  try {
-    await navigator.clipboard.writeText('');
+  const cleared = await ATB.copyText('');
+  if (cleared) {
     lastCopiedText = '';
-    setMsg(msg, verified
+    toastMsg('cookieMsg', verified
       ? '已自动清除剪贴板里的 cookies'
-      : '已自动清除剪贴板（无法校验内容：缺少剪贴板读取权限）', 'status');
-  } catch (e) {
-    if (reason === 'timeout') {
-      setMsg(msg, '自动清除失败，请手动清空剪贴板: ' + friendlyError(e), 'error');
-    }
+      : '已自动清除剪贴板（无法校验内容：缺少剪贴板读取权限）', 'ok');
+  } else if (reason === 'timeout') {
+    toastMsg('cookieMsg', '自动清除失败，请手动清空剪贴板', 'err');
   }
 }
 
 /** pagehide / beforeunload / 隐藏时立刻清一次，别等 TTL。 */
-function initClipboardLifecycle() {
+function bindClipboardLifecycle() {
   const flush = () => {
     if (lastCopiedText) {
       // unload 阶段异步 Promise 可能来不及完成，仍先发一次（能成功就成功）。
       try { navigator.clipboard.writeText(''); } catch (_) {}
       lastCopiedText = '';
     }
-    if (clipboardTimer) { clearTimeout(clipboardTimer); clipboardTimer = null; }
+    if (clipboardTimer) {
+      clearTimeout(clipboardTimer);
+      clipboardTimer = null;
+    }
   };
-  window.addEventListener('pagehide', () => { flush(); hideCookieValues(); });
+  window.addEventListener('pagehide', () => {
+    flush();
+    hideCookieValues();
+    if (statusTimer) clearInterval(statusTimer);
+  });
   window.addEventListener('beforeunload', flush);
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) hideCookieValues();
@@ -413,203 +761,35 @@ function initClipboardLifecycle() {
 }
 
 // ---------------------------------------------------------------------------
-// Bridge / Profile 状态
-// ---------------------------------------------------------------------------
 
-function initReloadButton() {
-  const info = document.getElementById('buildInfo');
-  const button = document.getElementById('reloadExt');
+function getManifestVersion() {
   try {
-    if (info) info.textContent = `运行版本 ${chrome.runtime.getManifest().version}`;
-  } catch (_) {}
-  if (!button) return;
-  button.addEventListener('click', () => {
-    button.disabled = true;
-    button.textContent = '正在重载…';
-    chrome.runtime.reload();
-  });
-}
-
-/**
- * 读 background 状态并渲染。
- * 返回 data（失败返回 null）—— savePort / saveWsToken 需要拿到刷新后的真实连接态，
- * 否则「已保存端口，正在重连」会和「状态: 未连接」并排出现。
- */
-async function refreshBridgeStatus() {
-  const status = document.getElementById('bridgeStatus');
-  const portInput = document.getElementById('port');
-  try {
-    const resp = await chrome.runtime.sendMessage({ cmd: 'status' });
-    if (!resp || !resp.ok) throw new Error((resp && resp.error) || 'unknown');
-    const data = resp.data || {};
-    if (portInput && data.wsPort) portInput.value = data.wsPort;
-    // token 只显示「有没有配」，绝不回显原文。
-    status.textContent = `状态: ${data.wsConnected ? '已连接' : '未连接'} ${data.wsUrl || ''}`
-      + (data.wsTokenSet ? ' / token 已设置' : '');
-    status.className = 'status';
-    renderAuthWarning(data);
-    const fileAccessStatus = document.getElementById('fileAccessStatus');
-    if (fileAccessStatus) {
-      fileAccessStatus.textContent = `文件网址访问: ${data.fileSchemeAccess ? '已启用' : '未启用'}`;
-      fileAccessStatus.className = data.fileSchemeAccess ? 'status' : 'error';
-    }
-    renderProfileStatus(data);
-    renderConnectError(data);
-    return data;
-  } catch (e) {
-    const friendly = friendlyError(e);
-    status.textContent = '状态读取失败: ' + friendly;
-    status.className = 'error';
-    const fileAccessStatus = document.getElementById('fileAccessStatus');
-    if (fileAccessStatus) {
-      fileAccessStatus.textContent = '文件网址权限读取失败: ' + friendly;
-      fileAccessStatus.className = 'error';
-    }
-    const profileStatus = document.getElementById('profileStatus');
-    if (profileStatus) {
-      profileStatus.textContent = 'Profile 读取失败: ' + friendly;
-      profileStatus.className = 'error';
-    }
-    renderAuthWarning(null);
-    renderConnectError(null);
-    return null;
+    return chrome.runtime.getManifest().version;
+  } catch (_) {
+    return '-';
   }
 }
 
 /**
- * 认证告警。
- * 旧文案只覆盖「daemon 空闲退出后端口被抢注」，但真正的风险面更大：
- * 兼容档（未配置 wsToken）下 daemon 运行期本就接受任何本机进程的连接，
- * 对方可以直接发命令接管本浏览器，根本不需要等端口空出来。
+ * 浏览器型号 + 版本：扩展页面能读到 navigator.userAgentData 的高熵版本，
+ * 拿不到就退回 UA 主版本；完整 UA 放在 title 里，方便区分 Chrome / Edge / Chromium。
  */
-function renderAuthWarning(data) {
-  const box = document.getElementById('authWarning');
-  if (!box) return;
-  if (!data || data.wsTokenSet) {
-    box.hidden = true;
-    box.textContent = '';
-    return;
-  }
-  box.hidden = false;
-  box.textContent = '当前为兼容档：任何本机进程都可能连入 daemon 并接管本浏览器（不限于空闲窗口）；'
-    + '建议执行 atb trust-extension --token 切到 token 档';
+function fillBrowserInfo() {
+  ATB.detectBrowser().then((info) => {
+    const node = $('browserInfoText');
+    if (!node) return;
+    const label = [info.name, info.version].filter(Boolean).join(' ');
+    node.textContent = label || '-';
+    node.title = [label, info.platform, info.ua].filter(Boolean).join('\n');
+  }).catch(() => {});
 }
 
-function renderConnectError(data) {
-  const box = document.getElementById('wsConnectError');
-  if (!box) return;
-  const err = data && !data.wsConnected ? data.lastConnectError : null;
-  if (!err) {
-    box.hidden = true;
-    box.textContent = '';
-    return;
-  }
-  box.hidden = false;
-  const when = err.at ? new Date(err.at).toLocaleTimeString() : '';
-  const tokenNote = err.hadToken ? '已带 token' : '未带 token';
-  const times = err.repeats ? `，重复 ${err.repeats} 次` : '';
-  box.textContent = `连接失败(${when}${when ? '，' : ''}${tokenNote}${times})：${err.message || '未知原因'}`;
+function renderBuildInfo() {
+  const version = getManifestVersion();
+  const info = $('buildInfo');
+  if (info) info.textContent = `v${version}`;
 }
 
-function renderProfileStatus(data) {
-  const profileStatus = document.getElementById('profileStatus');
-  const profileDetail = document.getElementById('profileDetail');
-  const profileLabelInput = document.getElementById('profileLabel');
-  const label = data.profileLabel || '';
-  if (profileLabelInput) profileLabelInput.value = label;
-  if (profileStatus) {
-    profileStatus.textContent = `Profile: ${label || '(未设置)'}`;
-    profileStatus.className = 'status';
-  }
-  // 具体 id 放进折叠区：它是本机环境标识，不需要默认摊在屏幕上。
-  if (profileDetail) {
-    profileDetail.textContent = `id: ${data.profileId || '-'} / browser: ${data.browserId || '-'}`;
-  }
-}
-
-async function saveProfileLabel() {
-  const input = document.getElementById('profileLabel');
-  await setProfileLabel(input ? input.value : '');
-}
-
-async function clearProfileLabel() {
-  const input = document.getElementById('profileLabel');
-  if (input) input.value = '';
-  await setProfileLabel(null);
-}
-
-async function setProfileLabel(label) {
-  const msg = document.getElementById('profileMsg');
-  try {
-    const resp = await chrome.runtime.sendMessage({ cmd: 'setProfileLabel', label });
-    if (!resp || !resp.ok) throw new Error((resp && resp.error) || 'unknown');
-    await refreshBridgeStatus();
-    setMsg(msg, `Profile Label ${(resp.data && resp.data.profileLabel) || '已清空'}`, 'status');
-  } catch (e) {
-    setMsg(msg, '保存失败: ' + friendlyError(e), 'error');
-  }
-}
-
-async function savePort() {
-  const portInput = document.getElementById('port');
-  const msg = document.getElementById('portMsg');
-  try {
-    const port = Number(portInput ? portInput.value : NaN);
-    if (!Number.isInteger(port) || port < 1 || port > 65535) {
-      throw new Error('端口必须是 1-65535');
-    }
-    if (port === 18767) {
-      throw new Error('18767 是 atb API 端口，请换一个插件端口');
-    }
-    const resp = await chrome.runtime.sendMessage({ cmd: 'setPort', port });
-    if (!resp || !resp.ok) throw new Error((resp && resp.error) || 'unknown');
-    // 先刷新状态再写文案：旧实现先报「正在使用新端口重连」，随后 refreshBridgeStatus
-    // 把状态改成「未连接」，两条信息互相矛盾。
-    const data = await refreshBridgeStatus();
-    const connected = !!(data && data.wsConnected);
-    setMsg(msg, `已保存端口 ${port}，${connected ? '已连接' : '正在重连（当前未连接）'}`, 'status');
-  } catch (e) {
-    setMsg(msg, '保存失败: ' + friendlyError(e), 'error');
-  }
-}
-
-async function fetchCookies() {
-  const out = document.getElementById('out');
-  const msg = document.getElementById('cookieMsg');
-  try {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!tab || !tab.url) {
-      lastCookieData = [];
-      lastCookieText = '没有活动标签页';
-      renderCookies();
-      return;
-    }
-    const resp = await chrome.runtime.sendMessage({ cmd: 'cookies', url: tab.url });
-    if (!resp || !resp.ok) {
-      lastCookieData = [];
-      const friendly = friendlyError(new Error((resp && resp.error) || 'unknown'));
-      lastCookieText = '读取失败: ' + friendly;
-      renderCookies();
-      setMsg(msg, '读取 cookies 失败: ' + friendly, 'error');
-      return;
-    }
-    if (!resp.data || !resp.data.length) {
-      lastCookieData = [];
-      lastCookieText = '(该站点没有 cookies)';
-      renderCookies();
-      return;
-    }
-    lastCookieData = resp.data;
-    cookieRevealed = false;
-    revealArmedAt = 0;
-    const btn = document.getElementById('toggleCookies');
-    if (btn) btn.textContent = '显示值';
-    renderCookies();
-    setMsg(msg, `已读取 ${resp.data.length} 条（值默认隐藏）`, 'status');
-  } catch (e) {
-    lastCookieData = [];
-    lastCookieText = '读取失败: ' + friendlyError(e);
-    renderCookies();
-    setMsg(msg, '读取 cookies 失败: ' + friendlyError(e), 'error');
-  }
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

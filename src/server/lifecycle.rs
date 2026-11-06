@@ -116,6 +116,10 @@ pub(crate) async fn shutdown(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
+/// 关机清理的单条下发窗口：daemon 正在退出，不值得为一条
+/// `debugClearAll` 等满 10s；送不出去只是 `sent:false`，不影响其它标签的清理。
+const SHUTDOWN_SEND_WINDOW: Duration = Duration::from_millis(500);
+
 pub(crate) async fn cleanup_on_shutdown(state: &AppState) -> Value {
     // 幂等：idle / inflight-stall / job-stall 都是「先 cleanup 再 send(shutdown)」，
     // graceful_shutdown 闭包与 `/shutdown` handler 还会再调一次。第二遍没有意义，
@@ -126,7 +130,7 @@ pub(crate) async fn cleanup_on_shutdown(state: &AppState) -> Value {
     let (snapshot_count, sessions) = {
         let mut driver = state.driver.write().await;
         let snapshot_count = driver.snapshots.len();
-        let sessions: Vec<(String, String, tokio::sync::mpsc::UnboundedSender<String>)> = driver
+        let sessions: Vec<(String, String, tokio::sync::mpsc::Sender<String>)> = driver
             .sessions
             .iter()
             .filter(|(_, session)| session.is_active())
@@ -174,7 +178,12 @@ pub(crate) async fn cleanup_on_shutdown(state: &AppState) -> Value {
             "tabId": tab_id_number
         })
         .to_string();
-        let ok = sender.send(payload).is_ok();
+        // 关机路径不能用默认的 10s 入队超时——daemon 已经在退出，
+        // 一条连接等 10s 会让「N 个标签」串成 N×10s。给 500ms 的短窗口：
+        // 送不出去就记 `sent:false`，清理本身不因此失败。
+        let ok = send_downstream_within(&sender, payload, SHUTDOWN_SEND_WINDOW)
+            .await
+            .is_ok();
         plugin_results.push(json!({ "session_key": session_key, "tab_id": tab_id, "sent": ok }));
     }
 

@@ -1,7 +1,7 @@
 use super::*;
 
-/// 受限站点（页面内嵌其他扩展的 iframe / 扩展隔离）时 Chrome debugger 的报错原文
-/// 。用**精确子串**匹配：这是 chrome.debugger 对「attach 到含其他扩展
+/// 受限站点（页面内嵌其他扩展的 iframe / 扩展隔离）时 Chrome debugger 的报错原文。
+/// 用**精确子串**匹配：这是 chrome.debugger 对「attach 到含其他扩展
 /// iframe 的页面」的固定文案，不会出现在普通页面错误里，几乎不可能误判。
 const PAGE_PROTECTED_NEEDLE: &str =
     "cannot access a chrome-extension:// url of different extension";
@@ -64,7 +64,7 @@ pub(crate) async fn cdp_call(
 ) -> Result<CdpCallResult> {
     // 「不接触」模式：明确禁止附加调试器。这样浏览器不会出现
     // 「已开始调试此浏览器」横幅，也不会因为 attach 改变页面可见状态。
-    if config::env_compat("NO_DEBUGGER").is_some() {
+    if crate::settings::no_debugger() {
         return Err(anyhow!(
             "已启用 ATB_NO_DEBUGGER（旧名 AGENT_BROWSER_CLI_NO_DEBUGGER）：{method} 需要 CDP 调试器，已拒绝执行。\n\
              可用替代：截图去掉 --full-page/--selector（走 captureVisibleTab）；\
@@ -684,7 +684,7 @@ pub(crate) async fn call_function_resolved(
             )
         })?;
     // 页面脚本抛异常时 CDP 仍然回 ok，只是没有 result、异常文本在 exceptionDetails 里。
-    // 旧实现不查它，所有页面异常统一退化成 "response missing value"（P3）。
+    // 旧实现不查它，所有页面异常统一退化成 "response missing value"。
     if let Some(message) = cdp_exception_text(step) {
         return Err(anyhow!("{steps}: {message}"));
     }
@@ -906,7 +906,7 @@ async fn dom_mouse_click_cdp(
         )
         .await?
     } else {
-        //  （C-05 残留）：旧实现是 focus_scroll（一次 WS 往返 + 一次页面执行）
+        // （残留）：旧实现是 focus_scroll（一次 WS 往返 + 一次页面执行）
         // 再 DOM.getBoxModel（第二次往返）。两次之间页面可能重排（惰性图片撑开、
         // 吸顶条出现），量到的坐标与滚动落定后的真实位置对不上，真实鼠标就点到
         // 旁边去了。这里把 scrollIntoView + getBoundingClientRect 合并成**单个**
@@ -942,7 +942,7 @@ async fn dom_mouse_click_cdp(
         });
     if rect.is_none() {
         // 页面脚本在量位置时抛异常（元素被 React 卸载、getBoundingClientRect 被改写等）：
-        // 旧实现一律报 "no layout box"，把「页面报错」误诊成「元素不可见」（P3 同族）。
+        // 旧实现一律报 "no layout box"，把「页面报错」误诊成「元素不可见」（同族）。
         if let Some(message) = box_data
             .get("results")
             .and_then(Value::as_array)
@@ -1093,7 +1093,7 @@ pub(crate) async fn focus_object(
     timeout: Duration,
 ) -> Result<()> {
     // 老脚本恒 `return true`，返回值被直接丢弃：对不可聚焦元素 `focus()` 是 no-op，
-    // 调用方却以为焦点已经进去了，随后 `dispatch_keys` 把按键打进 body（C-01）。
+    // 调用方却以为焦点已经进去了，随后 `dispatch_keys` 把按键打进 body。
     // 这里把落点算出来带回去，由调用方决定失败。
     // `getRootNode()` 兼顾 shadow DOM：document.activeElement 在那种情况下是宿主元素。
     let script = "function() { \
@@ -1161,7 +1161,7 @@ pub(crate) async fn dispatch_keys(
     }
     // 先**整体**解析、再逐个发送。`parse_key_segment` 是纯函数，没有副作用：
     // 旧实现边发边解析，靠后的键名写错时前几个键已经打出去了，既不能回滚、
-    // 错误里也不说「已经发了几段」，调用方重试就变成双打（C-03）。
+    // 错误里也不说「已经发了几段」，调用方重试就变成双打。
     let parsed: Vec<KeySegment> = segments
         .iter()
         .map(|segment| parse_key_segment(segment, platform))
@@ -1277,7 +1277,7 @@ pub(crate) fn key_spec(input: &str) -> Result<KeySpec> {
         "end" => ("End".to_string(), "End".to_string(), 35, None),
         _ if input.len() == 1 && input.chars().all(|c| c.is_ascii_alphabetic()) => {
             // 单字符字母必须按用户给的大小写原样发送：旧实现 key/text 都取 lower，
-            // 只有 code 用 upper，于是 `send-keys "A"` 实际输入的是小写 `a`（P3）。
+            // 只有 code 用 upper，于是 `send-keys "A"` 实际输入的是小写 `a`。
             // code 仍然保持 `KeyA` 形式（KeyboardEvent.code 不区分大小写）。
             let upper = input.to_ascii_uppercase();
             (
@@ -1316,7 +1316,7 @@ pub(crate) async fn dispatch_key_segment(
         key,
     } = segment;
     // 修饰键的 keyUp 必须无条件执行：CDP 的按键状态是浏览器级的，漏抬一次
-    // Ctrl/Shift/Meta，此后该标签的所有操作都等同按住修饰键（C-03）。
+    // Ctrl/Shift/Meta，此后该标签的所有操作都等同按住修饰键。
     // 所以「按下」逐条记录，「抬起」统一收尾，中间任何一步失败都不跳过释放。
     let mut active_bits = 0;
     let mut pressed: Vec<KeySpec> = Vec::with_capacity(modifiers.len());
@@ -1460,7 +1460,7 @@ pub(crate) fn truncate_text(value: &str, max: usize) -> String {
     }
 }
 
-/// CDP 快照（AX 树）侧的「可操作角色」判定集（C-04）。
+/// CDP 快照（AX 树）侧的「可操作角色」判定集。
 ///
 /// 与 JS 快照（`assets/page_snapshot.js` 的 `OPERABLE` 集合）必须对齐，否则同一
 /// 页面两种模式下 `@e` 集合与编号不同。这里取**并集**：JS 侧的 `file` 已并入，
@@ -1489,7 +1489,7 @@ pub(crate) fn is_operable_role(role: &str) -> bool {
             | "switch"
             | "tab"
             | "treeitem"
-            // C-04：JS 快照 OPERABLE 里有 file（`<input type=file>`），CDP 侧补齐，
+            // JS 快照 OPERABLE 里有 file（`<input type=file>`），CDP 侧补齐，
             // 保证同一文件上传控件在两种模式下都能拿到 @e 引用。
             | "file"
     )
@@ -1529,7 +1529,7 @@ mod regression_tests {
         assert_eq!(strip_outer_quotes("\"a'"), "\"a'");
     }
 
-    /// P3：单字符字母按原样（大写）发送，`code` 仍是 `KeyX`。
+    /// 单字符字母按原样（大写）发送，`code` 仍是 `KeyX`。
     #[test]
     fn single_letter_keeps_its_case() {
         let upper = key_spec("A").expect("A");

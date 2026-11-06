@@ -11,12 +11,8 @@ pub(crate) fn resolve_agent_id(explicit: Option<&str>) -> String {
     if let Some(value) = explicit.map(str::trim).filter(|value| !value.is_empty()) {
         return sanitize_agent(value);
     }
-    if let Some(value) = config::env_compat("AGENT") {
-        let trimmed = value.to_string_lossy();
-        let trimmed = trimmed.trim();
-        if !trimmed.is_empty() {
-            return sanitize_agent(trimmed);
-        }
+    if let Some(value) = crate::settings::agent_from_env() {
+        return sanitize_agent(&value);
     }
     for key in [
         "WT_SESSION",

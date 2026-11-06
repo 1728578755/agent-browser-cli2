@@ -6,7 +6,10 @@
 //   而那时既不知道原因也不知道怎么修。这里改成安装期就给出可执行的结论。
 //
 // 逃生口：ATB_SKIP_POSTINSTALL_CHECK=1 跳过探测（CI 里只装包不跑命令时用）。
-// 退出码：0 找到二进制；1 找不到（npm 会把这个包的安装标成失败，这就是目的）。
+// dry-run（`npm ci --dry-run` / `npm install --dry-run`）不装 optionalDependencies，
+// 但仍会执行 lifecycle script —— 探测必然失败，会把「只校验依赖树」误报成安装失败。
+// 这种情况下直接放行：dry-run 本来就没有可运行的产物。
+// 退出码：0 找到二进制（或 dry-run）；1 找不到（npm 会把这个包的安装标成失败，这就是目的）。
 const fs = require("node:fs");
 const path = require("node:path");
 
@@ -62,6 +65,13 @@ function resolvePlatformPackage(baseName) {
 }
 
 function main() {
+  // dry-run 时既不写文件也不探测二进制。npm 在 lifecycle script 里把
+  // `npm_config_dry_run` 设成字符串 "true"（不同 npm 版本大小写一致，但仍做小写归一）。
+  if (String(process.env.npm_config_dry_run || "").toLowerCase() === "true") {
+    console.log("[atb] dry-run：跳过执行位与原生二进制探测（未真正安装任何文件）");
+    return 0;
+  }
+
   // 1) 执行位：Windows 不需要，其它平台失败也不致命（用户可直接 node npm/bin/atb.js）。
   try {
     fs.chmodSync(LAUNCHER, 0o755);

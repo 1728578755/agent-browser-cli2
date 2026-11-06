@@ -67,7 +67,11 @@ pub struct Session {
     pub extension_protocol: u32,
     pub file_scheme_access: Option<bool>,
     pub info: TabInfo,
-    pub sender: mpsc::UnboundedSender<String>,
+    /// 这条会话所属扩展连接的下行通道。
+    ///
+    /// 有界通道。发送必须走 `server::send_downstream`，让「队列满」
+    /// 变成结构化 `ws_backpressure`，而不是在内存里无限积压。
+    pub sender: mpsc::Sender<String>,
     pub disconnected_at: Option<Instant>,
     /// 最近一次注册这条会话的 WebSocket 连接 id（连接代际）。
     ///
@@ -179,7 +183,7 @@ pub struct DriverState {
     pub default_session_key: Option<String>,
     pub latest_session_key: Option<String>,
     pub preferred_default_session_key: Option<String>,
-    /// `preferred_default_session_key` 的登记时刻（unix 秒，A2）。
+    /// `preferred_default_session_key` 的登记时刻（unix 秒）。
     ///
     /// 与 key **同生共死**：设置走 [`DriverState::set_preferred_default_session`]、
     /// 清理走 [`DriverState::clear_preferred_default_session`]，任何一处漏写都会让
@@ -338,7 +342,7 @@ pub enum WsIncoming {
         /// 扩展自检发现的问题（`queryTabs` / `tabGroups` / `restartSeq` 之类异常）。
         ///
         /// 扩展在 `connectWS` 的 finally 块里会发这个数组，但 daemon 侧长期没有建模，
-        /// serde 直接丢弃 —— 用户看不到「为什么这次上报的 tabs 是空的」（R-19）。
+        /// serde 直接丢弃 —— 用户看不到「为什么这次上报的 tabs 是空的」。
         #[serde(default)]
         warnings: Vec<Value>,
         #[serde(default, deserialize_with = "deserialize_ext_tabs")]
@@ -400,11 +404,15 @@ pub struct ExtTab {
     pub active: bool,
 }
 
-/// 手写 `Deserialize`：`id` 不是字符串 / 整数时**拒绝这一条**。
+/// 手写 `Deserialize`：`id` 不合法时**拒绝这一条**。
 ///
 /// 派生实现会把任意 JSON 收进 `Value`，于是对象/数组类型的 id 会被
-/// `Value::to_string()` 变成 `{"a":1}` 这种伪 id，混进会话表后按 id 查找永远对不上
-/// 。调用方（`Vec<ExtTab>` 的逐条 `from_value`）会把 Err 当成「丢掉这条」。
+/// `Value::to_string()` 变成 `{"a":1}` 这种伪 id，混进会话表后按 id 查找永远对不上。
+/// 调用方（`Vec<ExtTab>` 的逐条 `from_value`）会把 Err 当成「丢掉这条」。
+///
+/// **负数与非正整数同样拒绝**。Chrome 的 tabId 恒为正整数，负值只能是
+/// 扩展被篡改或上游协议写错；旧实现会让它一路进会话表，直到执行时才报错，归因失真。
+/// 空字符串 / 纯空白同理——它拼出来的 `b:p:` 会让所有非法标签塌缩成同一个会话 key。
 impl<'de> Deserialize<'de> for ExtTab {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -426,9 +434,17 @@ impl<'de> Deserialize<'de> for ExtTab {
         }
 
         let raw = RawTab::deserialize(deserializer)?;
-        let id_ok = matches!(&raw.id, Value::String(_))
-            || raw.id.as_i64().is_some()
-            || raw.id.as_u64().is_some();
+        let id_ok = match &raw.id {
+            Value::String(text) => !text.trim().is_empty(),
+            // 正整数的两种表示：`as_i64` 覆盖 i64 范围，`as_u64` 覆盖
+            // u64 大于 i64::MAX 的部分（此时 `as_i64` 返回 None）。
+            Value::Number(_) => raw
+                .id
+                .as_i64()
+                .map(|id| id > 0)
+                .unwrap_or_else(|| raw.id.as_u64().is_some_and(|id| id > 0)),
+            _ => false,
+        };
         if !id_ok {
             return Err(<D::Error as serde::de::Error>::custom(format!(
                 "invalid tab id: {}",
@@ -456,7 +472,7 @@ impl ExtTab {
         let tab_id = match self.id {
             Value::String(s) => s,
             Value::Number(number) => number.to_string(),
-            // `ExtTab` 的 Deserialize 只放行字符串 / 整数 id，走到这里是 bug。
+            // `ExtTab` 的 Deserialize 只放行「非空字符串 / 正整数」id，走到这里是 bug。
             // 不再用 `other.to_string()` 造伪 id：宁可给空串，也不让
             // `{"a":1}` / `true` 之类变成会话 key 的一部分。
             other => {
@@ -551,6 +567,32 @@ mod tests {
         assert_eq!(info.tab_id, "7");
         assert_eq!(info.id, "7");
         assert_eq!(info.session_key, "b:p:7");
+    }
+
+    /// 负 id / 0 / 空串必须在反序列化阶段就被丢掉。
+    ///
+    /// 旧实现只校验「是字符串或整数」，负值一路进会话表（执行时才报错，归因失真），
+    /// 空串则让所有非法标签塌缩成同一个 `b:p:` 会话 key。
+    #[test]
+    fn non_positive_and_blank_tab_ids_are_dropped() {
+        let message: WsIncoming = serde_json::from_value(json!({
+            "type": "ext_ready",
+            "tabs": [
+                { "id": -1, "url": "https://a" },
+                { "id": 0, "url": "https://b" },
+                { "id": "", "url": "https://c" },
+                { "id": "   ", "url": "https://d" },
+                { "id": 3, "url": "https://e" },
+                { "id": "42", "url": "https://f" }
+            ]
+        }))
+        .expect("ext_ready");
+        let WsIncoming::ExtReady { tabs, .. } = message else {
+            panic!("expected ext_ready");
+        };
+        assert_eq!(tabs.len(), 2, "只保留正整数与非空字符串 id");
+        assert_eq!(tabs[0].id, json!(3));
+        assert_eq!(tabs[1].id, json!("42"));
     }
 
     #[test]

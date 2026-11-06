@@ -12,33 +12,38 @@
 
 ## [Unreleased] - 2026-11-04
 
-> open/tabs/close 体验改进。全部向后兼容：不删除、
+> open/tabs/close 体验改进（P2-1 / P2-2 / P2-5 / P2-6 / P2-8）。全部向后兼容：不删除、
 > 不改名任何旧字段，旧脚本无需改动。
 
 ### Added
 
-- **`open --wait-for <networkidle|selector:S|text:T>`**：打开后继续等页面条件
+- **`open --wait-for <networkidle|selector:S|text:T>`（P2-2）**：打开后继续等页面条件
   满足才算成功。networkidle 在页面内等「readyState=complete 且 1 秒无新请求/DOM 变更」；
   selector/text 复用 daemon 现成的 JS 条件轮询。超时跟随 `--timeout`，等不到的目标
   `ok:false` + `error_code:"wait_for_timeout"`，不影响其它目标。带 `--wait-for` 时
   `ready:true` 语义升级为「条件已满足」。
-- **`open --warm`**：打开前先 ping 一次扩展（拉 tabs 列表）唤醒 service worker；
+- **`open --warm`（P2-6）**：打开前先 ping 一次扩展（拉 tabs 列表）唤醒 service worker；
   ping 失败重试一次后照常打开。
-- **`tabs --fields` / `--limit` / `--mine`**：字段白名单过滤（未知字段报
+- **`tabs --fields` / `--limit` / `--mine`（P2-5）**：字段白名单过滤（未知字段报
   `unsupported_flag` 退出码 2）、条数截断、只看本 agent open 过的标签页（daemon 侧按
   `agent_opened` 记录过滤）。
-- **`close --tab group:<标题> --yes`**：按组关闭的显式确认形态。不带 `--yes`
+- **`close --tab group:<标题> --yes`（P2-8）**：按组关闭的显式确认形态。不带 `--yes`
   时报错并告知将关闭的标签数；`all` / `url:` / `title:` 仍然拒绝。关闭结果逐条列
   tab_id + title。
 
 ### Changed
 
-- **open 返回统一**：单 URL 与多 URL 返回都额外带顶层 `targets`：
+- **open 返回统一（P2-1）**：单 URL 与多 URL 返回都额外带顶层 `targets`：
   `[{url, tab_id, ok, error?, ready, elapsed_ms}]`，并统一带 `count`。旧的
   `result.opened_tab_id`（单 URL）与 `tabs[]`（多 URL）字段原样保留；推荐新代码
   只解析 `targets`。多 URL 每个目标新增 `elapsed_ms`。
 
 ## [Unreleased] - 2026-11-03 / 11-04
+
+> 本节记录一次完整代码排查（106 条）与首轮报告（10 条）的修复与结构整理，CLI 版本未变更（0.7.1）。
+> **2026-11-04 补充**：后续审阅遗留与实测反馈（restart 自愈、错误码细分、四个新命令
+> schema/capabilities/doctor --fix/scrape）也记入本节；**扩展文件版本为 5.2.3**（11-03 记载的
+> 5.2.2 已被 11-04 部署覆盖）。
 
 ### Added
 
@@ -60,14 +65,14 @@
 
 ### Changed
 
-- **结果未知语义**：CLI 对 daemon 的 POST「请求已发出但响应未回」（超时 /
+- **结果未知语义（V8-03）**：CLI 对 daemon 的 POST「请求已发出但响应未回」（超时 /
   写后读失败 / 连接中断）不再误报 `unexpected_error`，改为结构化
   `{"error_code":"outcome_unknown","outcome":"unknown"}`，退出码 **4**（新增，
   退出码表同步更新）；连接都没建立的失败仍按原样报错。新增全局
   `--idempotency-key <key>`：随 `x-atb-idempotency-key` 请求头发给 daemon，
   daemon 对 60 秒内同 key 的 POST 直接回放首次响应（响应体带
   `idempotent_replay:true`），动作类命令可安全重发。
-- **迟到结果暂存**：扩展在请求超时后才回包的 exec 结果/错误不再静默丢弃，
+- **迟到结果暂存（A1-09）**：扩展在请求超时后才回包的 exec 结果/错误不再静默丢弃，
   暂存 5 分钟（超限淘汰最旧）；新增端点 `GET /exec-result/:exec_id`
   （命中即取走，返回 `found` / `result` / `error` / `ttl_seconds`）；
   exec 超时错误信息附带 exec_id 与查询指引。
@@ -85,19 +90,19 @@
   `set-extension-port` 现在只输出计划；计划统一包进 `result`，与真实执行同一套
   `jq .result` 解析；`--out` 占位符只在真多目标时校验。
 
-- **`atb restart` 自愈**：daemon 在跑但 API token 不匹配时，旧实现只提示
+- **`atb restart` 自愈（P0 实测反馈）**：daemon 在跑但 API token 不匹配时，旧实现只提示
   「结束占用 18767 的进程后重试」然后退出，而 restart 本身就是干这件事的，形成自锁。
   现在默认输出结构化 `daemon_token_mismatch` 错误（退出码 2，附将执行的命令）；
   新增 `atb restart --force`：自动定位 LISTENING 在 18767 的 PID（Windows `netstat -ano` /
   macOS·Linux `lsof`）强杀后照常重新拉起 daemon（含防误杀自身进程的过滤）。
-- **job 硬上限淘汰语义**：任务表达到硬上限强制淘汰 running 任务时，daemon 侧
+- **job 硬上限淘汰语义（D-05）**：任务表达到硬上限强制淘汰 running 任务时，daemon 侧
   现在留存根（最多 32 条，含 `evicted_at`）；`job get/wait` 命中存根返回
   `error_code:"job_evicted"` 与提示，不再把「daemon 侧丢弃」伪装成 `job_not_found`
   （那会被当成 id 写错）。
-- **注释纠偏**：`assets/atb_bridge/background.js` 中「ext_ready 的 restartSeq
+- **注释纠偏（V8-12）**：`assets/atb_bridge/background.js` 中「ext_ready 的 restartSeq
   daemon 侧从未解析」的说法不实（ws.rs 一直在解析并置 `cdpRebuildRequired`），已按
   实际契约改写：daemon 旁路解析、扩展侧仅上报。
-- **清理过期 `allow(dead_code)`**：`config::load()`（cmd_status 已接入）与
+- **清理过期 `allow(dead_code)`（V8-13）**：`config::load()`（cmd_status 已接入）与
   `preflight::clamp_timeout_seconds`（server/cli 的 `secs()` 已接入）的过期 allow 与
   注释已删除；其余 `allow(dead_code)` 逐处核验后保留（确为测试专用或未启用）。
 - **配置兜底路径不再静默吞错**：Windows「备份 + 改名」退路中删除 `.bak` 失败时，
@@ -105,32 +110,36 @@
 
 ### Fixed
 
-- **click 自动降级真实鼠标**：CDP 路径 `click` 失败且错误属于 CDP 层
+- **click 自动降级真实鼠标（P2-3）**：CDP 路径 `click` 失败且错误属于 CDP 层
   （协议 / 批回包缺结果，如 `Runtime.callFunctionOn response missing`）时，自动
   降级走 `mouse-click` 路径（`Input.dispatchMouseEvent`），响应带
   `used_fallback:true` + `fallback_reason`；降级也失败时报原始错误 + 降级错误。
   页面内点击路径（`@e` 带 selector / `--frame`）不降级；`blocked` / `covered_by`
   遮挡告警不受影响。
-- **受限站点报错人话化**：CDP 错误出口（`cdp_call` / `batch_cdp_call`）
+- **受限站点报错人话化（P2-4）**：CDP 错误出口（`cdp_call` / `batch_cdp_call`）
   命中 Chrome 原文 `Cannot access a chrome-extension:// URL of different extension`
   时，翻译为结构化错误：`error_code:"page_protected"`、
   error:「该页面禁止调试器注入（页面内嵌了其他扩展的 iframe 或站点 CSP/扩展隔离）」、
   hint:「改用 read / scan / snapshot（走无 eval 通道），或 mouse-click 直接坐标点击」，
   并保留 `raw_error`。
-- **快照与 CDP 细节修复**：
-  - `collect_dom_details` 只在 `--details` 时执行；旧实现不带 `--details`
+- **早期审阅遗留（C-02 / C-04 / C-05 / C-06 / X-15）**：
+  - C-02：`collect_dom_details` 只在 `--details` 时执行；旧实现不带 `--details`
     也无条件发起最多 25 批 CDP 往返，结果写进从未被读取的缓存字段。
-  - CDP 快照的可操作角色集并入 JS 快照的 `file`（并集策略，AX 树特有角色
+  - C-04：CDP 快照的可操作角色集并入 JS 快照的 `file`（并集策略，AX 树特有角色
     保留）；两处角色集差异已在注释中写明边界。
-  - `dom_mouse_click` 保持两次往返的原因（扩展 batch 协议 `$N` 占位只覆盖
+  - C-05：`dom_mouse_click` 保持两次往返的原因（扩展 batch 协议 `$N` 占位只覆盖
     objectId/nodeId，坐标必须页面侧量出）已写入注释，逻辑未改。
-  - `snapshot --js` 的 `next_offset` 加边界保护——页面回包未显式带
+  - C-06：`snapshot --js` 的 `next_offset` 加边界保护——页面回包未显式带
     `offset`/`has_more`/`next_offset`（旧版脚本）时不再给出 `next_offset`，
     避免调用方跟进后必然报「不支持 offset 分页」。
+  - X-15：`stalledMs` 已由 challenge 侧接通（核验通过）；`skipGeneric` 接通
+    daemon 侧（`SnapshotRequest.skip_generic` → 页面脚本），CLI flag 待 cmd 侧补充；
+    `confirmMs` / `credentials` / `parseJson` / `innerTextLimit` 所需改动在
+    challenge.rs / net.rs / read.rs，不在本轮修改文件范围，维持现状。
 - **退出码兜底**：`job_evicted` 归入参数类错误白名单（退出码 2）；错误文本的中文
   子串兜底（「未连接」等）只在 JSON 没有结构化 `error_code` 时才生效，daemon 补上
   typed error_code 后退出码不再漂移。
-- **假成功**：`upload` / `mouse-click` 由 `batch_cdp_call` 逐条校验
+- **假成功（P0）**：`upload` / `mouse-click` 由 `batch_cdp_call` 逐条校验
   `results[*].ok`、`data.skipped` 与顶层 `failed`；`wait` / `broadcast` / `run` /
   `batch` / `multi` / `job` 的内层 `ok:false` 会上浮为退出码非 0；
   挑战「已通过」在探测失败时不再成立。
@@ -152,7 +161,7 @@
   非法 selector 返回 `{ok:false}` 而不是抛到通道层。
 - **分发链路**：`npm/bin/atb.js` 兜底报错不再 `ReferenceError`，信号退出码按
   `128+n`，Alpine(musl) 有明确提示；Release 产物按 `<target>-atb` 命名，不再互相覆盖。
-- **目标解析错误语义细分**：daemon 的目标类错误统一带
+- **目标解析错误语义细分（v8 V8-05 / 实测 P1-1、P1-2）**：daemon 的目标类错误统一带
   `error_code` / `retryable` / `retry_after_ms` / `hint`，CLI 按码映射退出码，
   不再依赖「未连接」等中文子串（文案变化不再影响脚本判断）；旧自然语言文本全部保留。
   原 `no_tabs` / `no_targets` 一个码背四种病因，细分为 `tab_closed`（单标签关闭）、
@@ -173,7 +182,7 @@
 
 ## [扩展 5.2.x] - 2026-11-03
 
-> **Chrome 扩展文件**（`assets/atb_bridge/manifest.json`）的版本为 **5.2.3**。
+> 本节记录 **Chrome 扩展文件**（`assets/atb_bridge/manifest.json`）的版本，当前为 **5.2.3**。
 > CLI 版本（0.7.x）与扩展版本独立演进；扩展↔daemon 的消息协议未变（仍为 **4**）。
 
 ### Changed
@@ -183,13 +192,13 @@
   （alarms 只做长期兜底），调试器 attach 后 1.2s 内 detach。
 - **5.2.1 与 CLI 0.7.1 同步发布**：扩展侧的维护性修复（挑战探测、页面脚本与网络拦截相关），
   不新增/删除消息字段；`ops/page_*.js` 与 `assets/page_*.js` 继续保持逐字节一致。
-- **5.2.3（跟随下一版 CLI）**：缺陷修复，协议仍为 **4**。
+- **5.2.3（未发布，跟随下一版 CLI）**：一轮系统性修复，协议仍为 **4**。
   - `background.js`：`detachAllDebugSessions` 不再对 `ws-close` / `keepalive-lost` 清空
     持久化拦截快照 —— 旧实现会在每次 daemon 重启时把 `net route --persist` 的规则永久抹掉，
-    导致重启后拦截不自愈。
+    导致重启后拦截不自愈（EXT-27）。
   - `page_challenge.js`：`challenge wait` 不再把「挂着未通过验证码组件但页面能浏览」
     判成已放行（要求 `vendor && interactive && !token_ready` 时继续等）；
-    `stalledMs` 改由 daemon 下发后，静默挂死的快速失败链路恢复生效。
+    `stalledMs` 改由 daemon 下发后，静默挂死的快速失败链路恢复生效（B-05 / B-26）。
 - **5.2.2**：服务端生命周期与页面脚本的缺陷修复，协议仍为 **4**。
   - `background.js`：SW 重启后自愈（规则/采集状态恢复并重新 enable Fetch/Network/Runtime）、
     按 tab 串行化 attach、状态快照读-改-写、`onclose` 守卫、发送队列、`cookies clear --url` 域匹配。
@@ -210,7 +219,7 @@
 
 ### 说明
 
-- 仓库内没有 5.1.x 的独立发布记录：版本从 5.0.3 直接到 5.2.0，5.2.1 为同一批次的收尾。
+- 仓库内没有 5.1.x 的独立发布记录：版本从 5.0.3 直接到 5.2.0，5.2.1 为同轮收尾。
 - 本节只覆盖扩展文件；命令行为变化见下方 0.7.x 各节。
 
 ## [Unreleased]
@@ -241,7 +250,7 @@
 
 ### Fixed
 
-- **挑战页不再被注入任何脚本（最关键的一条）**。识别逻辑原先走 `eval` 进了页面的
+- **挑战页不再被注入任何脚本（本轮最关键的一条）**。识别逻辑原先走 `eval` 进了页面的
   MAIN world，脚本里的 `window.__abcChlSeenAt` 就成了站方可读的自动化指纹：
   点击照样被接收（页面会显示「正在验证您是否是真人」），但 Turnstile 永远不给 token。
   现在 `challenge` 的页面侧调用一律走扩展的 ISOLATED world，脚本里也不再写任何
@@ -371,70 +380,70 @@
 
 ## [Unreleased]
 
-> 主题：修复 `assets/page_*.js` 的静默失效 —— 跑起来不报错、行为和文档不一致，
-> 要么让命令假成功，要么让调用方拿到错的数据。
+> 主题：`assets/page_*.js` 的 23 条修复收口 —— 这批全是
+> 「跑起来不报错、行为和文档不一致」的静默失效，要么让命令假成功，要么让调用方拿到错的数据。
 
 ### Fixed
 
-- **口令/支付信息不再出现在命令输出里**：`read` / `find` / `snapshot` / `scan` 对
+- **口令/支付信息不再出现在命令输出里**（JS-10）：`read` / `find` / `snapshot` / `scan` 对
   `type=password` 与 `autocomplete=current-password|new-password|cc-number|cc-csc|one-time-code`
   的字段值统一返回 `•••` 并标 `redacted:true`。以前 fill 完登录表单再 read（LLM 代理的标准工作流）
   会把明文口令一路带进 CLI 输出、agent 上下文与日志文件。
-- **`@e` 引用不再点错元素**：`find` / `snapshot` 生成的 CSS 路径逐层验唯一
+- **`@e` 引用不再点错元素**（JS-01）：`find` / `snapshot` 生成的 CSS 路径逐层验唯一
   （`querySelectorAll(path).length === 1`），不唯一就继续加祖先直到 `documentElement`。
   重复结构页面（卡片/列表/表格行）上，`@e37` 以前会落到第 1 张卡片的同位按钮并返回 `ok:true`。
-- **被遮罩盖住的点击不再算「成功」**：`click` / `mouse-click` 在目标中心点被别的元素
+- **被遮罩盖住的点击不再算「成功」**（JS-06）：`click` / `mouse-click` 在目标中心点被别的元素
   盖住时，结果带 `blocked:true` + `covered_by`，并把 `warnings:[{code:"action_target_covered"}]`
   提到顶层。以前这条信息只在页面脚本的 `hit` 字段里，daemon 与 CLI 都不消费。
-- **React 受控 checkbox 真的会被勾上**：`check` / `uncheck` 改走原生 `click()`
+- **React 受控 checkbox 真的会被勾上**（JS-05）：`check` / `uncheck` 改走原生 `click()`
   （React 的 onChange 对 checkbox 挂的是 click 事件），返回 `via:"click"`；状态已一致时
   `unchanged:true`，disabled 或被页面回滚时报 `ok:false` 而不是假成功。
-- **`net hook --capture-bodies` 不再挂死页面**：响应体读取改为旁路，日志先落
+- **`net hook --capture-bodies` 不再挂死页面**（JS-02）：响应体读取改为旁路，日志先落
   `body_capture_pending` 再补 preview；`text/event-stream` 与超过 4MB 的响应直接标
   `body_capture_skipped`。以前 `await clone.text()` 会让 SSE 页面的 `fetch` 永不 resolve。
-- **响应改写不再整段缓冲、也不再丢字段**：只改 status/headers 时透传 `response.body` 流
+- **响应改写不再整段缓冲、也不再丢字段**（JS-03）：只改 status/headers 时透传 `response.body` 流
   （日志标 `body_stream_passthrough`），并补回 `url` / `type` / `redirected`（补不上标 `url_lost`）；
   目标状态码是 204/304 时显式置空 body（`body_dropped:"null_body_status"`），
   不会因 `new Response(stream, {status:204})` 抛 `TypeError`。
-- **mock 规则异常不再打断页面请求**：非法 status、204 带 body 时记 `mock_invalid`
+- **mock 规则异常不再打断页面请求**（JS-12）：非法 status、204 带 body 时记 `mock_invalid`
   并放行真实请求，不再把 `TypeError` 抛给页面、也不再「页面 reject 而日志里查不到」。
-- **XHR 的 abort/mock 现在符合原生状态机**：abort 置 `readyState=4` / `status=0` 并派发
+- **XHR 的 abort/mock 现在符合原生状态机**（JS-08）：abort 置 `readyState=4` / `status=0` 并派发
   `ProgressEvent`；复用同一个 xhr 再发真实请求时，`open()` 会清掉上一次打的 `readyState` 补丁
   （只删自己打的，靠 `__abcNetOwnReady` 标记），不再让 `onreadystatechange` 永久被遮蔽。
-- **规则匹配口径统一**：相对 URL 先解析成绝对 URL（`fetch('/api/x')`
+- **规则匹配口径统一**（JS-09 / JS-16 / JS-17）：相对 URL 先解析成绝对 URL（`fetch('/api/x')`
   能命中 `match:"host/api/x"`）；默认按子串匹配、`regex:true` 才按正则（`app.js` 不再命中
   `appXjs`）；`net route` 更新同 (match, method) 规则改为**原位替换**，不改变命中优先级；
   重放超过 50 条时返回 `routes_dropped` 而不是静默截断。
-- **`net fetch` 不再被自己的规则骗**：诊断请求改用 hook 之前的原始 `fetch`，
+- **`net fetch` 不再被自己的规则骗**（JS-21）：诊断请求改用 hook 之前的原始 `fetch`，
   返回体标 `bypassed_hooks:true`。以前它会命中自己写的 mock，还每次都进一条日志。
-- **scan 的浮层广告剔除链路复活**：`simphtml_opt.js` 的 `nodeInfo` WeakMap 以前从未
+- **scan 的浮层广告剔除链路复活**（JS-04）：`simphtml_opt.js` 的 `nodeInfo` WeakMap 以前从未
   `set`，`analyzeNode` 入口守卫必然命中 → `R:covered` / `R:floatingAd` 一个都打不上，
   每次 scan 都白做分析还把广告层写进正文。现在固定定位的图片广告会被剔出结果。
-- **超深 DOM 不再让 scan 崩掉**：页面侧克隆/分析加 512 层上限（与 `html.rs` 的
+- **超深 DOM 不再让 scan 崩掉**（JS-19）：页面侧克隆/分析加 512 层上限（与 `html.rs` 的
   `MAX_DOM_DEPTH` 同阈值），超限返回 `truncated: DOM deeper than 512 levels`；其它异常统一成
   `__ABC_SCAN_ERROR__<msg>` 由 daemon 转成结构化错误。
-- **页面不再能劫持页面脚本入口**：扩展每次调用都重新注入页面脚本（不再「探测到同名
+- **页面不再能劫持页面脚本入口**（JS-07）：扩展每次调用都重新注入页面脚本（不再「探测到同名
   函数就跳过」），并对 MAIN world 的 `__abcNet` / `__abcStealth` 校验不可枚举标记 `__abcOwn`；
   被页面抢占时明确报错，不执行页面提供的实现。
-- **调试日志不再打到被访页面**：`simphtml_opt` 的 `console.log`（含遗留的
+- **调试日志不再打到被访页面**（JS-18）：`simphtml_opt` 的 `console.log`（含遗留的
   `area / totalArea`）默认全关（`{debug:true}` 才输出）；文件末尾多余的 `optHTML()` 裸调用已删 ——
   它让每次注入都先对整页做一遍全量克隆。
-- **`wait --js --interval` 生效**：daemon 传的键名由 `intervalMs` 改为 `minIntervalMs`。
+- **`wait --js --interval` 生效**（JS-14）：daemon 传的键名由 `intervalMs` 改为 `minIntervalMs`。
   实测 `--timeout 11 --interval 5` 只巡检 3 次；以前被静默按 50ms 巡检（后台标签被节流到 1s 也有 11 次）。
-- **`find_list` 不再改页面 DOM**：不再给容器写 `id='_ljq..'`，改用不落地 DOM 的
+- **`find_list` 不再改页面 DOM**（JS-13）：不再给容器写 `id='_ljq..'`，改用不落地 DOM 的
   nth-of-type 路径，避免破坏依赖 id 唯一性的页面逻辑与 `[id^=...]` 样式。
-- **`--text` 定位不再给大页面强加整页布局**：元素数超过 20000 时降级 `textContent`，
+- **`--text` 定位不再给大页面强加整页布局**（JS-22）：元素数超过 20000 时降级 `textContent`，
   与 `page_wait.js` 的阈值一致。
-- **非法选择器有明确错误**：`read --selector` 对非法选择器返回
+- **非法选择器有明确错误**（JS-23）：`read --selector` 对非法选择器返回
   `invalid selector: ...`，与 `page_wait.js` 口径一致，不再表现为通道级 `pageOp failed`。
 
 ### Changed
 
-- **`challenge status` 新增 `suspected`**：标题关键词分强/弱两档，`One more step` /
+- **`challenge status` 新增 `suspected`**（JS-11）：标题关键词分强/弱两档，`One more step` /
   `Access Denied` 这类通用文案只记 `suspected:true` + `signals:title-only-suspect`，
   需要 DOM/脚本实锤（`#challenge-stage` / orchestrate / `#sec-if-cpt-container`）才升级为拦截。
   daemon 侧 `open --challenge` 的标题预判同步去掉 `access denied`，不再让每个 403 页白付一次注入。
-- **不再共用同名全局**：`page_action.js` / `page_find.js` 的可见性判断改用各自前缀
+- **不再共用同名全局**（JS-15）：`page_action.js` / `page_find.js` 的可见性判断改用各自前缀
   （`__abcActVisible` / `__abcFindVisible`）。两份脚本注入同一个 world，同名函数会被后注入者覆盖，
   只改其中一份就变成静默的行为漂移。
 
@@ -563,17 +572,17 @@
 
 ### Fixed
 
-- **`net hook --persist` 刷新后 mock 规则凭空消失**：持久化时把页面返回的「规则条数」当成规则数组写进配置，刷新重装时因类型不符被页面侧丢弃，表现为「规则只在当前页面有效，一刷新就没了」。现在先取规则列表再兜底过滤，任意操作顺序（先 hook 后 mock、先 mock 后 hook）刷新都不再丢规则。
-- **`net routes` 会误清正在生效的 CDP 拦截**：`net routes` 本意是查询，实际把整份配置当 CDP 规则数组下发，把 `--engine cdp` 的规则整批覆盖掉。现在查询不再有副作用。
-- **`challenge` 的「N 秒后转人工」永不触发**：`focusAfterMs` 每片都从 0 重新计时，而单片等待上限只有 4 秒，等多久都到不了阈值，需要人点的验证码页一路静默到超时。现在按总经过时间累计，到点自动把标签页带到前台。
-- **`exec --monitor` 吞掉页面脚本异常**：页面里抛错时命令仍返回 `ok:true`、退出码 0，调用方以为执行成功。现在照常上抛失败。
-- **CSP 误判导致提交按钮被点两次**：`is_csp_error` 用裸子串 `csp` 匹配，`#csp-banner not found` 这类普通报错也被当成 CSP 拦截，于是换通道重试一次，点击被重复执行。现在只认真正的 CSP 错误特征。
-- **扩展发送失败后命令空等**：WebSocket 发送失败时没有回收在途请求，命令只能等到超时。现在发送失败立即收口并返回错误。
-- **长跑 `exec`/`scan` 期间 daemon 自己退出**：空闲判定只数后台 job 数量，前台长命令不算在内，daemon 误判空闲后退出，命令被腰斩。现在在途命令同样计入。
-- **`close` 失败会丢会话**：以前拿到扩展确认前就删会话，关闭失败时既丢了会话状态，又让 `default_session_key` 指向已删除的会话。现在确认后才清理。
-- **会话级缓存只增不减**：`snapshots` / `page_scale` / `session_locks` 不随会话销毁，长跑 daemon 的内存单调上涨。现在随会话一并回收。
-- **`tabs` 的 `connected_at` 恒为 null**：现在按扩展上报的连接时间填写。
-- **迟到/重复 `ack` 永久驻留**：ack 集合只增不减，长跑 daemon 缓慢泄漏。现在超出等待窗口的 ack 直接丢弃。
+- **`net hook --persist` 刷新后 mock 规则凭空消失**：持久化时把页面返回的「规则条数」当成规则数组写进配置，刷新重装时因类型不符被页面侧丢弃，表现为「规则只在当前页面有效，一刷新就没了」。现在先取规则列表再兜底过滤，任意操作顺序（先 hook 后 mock、先 mock 后 hook）刷新都不再丢规则（BUG-08）。
+- **`net routes` 会误清正在生效的 CDP 拦截**：`net routes` 本意是查询，实际把整份配置当 CDP 规则数组下发，把 `--engine cdp` 的规则整批覆盖掉。现在查询不再有副作用（N-01）。
+- **`challenge` 的「N 秒后转人工」永不触发**：`focusAfterMs` 每片都从 0 重新计时，而单片等待上限只有 4 秒，等多久都到不了阈值，需要人点的验证码页一路静默到超时。现在按总经过时间累计，到点自动把标签页带到前台（BUG-05/BUG-06 同族）。
+- **`exec --monitor` 吞掉页面脚本异常**：页面里抛错时命令仍返回 `ok:true`、退出码 0，调用方以为执行成功。现在照常上抛失败（BUG-04）。
+- **CSP 误判导致提交按钮被点两次**：`is_csp_error` 用裸子串 `csp` 匹配，`#csp-banner not found` 这类普通报错也被当成 CSP 拦截，于是换通道重试一次，点击被重复执行。现在只认真正的 CSP 错误特征（BUG-11）。
+- **扩展发送失败后命令空等**：WebSocket 发送失败时没有回收在途请求，命令只能等到超时。现在发送失败立即收口并返回错误（BUG-10）。
+- **长跑 `exec`/`scan` 期间 daemon 自己退出**：空闲判定只数后台 job 数量，前台长命令不算在内，daemon 误判空闲后退出，命令被腰斩。现在在途命令同样计入（BUG-02）。
+- **`close` 失败会丢会话**：以前拿到扩展确认前就删会话，关闭失败时既丢了会话状态，又让 `default_session_key` 指向已删除的会话。现在确认后才清理（BUG-20）。
+- **会话级缓存只增不减**：`snapshots` / `page_scale` / `session_locks` 不随会话销毁，长跑 daemon 的内存单调上涨。现在随会话一并回收（BUG-15）。
+- **`tabs` 的 `connected_at` 恒为 null**：现在按扩展上报的连接时间填写（BUG-24）。
+- **迟到/重复 `ack` 永久驻留**：ack 集合只增不减，长跑 daemon 缓慢泄漏。现在超出等待窗口的 ack 直接丢弃（BUG-26）。
 - **`read`/`scan` 的 `--max-nodes` 被悄悄抬高**：给小于 1000 的值时被静默改成 60000，用户想省 token 反而拿到上限。现在按传入值生效。
 - **`--max-chars` 被静默收敛**：超出范围时不再无声改写（部分路径仍会收到服务端上限，但不会再出现「给了一个值、拿到另一个值却毫无提示」）。
 - **`job cancel` 对 `wait` 现在真能停**：`wait --js` 以前把剩余时间整段注入页面，取消要等整段返回才被看见（30s 的等待取消后仍然跑满 30s）。现在可取消的任务按 1s 切片，取消约 1s 内生效，并如实标为 `cancelled`；同步调用不受影响（仍是一次注入）。
@@ -623,7 +632,7 @@
 - `trust-extension` 与 `ws-trust.json` 都是可选的，不配置不影响任何现有用法。
 - 改过 `assets/page_*.js` 后必须 `npm run sync:extension`，否则 `ops/` 里的副本与扩展不同源（`npm run check:extension` 可在提交前自查）。
 
-### 补充修复（同日）
+### 第三轮验收补充（同日，v3 复核后）
 
 #### Fixed
 
@@ -647,7 +656,7 @@
 - **`ws-trust.json` 解析失败不再降级为「任意扩展可连」**：以前写坏一个尾逗号，整套白名单与 token 校验立刻失效，而 daemon 在后台看不见 stderr。现在配置损坏即拒绝所有握手（503），`/health` 的 `ws_security.trust_config_error` 给出具体解析错误——与「从没配过」可以区分了。
 - **信任变更即时生效**：`trust-extension` 之后调用 `/reload-trust`，此前已连上的不可信扩展会被真正踢掉，不用等它自己断开或重启 daemon。
 
-### 信任与工具链修复（同日）
+### 第四轮验收补充（同日，v4 闭环）
 
 #### Fixed
 
@@ -659,16 +668,18 @@
 
 - **`cargo clippy` 从"只告警"变成"卡 CI"**：补上 `-- -D warnings`，并把仓库里遗留的 8 条告警清零（多余 cast、可折叠 `if`、`format!` 嵌套、`clamp` 写法、测试里的 `get().is_none()` 等）。同时全量跑了 `cargo fmt`——此前的 `cargo fmt --check` 步骤对每次推送都是红的。
 
-### 2026-11-02（首次覆盖扩展与构建链）
+### 全量排查修复（2026-11-02，首次覆盖扩展与构建链）
+
+> 这一轮把排查范围从 `src/` 扩到 Chrome 扩展、`scripts/`、`npm/` 与 CI，共处理 62 条中的 55 条（余下见文末「已知未修」）。
 
 #### Fixed（严重）
 
 - **扩展 service worker 被回收后页面请求永久挂死**：`debugSessions` 只在内存，SW 被杀即空；但 CDP 侧的请求已暂停。新 SW 被 `Fetch.requestPaused` 唤醒时找不到 session 就直接 `return`，**没有任何 continue/fulfill/fail**，页面一直转圈。现在：该分支按阶段强制放行；并把每标签的规则落 `chrome.storage.session`，冷启动时对已 attach 的标签重建会话并重新 `Fetch.enable`。`ext_ready` 新增 `restartSeq`，daemon 能识别扩展重启。
-- **`--frame` 在 CSP 回退路径上系统性丢失**（5 处）：`net`/`read`/`find`/`challenge`/`wait` 的回退调用全部硬编码 `frame_id=None`，CSP 页面上带 `--frame` 会**静默落到主框架**——读到错误框架的内容且无任何提示；`net route` 更会把规则装到主框架。
+- **`--frame` 在 CSP 回退路径上系统性丢失**（5 处）：`net`/`read`/`find`/`challenge`/`wait` 的回退调用全部硬编码 `frame_id=None`，CSP 页面上带 `--frame` 会**静默落到主框架**——读到错误框架的内容且无任何提示；`net route` 更会把规则装到主框架。这是 v1 BUG-09 的同类项，当时只修了正常路径。
 - **`net` 字符串 rule 解析失败后校验被绕过**：解析得 `null` 仍写入 `opts["rule"]`，而校验用 `is_none()`——键存在即通过，于是错误归因成「需要 rule」（用户明明传了）。
 - **`net` 的 host 解析会把持久化注入注册到所有网站**：`https://x.com?q=1` 的 host 被切成 `x.com?q=1`（pattern 非法），且 `starts_with("chrom")` 误杀 `chromium.org`，最终兜底成 `<all_urls>`——与「收窄注入范围」的目标相反。现在按 scheme 判定，且 merged 为空时**不注册**并告警，不再兜底全站。
 - **持久化注入名未按 profile 隔离**：扩展侧 `persistInjections` 的键就是 name（全局），profile B 的 `net hook --persist` 会覆盖 A 的条目，A 的 `net reset` 又删掉共享条目 → daemon 配置、磁盘、扩展三方失同步。注入名改为带 profile 摘要，并 best-effort 清理旧名 `__net_hook`。
-- **`ws-trust.json` 写入非原子**：Windows 分支是先删后改名，中途失败/断电则文件消失 → daemon 把 `NotFound` 判为「从没配过」→ **回到任意扩展可连**（这是与「解析失败」同一 fail-open 的另一个入口）。现在复用 `config::replace_file_atomically`（backup → rename → 失败回滚），读取侧也走 `read_with_backup`。
+- **`ws-trust.json` 写入非原子**：Windows 分支是先删后改名，中途失败/断电则文件消失 → daemon 把 `NotFound` 判为「从没配过」→ **回到任意扩展可连**（v3 修的是「解析失败」，这是同一 fail-open 的另一个入口）。现在复用 `config::replace_file_atomically`（backup → rename → 失败回滚），读取侧也走 `read_with_backup`。
 - **popup 一打开就把当前页全部 cookie 静默写进系统剪贴板**（含 httpOnly 会话 cookie）。改为显式「复制 cookies」按钮，默认排除 httpOnly/secure，复制后给出提示。
 
 #### Fixed（假成功族）
@@ -725,11 +736,11 @@
 
 - 澄清了「加固是单向的」：`trust-extension` 只约束「谁能连 daemon」，不约束「扩展连的是谁」。README 与 popup 都如实说明：daemon 空闲退出后端口可能被本机其它进程抢占，配置 token 防不住这一点（双向握手需要协议升级，暂未做）。
 
-#### 已知未修
+#### 已知未修（第五轮）
 
-- 扩展 `alarms` 最小 30s 与 SW 30s 回收的根本矛盾：正解是用 offscreen document 持有 WebSocket，改动面大，当前未实现。
-- `job wait` / `wait` 的内层 `ok` 是否统一：会改变「匹配超时算不算失败」的语义，需产品决策。
-- `ext_ready` 无条件信任扩展上报的 browser/profile（兼容模式下任意扩展可冒充）：待双向握手方案落地后一并解决。
+- 扩展 `alarms` 最小 30s 与 SW 30s 回收的根本矛盾：正解是用 offscreen document 持有 WebSocket，改动面大，本批未做（已记录为下一步）。
+- `job wait` / `wait` 的内层 `ok` 是否统一（与 B-02 同族）：会改变「匹配超时算不算失败」的语义，需产品决策。
+- `ext_ready` 无条件信任扩展上报的 browser/profile（兼容模式下任意扩展可冒充）：与 AUTH-01 同源，待双向握手方案落地后一并解决。
 
 ## 未发布
 

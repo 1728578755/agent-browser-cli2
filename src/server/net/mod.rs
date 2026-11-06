@@ -37,7 +37,7 @@ pub(crate) struct NetRequest {
     #[serde(default, alias = "responseType")]
     pub(crate) response_type: Option<String>,
     /// fetch 的凭据模式：include（默认）/ omit / same-origin。
-    /// 页面脚本早就读 `opts.credentials`，但 CLI 侧一直没有下发通道（X-15）。
+    /// 页面脚本早就读 `opts.credentials`，但 CLI 侧一直没有下发通道。
     #[serde(default)]
     pub(crate) credentials: Option<String>,
     /// fetch 是否把 JSON 响应体解析成对象（页面默认 true）。
@@ -77,11 +77,50 @@ pub(crate) struct NetRequest {
     pub(crate) timeout: Option<f64>,
 }
 
-/// 等 `net_persist_lock` 的上限。
+/// 等该 profile 落盘锁的上限。
 ///
 /// 锁在整个读-改-写期间被持有，持锁内的每个网络等待都有自己的 timeout；
-/// 这里再给"等锁"本身一个上限，避免一条卡死的 net 命令把后续 net 命令无限堵住。
+/// 这里再给"等锁"本身一个上限，避免一条卡死的 net 命令把**同一 profile** 的
+/// 后续 net 命令无限堵住。锁按 profile 分配，其它 profile 不受影响。
 pub(crate) const NET_RMW_LOCK_WAIT: Duration = Duration::from_secs(150);
+
+/// `net reset` 的成功判据：三个维度都必须成立。
+///
+/// 旧实现只看页面 reset 与 CDP stop，持久注入（hook）删除失败时照样报 `ok:true`，
+/// 旧 mock 会在下次导航时「复活」。这里把判据收成一个纯函数，便于直接断言。
+pub(crate) fn reset_outcome_ok(page_ok: bool, cdp_stopped: bool, hook_removed: &Value) -> bool {
+    page_ok && cdp_stopped && hook_removed.get("ok").and_then(Value::as_bool) == Some(true)
+}
+
+/// 页面持久注入重放时的裁剪信息（观测缺口）。
+///
+/// 页面侧 `page_net.js` 的重放只接受前 `MAX_ROUTES`（64）条，并回报
+/// `routes_dropped`；daemon 侧以前完全不读它，于是 env 把 `ATB_NET_RULE_MAX_RULES`
+/// 放大到 64 以上时会出现「`net routes` 显示 N 条、浏览器只生效 64 条、没有任何提示」。
+/// 返回 `(丢弃条数, 人话告警)`；没有丢弃（或页面没回该字段）返回 `None`。
+///
+/// 文案里的上限优先取页面回报的 `routes_cap`（页面侧 `page_net.js` 的 `MAX_ROUTES`
+/// 直接派生，天然不会漂）；页面没回该字段时回落到 **64** —— 这个 64 是**页面侧常量**
+/// 的当前值，不是 daemon 的 `ATB_NET_RULE_MAX_RULES`（后者可被环境变量放大到 500）。
+/// 两处同时调整时必须一起改；页面一旦开始回 `routes_cap`，这里会自动跟随，不必再动 Rust。
+pub(crate) fn routes_dropped_note(payload: &Value) -> Option<(u64, String)> {
+    let dropped = payload.get("routes_dropped").and_then(Value::as_u64)?;
+    if dropped == 0 {
+        return None;
+    }
+    let cap = payload
+        .get("routes_cap")
+        .and_then(Value::as_u64)
+        .unwrap_or(64);
+    Some((
+        dropped,
+        format!(
+            "持久注入只重放前 {cap} 条页面规则，本次丢弃 {dropped} 条（页面侧 MAX_ROUTES 上限）；\
+             `net routes` 显示的是配置全量，浏览器实际生效的是裁剪后的子集。\
+             要放宽上限需同时调大页面侧常量"
+        ),
+    ))
+}
 
 pub(crate) async fn net(State(state): State<AppState>, Json(req): Json<NetRequest>) -> Json<Value> {
     touch(&state).await;
@@ -113,7 +152,7 @@ pub(crate) async fn net_value(state: &AppState, req: NetRequest) -> Result<Value
             return Err(anyhow!("net: 未知 engine {engine}（可选 page / cdp）"));
         }
         // cdp 引擎只实现 route / mock / unroute；其它 action 实际走页面注入。
-        // 以前放行后仍回报 engine:"cdp"，语义与结果都对不上（B-07）。
+        // 以前放行后仍回报 engine:"cdp"，语义与结果都对不上。
         if engine == "cdp" && !matches!(action.as_str(), "route" | "mock" | "unroute") {
             return Err(anyhow!(
                 "net {action}: --engine cdp 只支持 route / mock / unroute（该 action 只支持页面引擎，请去掉 --engine cdp）"
@@ -134,7 +173,7 @@ pub(crate) async fn net_value(state: &AppState, req: NetRequest) -> Result<Value
     }
     if let Some(headers) = req.headers.clone().filter(|value| !value.is_null()) {
         let object = if let Some(text) = headers.as_str() {
-            // 解析失败不能再静默变 `{}`：请求会少一堆头，用户却看到成功（B-06）。
+            // 解析失败不能再静默变 `{}`：请求会少一堆头，用户却看到成功。
             serde_json::from_str::<Value>(text).map_err(|err| {
                 let preview: String = text.chars().take(120).collect();
                 anyhow!("net: --headers 不是合法的 JSON（{preview}）：{err}")
@@ -147,7 +186,7 @@ pub(crate) async fn net_value(state: &AppState, req: NetRequest) -> Result<Value
     if let Some(body) = req.body.clone().filter(|value| !value.is_null()) {
         opts["body"] = body;
     }
-    // fetch 的两个页面侧开关（X-15）：页面脚本读的是 `credentials` / `parseJson`，
+    // fetch 的两个页面侧开关：页面脚本读的是 `credentials` / `parseJson`，
     // 不传时不覆盖页面默认值（include / true）。
     if action == "fetch" {
         if let Some(credentials) = req.credentials.as_deref() {
@@ -194,7 +233,7 @@ pub(crate) async fn net_value(state: &AppState, req: NetRequest) -> Result<Value
     if let Some(rule) = req.rule.clone().filter(|value| !value.is_null()) {
         let rule = if let Some(text) = rule.as_str() {
             // 解析失败必须直接报错：以前写入 Value::Null，键存在但值为空，
-            // 既绕过了下面的必填校验，又把错误推迟到 cdp 引擎（B-06）。
+            // 既绕过了下面的必填校验，又把错误推迟到 cdp 引擎。
             serde_json::from_str::<Value>(text).map_err(|err| {
                 let preview: String = text.chars().take(120).collect();
                 anyhow!("net: --rule 不是合法的 JSON（{preview}）：{err}")
@@ -240,8 +279,11 @@ pub(crate) async fn net_value(state: &AppState, req: NetRequest) -> Result<Value
     // 旧实现读完之后夹着一次页面往返（await）才写回，两个并发 `net route` 后写
     // 覆盖先写；`net reset` 与 `route` 交错时，route 还会把已删除的 profile 写回来。
     //
+    // 锁粒度是 **per-profile**：全局单锁会让 A profile 的慢命令把
+    // B profile 的 net 命令一起堵在 `NET_RMW_LOCK_WAIT` 上，叠加后调用方预算先耗尽。
+    //
     // 持锁期间的所有网络等待都有自己的 timeout（`extension_control` / `net_page_call`），
-    // 拿锁本身也设上限：否则一条卡死的 net 命令会把后续 net 命令永久堵住。
+    // 拿锁本身也设上限：否则一条卡死的 net 命令会把同 profile 的后续 net 命令永久堵住。
     let mutating = matches!(
         action.as_str(),
         // `routes` 通常只读，但扩展重启后的重建会把 `cdpRebuildRequired` 清掉并落盘，
@@ -249,11 +291,13 @@ pub(crate) async fn net_value(state: &AppState, req: NetRequest) -> Result<Value
         "routes" | "hook" | "route" | "unroute" | "mock" | "reset"
     );
     let _rmw_guard = if mutating {
-        match tokio::time::timeout(NET_RMW_LOCK_WAIT, state.net_persist_lock.lock()).await {
+        match tokio::time::timeout(NET_RMW_LOCK_WAIT, profile_persist_lock(state, &profile_key))
+            .await
+        {
             Ok(guard) => Some(guard),
             Err(_) => {
                 return Err(anyhow!(
-                    "net: 另一个 net 配置操作已持续超过 {}s 未结束，请稍后重试",
+                    "net: 该 profile 的另一个 net 配置操作已持续超过 {}s 未结束，请稍后重试",
                     NET_RMW_LOCK_WAIT.as_secs()
                 ))
             }
@@ -285,7 +329,7 @@ pub(crate) async fn net_value(state: &AppState, req: NetRequest) -> Result<Value
         let rebuild = config.get("cdpRebuildRequired").and_then(Value::as_bool) == Some(true);
         if cdp_enabled || rebuild {
             // 下发失败不能静默：旧实现 `if let Ok(value)` 吞错，`applied` 保持 null，
-            // 调用方分不清「没有规则要下发」和「扩展根本没收到」（B-11）。
+            // 调用方分不清「没有规则要下发」和「扩展根本没收到」。
             applied = match net_cdp_broadcast(
                 state,
                 &profile_key,
@@ -318,6 +362,12 @@ pub(crate) async fn net_value(state: &AppState, req: NetRequest) -> Result<Value
             }
         }
         let routes = config.get("routes").cloned().unwrap_or_else(|| json!([]));
+        // match pattern 是 host 级（Chrome 语法里 host 段不接受端口），
+        // 调用方需要知道「这个 pattern 会覆盖同一 host 的其它端口」。
+        // 只读回显，不改配置；要按端口隔离请用 `--match` 或 `--engine cdp`。
+        let page_pattern = current_site_match_pattern(state, &session_key)
+            .await
+            .map(|(pattern, _)| pattern);
         return Ok(json!({
             "tab_id": tab_id_of_session(&session_key),
             "session_key": session_key,
@@ -330,6 +380,9 @@ pub(crate) async fn net_value(state: &AppState, req: NetRequest) -> Result<Value
                 "routes": routes,
                 "persist": config.get("persist").cloned().unwrap_or(json!(false)),
                 "matches": config.get("matches").cloned().unwrap_or_else(|| json!(["<all_urls>"])),
+                // 当前页面对应的站点 pattern，以及它的端口覆盖范围（只读）。
+                "pattern": page_pattern,
+                "port_scope": "host-only",
                 "cdp": {
                     "enabled": config.get("cdpEnabled").cloned().unwrap_or(json!(false)),
                     "count": cdp_rules.as_array().map(Vec::len).unwrap_or(0),
@@ -416,7 +469,11 @@ pub(crate) async fn net_value(state: &AppState, req: NetRequest) -> Result<Value
         // 明确报错才让命令失败；未确认的单列出来，提示「下次导航自然失效」。
         let (page_failed, page_unconfirmed) = split_reset_failures(&page_failures);
         let page_ok = page_failed.is_empty();
-        let reset_ok = page_ok && cdp_stopped;
+        // 持久注入删除失败必须算失败：旧实现只把「页面 reset + CDP stop」
+        // 计入 reset_ok，hook 删不掉时照样报 ok:true —— 扩展存储里的旧注入还在，
+        // 下次导航会把已经 reset 掉的 mock 重新装回来（「reset 成功但规则还生效」）。
+        let hook_ok = hook_removed.get("ok").and_then(Value::as_bool) == Some(true);
+        let reset_ok = reset_outcome_ok(page_ok, cdp_stopped, &hook_removed);
         let mut out = json!({
             "ok": reset_ok,
             "tab_id": tab_id_of_session(&session_key),
@@ -435,6 +492,7 @@ pub(crate) async fn net_value(state: &AppState, req: NetRequest) -> Result<Value
             "cdp_stopped": cdp_stopped,
             "cdp": cdp_result,
             "hook_removed": hook_removed,
+            "hook_removed_ok": hook_ok,
             // 没停下来时配置被刻意保留，才能再试一次；如实告诉调用方。
             "config_removed": cdp_stopped,
         });
@@ -443,6 +501,17 @@ pub(crate) async fn net_value(state: &AppState, req: NetRequest) -> Result<Value
                 out["error"] =
                     json!("网络层拦截未能在所有标签上停止，已保留配置以便重试（见 cdp.failed）");
                 out["hint"] = json!("先 `atb net reset --engine cdp` 重试；持续失败时用 `atb browsers` 确认目标浏览器是否还连着");
+            } else if !hook_ok {
+                // 旧注入仍留在扩展存储里：下一次导航会重装已 reset 的规则，必须让命令失败。
+                out["error_code"] = json!("hook_remove_failed");
+                out["error"] = json!(
+                    "页面包装与 CDP 拦截已停止，但持久注入删除失败（见 hook_removed）；\
+                     该注入会在下次导航时重新生效"
+                );
+                out["hint"] = json!(
+                    "先 `atb net hook --off`（或重试 `atb net reset`）；持续失败时用 `atb status` \
+                     确认扩展已连接，必要时重载扩展后重试"
+                );
             } else {
                 let failed = page_failed.len();
                 out["error"] = json!(format!(
@@ -507,6 +576,13 @@ pub(crate) async fn net_value(state: &AppState, req: NetRequest) -> Result<Value
             );
         }
     }
+    // 页面引擎与 CDP 引擎共用同一套条数上限（每 profile 默认 64 条）。
+    // CDP 分支已在上面 return，这里只覆盖页面引擎；同 match+method 是原位替换，
+    // 不占新名额，所以只对「新增」报 too_many_rules。
+    if matches!(action.as_str(), "route" | "mock") {
+        ensure_page_rule_capacity(&config, &action, opts.get("rule"))?;
+    }
+
     // 修改页面级规则的动作要下发到该 profile 的**每个**标签：配置按
     // `profile_key` 存，但规则实际生效在页面里。旧实现只发当前标签，
     // `net unroute X` 在 B 标签返回 `removed:1, ok:true`，A 标签却仍在 mock X。
@@ -549,7 +625,7 @@ pub(crate) async fn net_value(state: &AppState, req: NetRequest) -> Result<Value
     };
 
     // 持久化：记录配置，并把「页面脚本 + 当前规则」注册成 document_start 注入。
-    // matches 为空时不注册（fail-closed），并把原因带回给调用方（B-10）。
+    // matches 为空时不注册（fail-closed），并把原因带回给调用方。
     let mut persist_warning: Option<String> = None;
     // 与 persist_warning 分开存：注册持久注入的 warning 会覆盖前者，
     // 但「端口未保留」这条与注册成败无关，必须两段都能看到。
@@ -600,7 +676,7 @@ pub(crate) async fn net_value(state: &AppState, req: NetRequest) -> Result<Value
         config["matches"] = json!(matches);
         // 只有显式给了才覆盖。第二次 `net hook --persist` 通常只想刷新 matches，
         // 旧实现用 `unwrap_or(false)` / `unwrap_or(200)` 把已存的开关静默压回默认值，
-        // 用户看到的是「body 抓不到了 / 日志只剩 200 条」却找不到改过什么（B-17）。
+        // 用户看到的是「body 抓不到了 / 日志只剩 200 条」却找不到改过什么。
         match req.capture_bodies {
             Some(capture) => config["captureBodies"] = json!(capture),
             None => {
@@ -681,7 +757,7 @@ pub(crate) async fn net_value(state: &AppState, req: NetRequest) -> Result<Value
         }
         // 规则变了就同步到持久化注入，刷新后仍然是同一套规则。
         if config.get("persist").and_then(Value::as_bool) == Some(true) {
-            // 同上：持着 net_persist_lock 时不能无界等待会话锁。
+            // 同上：持着该 profile 的落盘锁时不能无界等待会话锁。
             let installed = match tokio::time::timeout(
                 timeout,
                 install_net_hook(state, &session_key, &profile_key, &config),
@@ -702,6 +778,12 @@ pub(crate) async fn net_value(state: &AppState, req: NetRequest) -> Result<Value
         }
     }
 
+    // 的观测缺口：页面侧重放只保留前 `MAX_ROUTES`（64）条，丢弃条数由页面在
+    // `routes_dropped` 里回报。daemon 以前完全不读它 —— 用户把 `ATB_NET_RULE_MAX_RULES`
+    // 放大到 64 以上、堆了 100+ 条规则时，`net routes` 显示全量、浏览器只生效前 64 条，
+    // 却没有任何提示（正是 要消灭的「配置与实际生效集漂移」，只是挪到了 env 放大档）。
+    // 先在 `payload` 被移进 `result` 之前取出来。
+    let dropped_note = routes_dropped_note(&payload);
     let mut result = json!({
         "tab_id": tab_id_of_session(&session_key),
         "session_key": session_key,
@@ -730,6 +812,18 @@ pub(crate) async fn net_value(state: &AppState, req: NetRequest) -> Result<Value
                 existing.push_str(&warning);
             }
             None => persist_warning = Some(warning),
+        }
+    }
+    // 页面重放裁剪出的丢条数与告警一并透出（只增不改）：顶层 `routes_dropped` +
+    // 合并进 `warning`，调用方不必去翻 `net.*` 的页面回包也能发现「只生效了前 64 条」。
+    if let Some((dropped, note)) = dropped_note {
+        result["routes_dropped"] = json!(dropped);
+        match persist_warning.as_mut() {
+            Some(existing) => {
+                existing.push('；');
+                existing.push_str(&note);
+            }
+            None => persist_warning = Some(note),
         }
     }
     if let Some(warning) = persist_warning {
@@ -775,4 +869,45 @@ fn split_reset_failures(failures: &[Value]) -> (Vec<Value>, Vec<Value>) {
         }
     }
     (failed, unconfirmed)
+}
+
+#[cfg(test)]
+mod net_outcome_tests {
+    use super::*;
+
+    /// 契约：`net reset` 的 ok 必须同时覆盖页面 reset、CDP stop、hook 删除。
+    /// 旧实现漏掉第三项 —— 持久注入删不掉时报成功，旧 mock 下次导航复活。
+    #[test]
+    fn reset_requires_hook_removal() {
+        let removed = json!({ "ok": true, "data": { "removed": true } });
+        let failed = json!({ "ok": false, "error": "extension disconnected" });
+        let unknown = json!({ "error": "unexpected payload" });
+
+        assert!(reset_outcome_ok(true, true, &removed));
+        assert!(!reset_outcome_ok(true, true, &failed));
+        // 回包认不出成败时按失败处理：不能拿「不知道」冒充「删掉了」。
+        assert!(!reset_outcome_ok(true, true, &unknown));
+        assert!(!reset_outcome_ok(false, true, &removed));
+        assert!(!reset_outcome_ok(true, false, &removed));
+    }
+
+    /// 的观测缺口：页面重放的 `routes_dropped` 必须能变成顶层字段 + 告警，
+    /// 否则 env 放大上限后「配置 N 条、实际生效 64 条」没有任何提示。
+    #[test]
+    fn dropped_routes_are_surfaced() {
+        let dropped = json!({ "ok": true, "action": "hook", "routes_dropped": 6 });
+        let (count, note) = routes_dropped_note(&dropped).expect("有丢弃时必须产生告警");
+        assert_eq!(count, 6);
+        assert!(note.contains("64"), "{note}");
+        assert!(note.contains('6'), "{note}");
+
+        // 页面日后回 `routes_cap` 时文案自动跟随，不需要再动 Rust（单一真相源在页面侧）。
+        let (_, note) = routes_dropped_note(&json!({ "routes_dropped": 2, "routes_cap": 128 }))
+            .expect("有丢弃");
+        assert!(note.contains("128"), "{note}");
+
+        // 没丢 / 页面没回该字段：不产生噪音。
+        assert!(routes_dropped_note(&json!({ "ok": true, "routes_dropped": 0 })).is_none());
+        assert!(routes_dropped_note(&json!({ "ok": true })).is_none());
+    }
 }

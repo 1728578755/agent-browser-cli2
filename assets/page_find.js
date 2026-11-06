@@ -25,6 +25,20 @@
 // 唯一性判定必须在**元素所属的 root** 内做：shadow 里的 `button.ok` 在主文档里
 // 可能同名，用 document 的计数去判会把相对路径误判成全局唯一。
 
+// ---- 入口挂载----
+// 本文件在扩展通道上是**每次调用前重新注入**的（background.js 的 handlePageOp：
+// `executeScript({files:[...]})` → invoke），同一个 world 里会被执行很多次。
+// classic script 顶层的 const/let 会进入该 world 的全局词法环境并跨脚本持久，
+// 第二次注入就是「Identifier ... has already been declared」的早期错误：整个
+// pageOp reject，直到页面导航才恢复 —— 症状是「read 能用，find 用一次就坏」。
+//
+// 所以整个文件包在 IIFE 里（与 page_net.js 同一套写法），入口用 defineProperty 挂：
+//   * 不可枚举 —— Object.keys(window) / for...in / JSON.stringify 看不到；
+//   * 可配置   —— stealth scrub 的 delete 才能真的成功。顶层 `function __abcFind(){}`
+//     在 classic script 里创建的是不可删除的全局绑定，审计自己就成了永久指纹。
+// 名字保持不变：daemon 侧是裸标识符 `return __abcFind({...})`，靠全局对象属性解析；
+// 扩展侧读 `window[name]`，两者都不受影响。
+;(function () {
 /// shadow 遍历上限：组件库站点常见几十个 shadow root，超过 200 个基本是异常页面，
 /// 再扫下去只是把一帧的预算烧光。
 const __ABC_FIND_SHADOW_MAX_ROOTS = 200;
@@ -367,3 +381,27 @@ function __abcFind(spec) {
   };
   return out;
 }
+
+// 实现标记（与 page_net / page_challenge 同一套）：MAIN world 里页面可以抢先把
+// 同名全局定义成自己的函数，扩展侧只执行带这个标记的实现。find 目前固定在
+// ISOLATED world（PAGE_OP_WORLD），页面根本碰不到，标记是给将来放开 world 留的护栏，
+// 成本为零。不可枚举：不新增可被 Object.keys 看见的痕迹。
+try {
+  Object.defineProperty(__abcFind, '__abcOwn', {
+    value: true, enumerable: false, configurable: true
+  });
+} catch (_) {}
+
+try {
+  Object.defineProperty(window, '__abcFind', {
+    value: __abcFind,
+    writable: true,
+    enumerable: false,
+    configurable: true
+  });
+} catch (_) {
+  // 页面上已有不可配置的同名绑定：属性描述改不动，但值是 writable 的，
+  // 赋值至少能把实现换成本版本（仍然不可删，只能等页面重载）。
+  try { window.__abcFind = __abcFind; } catch (_) {}
+}
+})();

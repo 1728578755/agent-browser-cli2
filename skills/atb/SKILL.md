@@ -20,7 +20,6 @@ description: 在用户已登录的真实 Chrome/Edge 里操作网页：读页面
 不用：
 
 - 需要无头集群、容器内并发、可重复的干净环境：用 Playwright/Puppeteer。
-- 需要绕过登录、付费墙、访问控制或验证码：atb 不做。
 - 只是解析本地 HTML/JSON：不需要浏览器。
 
 ## 三条硬规则
@@ -136,10 +135,10 @@ atb cleanup
 | `download_id_required` | `ATB_DOWNLOAD_AUTO_CLAIM=false` 且 `download-wait` 没给 `--id` | 先 `downloads` 取 id，再 `download-wait --id <id>` |
 | `outcome_unknown` | 请求已发出但响应丢失（超时/断连），动作可能已执行 | 退出码 4；带同一个 `--idempotency-key` 重发，不要换 key |
 | `host_not_allowed` | HTTP `Host` 不是回环名 | 用 `127.0.0.1` / `localhost` 访问 daemon，不要用局域网 IP 或自定义域名 |
-| `ws_backpressure` | 下行队列满（目前只把 pong 控制通道改成有界，命令通道仍无界，因此该码目前是**预留**） | 偶发卡顿等几秒重试；持续出现重载扩展或 `atb restart`，高并发改用 `batch` 控并发 |
+| `ws_backpressure` | 下行队列满（当前只把 pong 控制通道改成有界，命令通道仍无界，因此该码目前是**预留**） | 偶发卡顿等几秒重试；持续出现重载扩展或 `atb restart`，高并发改用 `batch` 控并发 |
 | `capture_too_large` | 截图/PDF 超出 `ATB_IO_MAX_OUTPUT_MB` 或 `ATB_CAPTURE_MAX_PIXELS` | 降 `--max-height` / 改 `--format jpeg`，或调高 `ATB_IO_MAX_OUTPUT_MB` |
 | `pdf_too_tall` | 页面超出 PDF 单页/分页上限 | 用 `--max-height` 限高，或改 `screenshot --full-page` 留证 |
-| `challenge_probe_failed` | 挑战探测拿不到可用载荷（扩展断连/注入失败） | 重试一次；持续失败看 `diag`、`doctor`，不要当作「没有挑战」 |
+| `challenge_probe_failed` | 挑战探测拿不到可用载荷（扩展断连/注入失败） | 重试一次；持续失败看 `doctor`，不要当作「没有挑战」 |
 | `invalid_port` | URL 的端口不合法（如 `:99999`） | 改用合法端口；`scheme:数字` 不会被猜成 http |
 | `unsupported_file_host` | `file://host/...` 的主机不在允许列表 | 用 `file:///C:/...` 本机路径，或把主机加进 `ATB_FILE_HOSTS` |
 | `file_not_found` | 本地文件 / `--urls` 列表不存在 | 核对路径；`--urls` 的「像路径但不存在」不再被当成 URL 列表 |
@@ -187,7 +186,7 @@ atb job cancel <jobId>
 
 ## 版本与扩展
 
-三方版本：CLI/daemon API 协议 `5`、扩展消息协议 `4`、扩展文件版本（当前 **5.3.0**）。
+三方版本：CLI/daemon API 协议 `5`、扩展消息协议 `4`、扩展文件版本（当前 **5.4.2**）。
 
 ```bash
 atb status        # 只在排障时看 compatibility：ok / 期望协议 / 已连接协议 / fixes
@@ -204,14 +203,12 @@ atb restart --force   # daemon 占着 18767 且不认当前 token
 
 ## 边界
 
-- `challenge` 默认会主动求解（定位组件、带轨迹点击、等 token/跳转），不是干等；失败时智能体用 `widget` + `click --at` 兜底，图片/短信验证才 `focus` 转人工。不保证通过，也不绕过访问控制。
-- `stealth` 只减少本工具自身留下的痕迹，不承诺「不被检测」；不要用页面 JS 伪造 `navigator.webdriver` 之类信号。
-- 只操作有权访问的页面；不要用登录态去抓取未授权数据。
+- `challenge` 默认会主动求解（定位组件、带轨迹点击、等 token/跳转），不是干等；失败时智能体用 `widget` + `click --at` 兜底，图片/短信验证才 `focus` 转人工。
 - 不 attach 的常用路径：`open`（未命中挑战页）、`read` / `scan` / `find` / `exec` / `wait` / `hover` / `select` / `check` / `scroll` / `inject` / `cookies`，以及带 CSS selector 的 `@e` 引用或 `--frame` 触发的 `click` / `fill`。
 - 会 attach：`snapshot` 默认（要避开用 `snapshot --js`）、纯 CSS 选择器的 `click` / `fill`、`mouse-click`、`send-keys`、`upload`、`network` / `console`、整页/元素截图、`save-pdf`、`net mock --engine cdp`、挑战求解/点击、显式 CDP。设 `ATB_NO_DEBUGGER=1` 可彻底禁止 attach。
 - attach 被拒（页面内嵌别的扩展 iframe，`error_code:"page_protected"`）时不要直接放弃：截图/PDF/鼠标点击会自动回落，结果里看 `via` / `synthetic` 判断走的是哪条通道（`captureVisibleTab` / `captureFullPageStitched` / `stitched-image-pdf` / `synthetic:true`）。只有 `network`、`console`、`upload`、`send-keys`、元素截图仍需调试器。
 - 调试横幅无法运行时去除，唯一开关是启动参数 `--silent-debugger-extension-api`，只能通过 `atb launch --restart` 生效。
-- `trust-extension` 是单向的：只约束「谁能连 daemon」，不校验「扩展连的是不是真 daemon」。默认 `ATB_WS_TRUST_MODE=compat` 会放行任何本机连接；共用机器时同时配白名单与 token，并把 `ATB_WS_TRUST_MODE` 设为 `both` 再 `atb restart`（只配置不切档仍按 compat 放行）。
+- `trust-extension` 的 token 是双向的：daemon 在 WS upgrade 后立刻下发 `ws_hello`（nonce + HMAC proof），扩展配了 `wsToken` 时必须先验 proof 才发 `ext_ready`，不知道 token 的本机进程无法冒充 daemon；没配 token 时（默认 `compat`）任何本机连接都能连，扩展也无法证明对端身份。`ATB_WS_TRUST_MODE` 的 `whitelist` / `token` / `both` 控制「谁能连」，需显式切档；共用机器请同时配白名单与 token。
 - daemon 默认空闲 300 秒且无扩展连接时退出，扩展连着时不退；退出后端口空窗期可能被本机其它进程占用，下一条命令会自动拉起。
 - `chrome://`、扩展页、`about:blank` 上的可操作能力受限，先导航到普通 `http/https` 页面。
 

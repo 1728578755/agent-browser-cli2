@@ -1,7 +1,7 @@
 # 自动过 Cloudflare 挑战 & 防止站点检测自动化：实现方案
 
 > 本文只描述实现思路与代码落点，**不修改任何代码**。
-> 适用范围：自有站点测试、授权渗透/风控验证、可访问性与兼容性回归。
+> 本文记录挑战页识别/求解与痕迹审计的实现、取舍与已知边界。
 
 ---
 
@@ -66,7 +66,7 @@ DIV#_333e9a51…(display:grid)
 
 ## 2. 自动过 Cloudflare 挑战
 
-### 2.1 先分类：哪些能自动过，哪些不能
+### 2.1 先分类：哪些能自动过，哪些不自动处理
 
 这一步做错，后面全是无用功。Cloudflare 的拦截产品线差异很大：
 
@@ -75,9 +75,9 @@ DIV#_333e9a51…(display:grid)
 | **JS Interstitial**（`Just a moment...`） | 标题 + `#cf-challenge-running` / `#challenge-stage`，`cdn-cgi/challenge-platform` 脚本 | ✅ 通常 3–8 秒自动放行 | 只需**等待**，不要乱点 |
 | **Managed Challenge（隐形 Turnstile）** | 同上，但内部跑 Turnstile 打分 | ⚠️ 多数能，取决于浏览器环境评分 | 等待为主；环境干净基本能过 |
 | **Turnstile 显式勾选框** | `challenges.cloudflare.com` iframe，300×65 | ✅ 能 | 等待 + **带轨迹点击** |
-| **图片点选 / 滑块**（reCAPTCHA 图片、阿里、极验、腾讯） | 需要视觉理解 | ❌ 不能 | 转人工：`challenge focus` |
-| **Hard Block**（1020 / 1015 / `Access denied`） | 纯文本拦截页，无 JS | ❌ 不能 | IP 或 ASN 级封禁，换网络/换号 |
-| **需要手机/邮箱验证的 Managed Challenge** | 表单 | ❌ 不能 | 转人工 |
+| **图片点选 / 滑块**（reCAPTCHA 图片、阿里、极验、腾讯） | 需要视觉理解 | 尚未实现（未来工作） | 当前不自动处理；`challenge focus` 把标签带到前台，由使用者在页面上自行完成 |
+| **Hard Block**（1020 / 1015 / `Access denied`） | 纯文本拦截页，无 JS | 尚未实现（未来工作） | IP 或 ASN 级封禁，与浏览器无关，页面侧无解；换网络/换号 |
+| **需要手机/邮箱验证的 Managed Challenge** | 表单 | 尚未实现（未来工作） | 当前不自动处理；`challenge focus` 把标签带到前台，由使用者在页面上自行完成 |
 
 所以实现上必须有 `auto`（可等）/ `interactive`（需交互）/ `blocking`（阻断）三个正交标志位，而不是一个 `detected: true/false`。
 
@@ -328,7 +328,7 @@ window.__abcChlSeenAt = Date.now();   // 记录「第一次判定为拦截」的
 2. 入口改用
    `Object.defineProperty(window, '__abcChallenge', { value, writable:true, enumerable:false, configurable:true })`：
    `Object.keys(window)` / `for...in` 看不到，`delete window.__abcChallenge` 返回 `true`，
-   `stealth scrub` 不会永远把 `remaining` 报成非空（PG-01）。
+   `stealth scrub` 不会永远把 `remaining` 报成非空。
 3. 入口同时挂一个不可枚举的 `__abcOwn` 标记；`pageOp` 只执行带该标记的实现，
    页面抢先声明同名 `__abcChallenge` 时直接拒绝，不会执行页面提供的实现。
 4. 脚本里**不再写任何其他 `window.*` 全局**，时间戳改由 daemon 侧计；
@@ -424,14 +424,14 @@ if !blocking && (!interactive || token_ready) { return cleared: true }
 
 | 做法 | 本项目态度 | 理由 |
 | --- | --- | --- |
-| 改 `canvas` / `WebGL` 输出加噪声 | ❌ 不做（保留接口，将来可选） | 与「不伪装指纹」的公开承诺一致，见 README「平台与限制」；伪造本身也会与真实 GPU / 字体 / 时区产生一致性硬伤 |
-| 改 UA / 硬件参数 | ❌ 不做（保留接口，将来可选） | 与 Client Hints、`navigator.platform`、屏幕尺寸、字体列表必须成套自洽，单改一项就是硬伤；README 明确列为「做不到的事」 |
+| 改 `canvas` / `WebGL` 输出加噪声 | 尚未实现（未来工作） | 且伪造本身会与真实 GPU / 字体 / 时区产生一致性硬伤 |
+| 改 UA / 硬件参数 | 尚未实现（未来工作） | 与 Client Hints、`navigator.platform`、屏幕尺寸、字体列表必须成套自洽，单改一项就是硬伤 |
 | 减少自身注入到页面 | ✅ 核心 | 这是唯一"只减不加"的操作，零副作用 |
 | 擦除已写入的痕迹 | ✅ 核心 | 同上，且可验证 |
 | 不附加调试器 | ✅ 结构性优势 | CDP attach 有横幅、有可检测面 |
 | 点击带人类轨迹 | ✅ 做 | 只用于验证码组件的点击轨迹，不做全站行为模拟 |
 
-> 取舍口径以 README 的「平台与限制」为准：**不伪装指纹、不绕过访问控制**。本表的「不做」是当前发布行为；「保留接口」只表示后续版本可能以显式配置提供，不构成承诺。
+> 本表的「尚未实现（未来工作）」为当前发布状态；「保留接口」只表示后续版本可能以显式配置提供，不构成承诺。
 
 
 ### 3.2 最重要的一条：世界隔离
@@ -699,8 +699,8 @@ atb stealth audit
 | 正常页（无挑战） | `atb open https://example.com` | 不多花往返，无 `challenge` 字段 |
 | JS interstitial | `atb challenge wait` | 3–8s 内 `cleared:true`，`via` 有值 |
 | Turnstile 显式勾选 | `atb challenge solve` | `clicks>0` 且 `passed:true` |
-| 需要人工的滑块 | `atb challenge solve --no-focus` | `need_human` 早于总超时返回 |
-| 硬封禁页 | `atb challenge status` | `blocking:true, auto:false`，提示转人工 |
+| 滑块（尚未实现自动求解） | `atb challenge solve --no-focus` | `need_human` 早于总超时返回 |
+| 硬封禁页 | `atb challenge status` | `blocking:true, auto:false`，页面侧无解，需更换网络出口 |
 | 后台标签打开 | `atb open ... --background` | 不抢焦点；必要时先激活再等 |
 | 挑战中导航 | `challenge wait` 期间页面跳转 | 不因执行上下文销毁误判失败 |
 
@@ -722,8 +722,8 @@ node --test tests/asset_parity.test.mjs   # 确认 assets 与扩展目录里的�
 
 | 边界 | 原因 | 应对 |
 | --- | --- | --- |
-| **过不了 hard block（1020/1015）** | IP / ASN 级封禁，与浏览器无关 | 换网络出口、换账号 |
-| **过不了图片点选 / 滑块** | 需要视觉理解与人类操作 | `challenge focus` 转人工 |
+| **hard block（1020/1015）当前不自动处理** | IP / ASN 级封禁，与浏览器无关，页面侧无解 | 换网络出口、换账号 |
+| **图片点选 / 滑块尚未实现自动求解** | 需要视觉理解与人类操作 | `challenge focus` 把标签带到前台，由使用者在页面上自行完成 |
 | **行为侧、IP 侧管不了** | 鼠标轨迹只覆盖验证码点击那一下 | 控制请求频率、避免批量同一路径 |
 | **后台标签会节流** | Chrome 对后台 tab 的 timer 降频 | 等待前用 `tabs/switch`（`allowFocus:false`）激活 |
 | **closed shadow root 内探会失效** | Turnstile 内部结构随版本变 | 有几何兜底；`diag` 里能看到每一步失败原因 |
@@ -750,6 +750,8 @@ node --test tests/asset_parity.test.mjs   # 确认 assets 与扩展目录里的�
 | P2 | **`diag` 结构化上报** | 把 `challenge_frames` 的三级 CDP 失败原因聚合成一个 `error_code` | 排障从"瞎猜"变"看码" |
 | P2 | **行为轨迹参数化** | 步数、抖动幅度、间隔从固定值改成可选 profile（`fast` / `natural`） | 让用户按场景取舍速度与拟人度 |
 | P3 | **审计增加"一致性"检查** | UA vs UA-CH vs `navigator.platform` vs 屏幕尺寸 vs 时区是否自洽 | 抓出"伪装留下的一致性硬伤"（当前刻意不做伪装，此项为将来留口） |
+| 未来工作 | **图片点选 / 滑块 / 手机邮箱验证的自动求解** | 需要视觉理解与真实人类操作，当前不自动处理；实现前走 `challenge focus` 人工通道，由使用者在页面上自行完成 | 覆盖剩余挑战类型 |
+| 未来工作 | **hard block 的页面侧处理** | IP / ASN 级封禁与浏览器无关，页面侧无解；即便立项也依赖更换网络出口，不是纯软件可解 | — |
 
 ---
 

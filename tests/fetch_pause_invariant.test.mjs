@@ -142,7 +142,7 @@ async function main() {
   }
 
   // 2) 首选方法报其他错误（拦截已失效、请求已被处理等）—— 仍必须续传，
-  //    否则该请求永久挂起。这条是核心断言。
+  //    否则该请求永久挂起。这条是 的核心断言。
   {
     const { calls, error } = await runCase((method) => {
       if (method === 'Fetch.continueResponse') {

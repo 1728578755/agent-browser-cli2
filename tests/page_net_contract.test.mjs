@@ -1,4 +1,4 @@
-// page_net.js 的返回字段契约（的上游）。
+// page_net.js 的返回字段契约（上游）。
 //
 // daemon 侧持久化规则时要读「真实数组」，而页面脚本在不同 action 下把数组放在
 // 不同字段里：
@@ -64,7 +64,7 @@ function createContext(beforeRun) {
 
 /// 每个用例的入口：真实取到 __abcNet 并记录它属于哪个 context。
 /// 返回 null 表示脚本没暴露入口——调用方必须显式判红，不能因为 `typeof` 不是
-/// function 就跳过断言（的恒绿就是这么来的）。
+/// function 就跳过断言（恒绿就是这么来的）。
 function loadPageNet(beforeRun) {
   const context = createContext(beforeRun);
   const fn = context.__abcNet || context.window.__abcNet;

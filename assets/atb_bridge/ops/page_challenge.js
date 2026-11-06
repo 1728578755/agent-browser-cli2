@@ -1,6 +1,6 @@
 // 挑战页 / 验证码识别与等待（page_challenge.js）。
 //
-// ---- world 与入口（代码侧注记）----
+// ---- world 与入口（审阅 的代码侧注记）----
 // 本文件跑在 **MAIN world**（background.js 的 PAGE_OP_WORLD 决策表：challenge → MAIN）。
 // 原因：判定依赖站点自己挂在页面 window 上的全局 —— `window.turnstile`、
 // `window._cf_chl_opt`、hCaptcha 的 `__hcaptcha_cfg`。ISOLATED world 有独立的
@@ -8,7 +8,7 @@
 // 代价是入口 `window.__abcChallenge` 对页面可见，因此必须：
 //   * 不可枚举（Object.keys(window) / for...in 看不到）；
 //   * 可配置（`delete window.__abcChallenge` 必须成功，否则 stealth scrub 永远
-//     报 remaining 里还有它）。
+//     报 remaining 里还有它，见 阅文）。
 // 这两条靠文件末尾的 defineProperty 挂载实现；整个文件包在 IIFE 里，
 // 不再使用顶层 `function __abcChallenge(){}`（classic script 里那是不可删除的
 // 全局绑定，且可枚举）。
@@ -50,11 +50,46 @@ function __abcChallenge(opts) {  opts = opts || {};
     return false;
   }
 
+  /// 验证码「可见挂载点」判定。
+  ///
+  /// SDK 脚本在正常页面上也常驻：只要站点引过 recaptcha/hcaptcha 的 api.js，
+  /// 旧实现就把页面判成「存在可交互组件」，于是 `challenge wait` 每一次都认为
+  /// 还需要人操作，硬生生耗满预算。脚本标签只能算线索（signals），真正的
+  /// interactive 必须有**看得见、点得到**的挂载点：
+  ///   * `data-size="invisible"`（reCAPTCHA v2 invisible / hCaptcha invisible）不渲染勾选框；
+  ///   * `display:none` / `visibility:hidden` / 尺寸为 0 的占位还没渲染出来。
+  /// 读不到布局（例如 display:none 时 getBoundingClientRect 全 0）按「不可交互」处理：
+  /// 宁可少报一次 widget，也不要把正常页面钉在等待循环里。
+  function visibleCaptchaMount(selector) {
+    let nodes = [];
+    try { nodes = document.querySelectorAll(selector); } catch (_) { return false; }
+    for (let i = 0; i < nodes.length; i += 1) {
+      const node = nodes[i];
+      const size = String((node.getAttribute && node.getAttribute('data-size')) || '').toLowerCase();
+      if (size === 'invisible') continue;
+      // 没有布局 API 按「存在即挂载」处理：真实浏览器里 getComputedStyle /
+      // getBoundingClientRect 一定都在，只有非真实元素（精简的测试桩 / 已脱离文档的
+      // 节点）才读不到 —— 那种情形没有任何布局信息可用，按不可交互处理会把
+      // 「明明有组件」误判成没有，属于更难归因的假阴性。
+      if (typeof node.getBoundingClientRect !== 'function') return true;
+      try {
+        const style = typeof window.getComputedStyle === 'function' ? window.getComputedStyle(node) : null;
+        if (style && (style.display === 'none' || style.visibility === 'hidden')) continue;
+        const box = node.getBoundingClientRect();
+        if (box.width < 16 || box.height < 16) continue;
+      } catch (_) {
+        continue;
+      }
+      return true;
+    }
+    return false;
+  }
+
   /// CF「真的还在挑战」的脚本证据。
   ///
   /// 不能用 `cdn-cgi/challenge-platform` 当判据：CF 会给**每一个**受保护站点注入
   /// `/cdn-cgi/challenge-platform/h/b/scripts/jsd/main.js`（隐形探测信标），
-  /// 正常页面也带它。拿它判拦截，等于把 已放行的站点永远当拦截页，
+  /// 正常页面也带它。拿它判拦截，等于把 kick.com 这种已放行的站点永远当拦截页，
   /// wait 会一直等到超时（实测 30s 白等，页面其实早已正常渲染）。
   ///
   /// 真正的挑战页加载的是 orchestrate 下的编排脚本（chl_page / managed / challenge），
@@ -72,7 +107,7 @@ function __abcChallenge(opts) {  opts = opts || {};
 
   /// CF 硬拦截页（"Sorry, you have been blocked"）：等多久都没用，不是「自动放行」类。
   ///
-  /// 旧判据只要正文里出现 "access denied" 就算硬拦截 —— 普通 403
+  /// 审阅 旧判据只要正文里出现 "access denied" 就算硬拦截 —— 普通 403
   /// （自建站 / Nginx 默认页 / Akamai 的拒绝页）全被归因成「CF 硬拦截」，
   /// hint 直接把用户引向「换出口 IP」，排查方向整体跑偏。
   /// 现在必须叠加 **CF 专属证据**：
@@ -80,6 +115,8 @@ function __abcChallenge(opts) {  opts = opts || {};
   ///   * 页脚 "Cloudflare Ray ID:（CF 错误页必带，普通 403 不会出现）。
   /// 页面 JS 读不到响应头，`cf-ray` header 这条证据只能由 daemon 侧补充。
   const CF_RAY_TEXT = /cloudflare ray id/i;
+  // 与 TEXT_SCAN_LIMIT 分开命名：这里要看的是「错误页脚注」，多留一点余量。
+  const CF_TEXT_SCAN_LIMIT = 4000;
   function cfBlockEvidence() {
     const evidence = [];
     try {
@@ -87,9 +124,11 @@ function __abcChallenge(opts) {  opts = opts || {};
       else if (document.querySelector('[id^="cf-error"], [class*="cf-error-details"]')) evidence.push('cf-error-container');
     } catch (_) {}
     if (evidence.length) return evidence;
-    // 没有错误容器时才去扫正文（最多 4000 字符，只在前半段找脚注）。
-    let text = '';
-    try { text = String((document.body && document.body.textContent) || '').slice(0, 4000); } catch (_) { text = ''; }
+    // 没有错误容器时才去扫正文（只取开头一段，同旧口径）。
+    // 必须走 bodyTextHead()：旧实现 `String(document.body.textContent).slice(0, 4000)`
+    // 的切片发生在**整页序列化之后**，26 万节点的页面上每 250ms 拼一次整页字符串，
+    // 30 秒的 challenge wait 足以把页面卡死（与本文件 TEXT_SCAN 那段同一教训）。
+    const text = bodyTextHeadCached(CF_TEXT_SCAN_LIMIT);
     if (text && CF_RAY_TEXT.test(text)) evidence.push('cf-ray-id-footer');
     return evidence;
   }
@@ -97,7 +136,7 @@ function __abcChallenge(opts) {  opts = opts || {};
   /// 普通「看起来像被拦」的正文判据：只用于判断要不要继续等，不再单独决定 hard_block。
   function blockTextHit() {
     try {
-      const text = String((document.body && document.body.textContent) || '').slice(0, 4000);
+      const text = bodyTextHeadCached(CF_TEXT_SCAN_LIMIT);
       return /you have been blocked|has been blocked|access denied|error 1020|error 1015/i.test(text);
     } catch (_) {
       return false;
@@ -151,6 +190,11 @@ function __abcChallenge(opts) {  opts = opts || {};
       const frame = frames[i];
       const vendor = vendorOfSrc(frame.src);
       if (!vendor) continue;
+      // 隐形 / 角标挂件用 iframe 承载，但页面上没有可点的勾选框
+      // （reCAPTCHA v3 的 `size=invisible&badge=...`、hCaptcha 的 invisible 模式）。
+      // 只看 iframe 尺寸会把这些算成「有可交互组件」，challenge wait 于是永远等不到
+      // cleared —— 与脚本标签那条误判同源。
+      if (/size=invisible|[?&]badge=/i.test(String(frame.src || ''))) continue;
       let rect = null;
       try {
         const box = frame.getBoundingClientRect();
@@ -272,6 +316,22 @@ function __abcChallenge(opts) {  opts = opts || {};
     return out.length > limit ? out.slice(0, limit) : out;
   }
 
+  /// 带节流的正文头部：同一秒内、同一 limit 的多次读取只走一次 DOM。
+  ///
+  /// 一次 detect() 里最多有三处要看正文（CF 硬拦截证据 / 正文指纹 / 「正在验证」），
+  /// challenge wait 每 250ms 调一次 detect()。不缓存的话就是每秒十几次 TreeWalker ——
+  /// 比整页序列化便宜得多，但完全没必要重复。按 limit 分槽缓存（2000 / 4000 各一份），
+  /// 窗口与 TEXT_SCAN_INTERVAL_MS 一致，避免缓存把「刚变化」的正文判成旧结论。
+  const headCache = new Map();
+  function bodyTextHeadCached(limit) {
+    const at = now();
+    const slot = headCache.get(limit);
+    if (slot && at - slot.at < TEXT_SCAN_INTERVAL_MS) return slot.text;
+    const text = bodyTextHead(limit);
+    headCache.set(limit, { at: at, text: text });
+    return text;
+  }
+
   /// 轻量摘要：长度 + 首尾片段。够区分「换了一页」，又不用把 2000 字符存两份。
   function bodyTextDigest(head) {
     const text = String(head || '');
@@ -285,7 +345,7 @@ function __abcChallenge(opts) {  opts = opts || {};
     const url = String(location.href || '');
     if (bodyTextScan.url !== url) bodyTextScan = { url: url, digest: '', matched: false };
     if (!mayScanBodyText()) return bodyTextScan.matched;
-    const head = bodyTextHead(TEXT_SCAN_LIMIT);
+    const head = bodyTextHeadCached(TEXT_SCAN_LIMIT);
     const digest = bodyTextDigest(head);
     if (digest !== bodyTextScan.digest) {
       bodyTextScan.digest = digest;
@@ -337,7 +397,7 @@ function __abcChallenge(opts) {  opts = opts || {};
     }
     // 注意：这里**只能**用「看得见的拦截页证据」判定 blocking。
     // CF 会在正常页面上也预置 `_cf_chl_opt` 引导对象、也注入 challenge-platform 脚本，
-    // 拿它们当判据会把已放行的站点永久判成拦截页（实测已放行站点仍报 blocking=true，
+    // 拿它们当判据会把已放行的站点永久判成拦截页（实测 kick.com 放行后仍报 blocking=true，
     // challenge wait 白等 30s）。真正还在拦的时候，标题与 #challenge-stage 一定在。
     const cfScript = challengeScript();
     if (cfScript) {
@@ -360,14 +420,22 @@ function __abcChallenge(opts) {  opts = opts || {};
     }
 
     // 页面上的验证码组件（不阻断浏览，但提交前必须完成）
-    if (has('.cf-turnstile') || has('[data-sitekey].cf-turnstile')) {
+    // 脚本标签只进 signals；interactive 必须由可见挂载点决定，
+    // 否则「引过 api.js 的正常页面」会被当成永远有待完成组件。
+    if (visibleCaptchaMount('.cf-turnstile, [data-sitekey].cf-turnstile')) {
       hit('turnstile', 8, 'widget', false, true, false, 'turnstile-widget');
+    } else if (scriptHas('challenges.cloudflare.com')) {
+      signals.push('turnstile-script');
     }
-    if (has('.g-recaptcha') || scriptHas('recaptcha')) {
-      hit('recaptcha', 7, 'widget', false, true, false, 'recaptcha');
+    if (visibleCaptchaMount('.g-recaptcha')) {
+      hit('recaptcha', 7, 'widget', false, true, false, 'recaptcha-widget');
+    } else if (scriptHas('recaptcha')) {
+      signals.push('recaptcha-script');
     }
-    if (has('.h-captcha') || scriptHas('hcaptcha.com')) {
-      hit('hcaptcha', 7, 'widget', false, true, false, 'hcaptcha');
+    if (visibleCaptchaMount('.h-captcha')) {
+      hit('hcaptcha', 7, 'widget', false, true, false, 'hcaptcha-widget');
+    } else if (scriptHas('hcaptcha.com')) {
+      signals.push('hcaptcha-script');
     }
 
     // 滑块 / 点选类
@@ -482,7 +550,7 @@ function __abcChallenge(opts) {  opts = opts || {};
     // 「正在验证」只在已判定被拦时才有意义，且只扫一次（1s 节流）。
     let verifying = false;
     if (blocking && document.readyState !== 'loading' && mayScanVerifying()) {
-      verifying = VERIFYING_HINT.test(bodyTextHead(TEXT_SCAN_LIMIT));
+      verifying = VERIFYING_HINT.test(bodyTextHeadCached(TEXT_SCAN_LIMIT));
     }
 
     // 环境信号。CF 的 Turnstile 在隐藏页面 / 零尺寸窗口里根本不会执行：
@@ -593,6 +661,10 @@ function __abcChallenge(opts) {  opts = opts || {};
       blocking: blocking,
       interactive: interactive,
       auto: auto,
+      // `widget_pending` 是**中间态** —— 识别出了组件、页面本身没被拦、
+      // 但 token 还没拿到。它既不是「已放行」也不是「被拦截」，单独给字段让
+      // daemon / CLI 能说清「在等人工完成组件」，而不是笼统地报挑战未清除。
+      widget_pending: !!(vendor && kind === 'widget' && !blocking && !tokens.token_ready),
       title: title,
       url: url,
       frames: frames,
@@ -643,7 +715,7 @@ function __abcChallenge(opts) {  opts = opts || {};
         done = true;
         cleanup();
         const payload = Object.assign({
-          // `ok` 必须跟 `cleared` 走。
+          // 审阅 `ok` 必须跟 `cleared` 走。
           // 旧实现无条件 ok:true —— 超时 / need_human 都报成功，直接消费者
           // （不经 daemon 补偿的调用方）会把「还在挑战页」当成「已通过」。
           ok: cleared === true,
@@ -669,6 +741,9 @@ function __abcChallenge(opts) {  opts = opts || {};
           vendor: current.vendor,
           blocking: current.blocking,
           interactive: current.interactive,
+          // 中间态随每一片回传。调用方据此区分「被拦住了」与「组件还在等
+          // 人工点」，超时结论也不再是一句笼统的「未清除」。
+          widget_pending: current.widget_pending === true,
           checks: checks,
           elapsed_ms: Math.round(now() - started)
         }, extra || {});
@@ -701,7 +776,7 @@ function __abcChallenge(opts) {  opts = opts || {};
         // `blocking=false` 只表示「页面能浏览」，不表示「挑战已过」：登录页 / 结账页上
         // 挂着一个没勾的 Turnstile 就是这种形态。旧实现里 solve 模式还会在这里等 token，
         // 而 wait 模式（waitToken=false）直接落到下面的 `!blocking` 分支，250ms 后就
-        // 返回 cleared:true —— 调用方以为进去了，提交时才被拦（B-26）。
+        // 返回 cleared:true —— 调用方以为进去了，提交时才被拦。
         //
         // 只对「识别出厂商」的组件这么做：`interactive` 是启发式判据，没有厂商佐证时
         // 宁可沿用旧行为，免得把正常页面判成永远过不去（假阴性比假阳性更难排查）。
@@ -750,7 +825,9 @@ function __abcChallenge(opts) {  opts = opts || {};
       timer = setInterval(function () { check(false); }, intervalMs);
       timeout = setTimeout(function () {
         finish(false, {
-          reason: 'timeout',
+          // 超时原因分开写：`widget_pending` 说明「组件在、等人工完成」，
+          // 与「页面还在挑战/加载」是两种不同的排查方向。
+          reason: current.widget_pending ? 'widget_pending' : 'timeout',
           error: 'timeout',
           error_code: 'challenge_wait_timeout',
           hints: current.hints

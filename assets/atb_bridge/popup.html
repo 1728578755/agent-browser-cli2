@@ -1,120 +1,216 @@
 <!DOCTYPE html>
-<html>
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<style>
-/* 布局（v10 审阅 PG-11）：
-   旧样式写死 body{width:420px}，popup 在窄容器（分屏/小屏/侧边面板）里被裁切，
-   在宽容器里又留一大片空白，且 .row 不换行 + pre 自身滚动 ⇒ 出现「页面滚 + 代码块滚」
-   双层滚动。现在：
-     * 宽度用 min(...) 跟随可用视口，body 永远不超出 100vw；
-     * body[data-width] 支持 compact / standard / wide 三档（storage: popupWidthMode）；
-     * .row 允许换行、按钮 max-width:100%、长文本 overflow-wrap:anywhere。 */
-:root{color-scheme:dark}
-body{width:min(420px,100vw);max-width:100%;margin:0;padding:8px;box-sizing:border-box;
-  font:12px monospace;background:#1e1e1e;color:#d4d4d4;overflow-y:auto;overflow-wrap:anywhere}
-body[data-width="compact"]{width:min(340px,100vw)}
-body[data-width="wide"]{width:min(560px,100vw)}
-h3{margin:6px 0 4px;color:#569cd6;font-size:13px}
-button{background:#264f78;color:#fff;border:none;padding:4px 12px;cursor:pointer;border-radius:3px;
-  margin:0 0 6px;max-width:100%}
-button:hover{background:#37699e}
-button:disabled{opacity:.55;cursor:default}
-input{width:86px;max-width:100%;box-sizing:border-box;background:#252526;color:#d4d4d4;
-  border:1px solid #3c3c3c;border-radius:3px;padding:4px;font:12px monospace}
-input[type=checkbox]{width:auto;padding:0}
-select{max-width:100%;background:#252526;color:#d4d4d4;border:1px solid #3c3c3c;border-radius:3px;
-  padding:3px;font:12px monospace}
-label{display:inline-flex;align-items:center;gap:6px;margin-right:6px;max-width:100%}
-#profileLabel{width:150px}
-.panel{margin-bottom:8px;padding:6px;background:#252526;border-radius:3px}
-.row{display:flex;align-items:center;gap:6px;margin-top:6px;flex-wrap:wrap}
-/* 按钮组：窄窗口里整组换行，不要把一个操作的按钮拆成两行（PG-11 视觉检查）。 */
-.btn-group{display:inline-flex;align-items:center;gap:6px;flex-wrap:nowrap;max-width:100%}
-.status{color:#9cdcfe}
-.error{color:#f48771}
-.muted{color:#8f8f8f;margin-top:4px}
-details{margin:4px 0}
-summary{cursor:pointer;color:#9cdcfe}
-pre{white-space:pre-wrap;word-break:break-all;overflow-wrap:anywhere;margin:6px 0 0;padding:6px;
-  background:#252526;border-radius:3px;max-height:320px;overflow-y:auto}
-[hidden]{display:none !important}
-</style>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ATB</title>
+<link rel="stylesheet" href="ui/tokens.css">
+<link rel="stylesheet" href="ui/base.css">
+<link rel="stylesheet" href="popup.css">
+<!-- 主题在 <head> 里同步决定，尽量不出现白屏闪烁（MV3 不允许内联脚本）。 -->
+<script src="ui/theme-boot.js"></script>
 </head>
 <body data-width="standard">
-<h3>Bridge</h3>
-<div class="panel">
-  <div id="bridgeStatus" class="status" role="status" aria-live="polite">读取连接状态...</div>
-  <!-- SEC-12：兼容档风险提示。文案由 popup.js 渲染（含 token 档建议）。 -->
-  <div id="authWarning" class="error" role="alert" hidden></div>
-  <div id="fileAccessStatus" class="status" role="status" aria-live="polite">读取文件网址权限...</div>
-  <div id="wsConnectError" class="error" role="alert" hidden></div>
-  <!-- SEC-12：端口/版本等可识别信息默认折叠，避免一眼看全本机环境细节。 -->
-  <details>
-    <summary>连接详情</summary>
-    <div class="row">
-      <label>端口 <input id="port" type="number" min="1" max="65535"></label>
-      <button id="savePort">保存并重连</button>
+<header class="appbar">
+  <div class="brand">
+    <img class="brand-logo" src="icons/atb-32.png" width="20" height="20" alt="">
+    <span class="brand-name">ATB</span>
+    <span class="brand-ver mono" id="buildInfo">-</span>
+  </div>
+  <div class="appbar-right">
+    <span class="pill" id="connPill" role="status" aria-live="polite">
+      <i class="dot"></i><span id="connText">检测中</span>
+    </span>
+    <button class="icon-btn" id="openPage" type="button" title="在标签页中打开（宽屏）" aria-label="在标签页中打开">
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M14 4h6v6"></path>
+        <path d="M20 4 11 13"></path>
+        <path d="M18 14v5a1.8 1.8 0 0 1-1.8 1.8H5A1.8 1.8 0 0 1 3.2 19V7.8A1.8 1.8 0 0 1 5 6h5"></path>
+      </svg>
+    </button>
+    <button class="icon-btn" id="openOptions" type="button" title="打开管理页面" aria-label="打开管理页面">
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <circle cx="12" cy="12" r="3.2"></circle>
+        <path d="M19.1 14.6a1.6 1.6 0 0 0 .32 1.76l.06.06a1.9 1.9 0 1 1-2.69 2.69l-.06-.06a1.6 1.6 0 0 0-1.76-.32 1.6 1.6 0 0 0-.97 1.47V21a1.9 1.9 0 1 1-3.8 0v-.1a1.6 1.6 0 0 0-1.05-1.46 1.6 1.6 0 0 0-1.76.32l-.06.06a1.9 1.9 0 1 1-2.69-2.69l.06-.06a1.6 1.6 0 0 0 .32-1.76 1.6 1.6 0 0 0-1.47-.97H3a1.9 1.9 0 1 1 0-3.8h.1a1.6 1.6 0 0 0 1.46-1.05 1.6 1.6 0 0 0-.32-1.76l-.06-.06a1.9 1.9 0 1 1 2.69-2.69l.06.06a1.6 1.6 0 0 0 1.76.32H9a1.6 1.6 0 0 0 .97-1.47V3a1.9 1.9 0 1 1 3.8 0v.1a1.6 1.6 0 0 0 .97 1.47 1.6 1.6 0 0 0 1.76-.32l.06-.06a1.9 1.9 0 1 1 2.69 2.69l-.06.06a1.6 1.6 0 0 0-.32 1.76V9c.2.62.76 1.04 1.41 1.04H21a1.9 1.9 0 1 1 0 3.8h-.1a1.6 1.6 0 0 0-1.8.76Z"></path>
+      </svg>
+    </button>
+  </div>
+</header>
+
+<nav class="tabs" role="tablist" aria-label="功能分区">
+  <button class="tab" id="tabBtn-status" type="button" role="tab" aria-selected="true" aria-controls="panel-status" data-tab="status">状态</button>
+  <button class="tab" id="tabBtn-data" type="button" role="tab" aria-selected="false" aria-controls="panel-data" data-tab="data">
+    数据<span class="tab-count" id="cookieCount" hidden>0</span>
+  </button>
+  <button class="tab" id="tabBtn-settings" type="button" role="tab" aria-selected="false" aria-controls="panel-settings" data-tab="settings">设置</button>
+</nav>
+
+<main class="content" id="content">
+  <!-- ------------------------------------------------------------ 状态 -->
+  <section class="panel" id="panel-status" role="tabpanel" aria-labelledby="tabBtn-status">
+    <div class="card">
+      <div class="hero">
+        <div class="hero-main">
+          <span class="status-dot" id="statusDot" data-state="off"></span>
+          <div class="hero-text">
+            <div class="hero-title" id="statusTitle">正在读取连接状态…</div>
+            <div class="hero-sub mono" id="statusUrl">-</div>
+          </div>
+        </div>
+        <button class="btn btn-secondary btn-sm" id="reconnect" type="button">重新连接</button>
+      </div>
+      <div class="notice notice-warn" id="authWarning" role="alert" hidden></div>
+      <div class="notice notice-err" id="wsConnectError" role="alert" hidden></div>
     </div>
-    <div id="portMsg" class="status" role="status" aria-live="polite"></div>
-    <div id="wsTokenRow"></div>
-    <div class="row">
-      <label>popup 宽度
-        <select id="widthMode">
-          <option value="compact">紧凑</option>
-          <option value="standard">标准</option>
-          <option value="wide">宽松</option>
+
+    <div class="card">
+      <div class="card-head">
+        <h2 class="card-title">环境</h2>
+        <span class="card-sub">只读</span>
+      </div>
+      <dl class="kv">
+        <div class="kv-row"><dt>浏览器</dt><dd class="mono" id="browserInfoText" title="">-</dd></div>
+        <div class="kv-row"><dt>Profile</dt><dd id="profileLabelText">-</dd></div>
+        <div class="kv-row"><dt>浏览器标识</dt><dd class="mono" id="browserIdText" title="">-</dd></div>
+        <div class="kv-row"><dt>端口</dt><dd class="mono" id="portText">-</dd></div>
+        <div class="kv-row"><dt>信任档</dt><dd id="trustText">-</dd></div>
+        <div class="kv-row"><dt>文件网址</dt><dd id="fileAccessStatus">-</dd></div>
+        <div class="kv-row"><dt>心跳</dt><dd class="mono" id="rttText">-</dd></div>
+        <div class="kv-row"><dt>最近命令</dt><dd id="lastCommandText">-</dd></div>
+      </dl>
+    </div>
+  </section>
+
+  <!-- ------------------------------------------------------------ 数据 -->
+  <section class="panel" id="panel-data" role="tabpanel" aria-labelledby="tabBtn-data" hidden>
+    <div class="card">
+      <div class="card-head">
+        <h2 class="card-title">Cookies</h2>
+        <span class="card-sub mono" id="siteHost" title="">-</span>
+      </div>
+      <div class="toolbar">
+        <button class="btn btn-primary btn-sm" id="refresh" type="button">刷新</button>
+        <button class="btn btn-secondary btn-sm" id="toggleCookies" type="button">显示值</button>
+        <button class="btn btn-secondary btn-sm" id="copyCookies" type="button">复制</button>
+      </div>
+      <div class="toolbar toolbar-wrap">
+        <label class="check"><input id="includeHttpOnly" type="checkbox"><span>含 httpOnly/secure</span></label>
+        <label class="inline-field">
+          <span>复制后清除</span>
+          <select class="select select-sm" id="clipboardTtl">
+            <option value="30">30 秒</option>
+            <option value="60">60 秒</option>
+            <option value="120">120 秒</option>
+            <option value="300">300 秒</option>
+          </select>
+        </label>
+      </div>
+      <div class="filter-row">
+        <input class="input input-sm" id="cookieFilter" type="search" placeholder="筛选名称或标记…" autocomplete="off" aria-label="筛选 cookie">
+      </div>
+      <div class="msg" id="cookieMsg" role="status" aria-live="polite"></div>
+      <ul class="cookie-list" id="cookieList" aria-label="Cookie 列表"></ul>
+      <div class="empty" id="cookieEmpty">点「刷新」读取当前站点的 cookies。值默认打码，仅在本机显示。</div>
+      <p class="hint">复制会写入系统剪贴板，并按上面的时长自动清除；关闭弹窗立即恢复打码。</p>
+    </div>
+  </section>
+
+  <!-- ------------------------------------------------------------ 设置 -->
+  <section class="panel" id="panel-settings" role="tabpanel" aria-labelledby="tabBtn-settings" hidden>
+    <div class="card">
+      <div class="card-head"><h2 class="card-title">连接</h2></div>
+      <div class="field">
+        <label class="field-label" for="port">插件端口</label>
+        <div class="field-row">
+          <input id="port" class="input mono" type="number" min="1" max="65535" inputmode="numeric">
+          <button id="savePort" class="btn btn-secondary" type="button">保存并重连</button>
+        </div>
+        <div class="msg" id="portMsg" role="status" aria-live="polite"></div>
+      </div>
+      <div class="field field-gap">
+        <label class="field-label" for="wsToken">访问 token</label>
+        <div class="field-row">
+          <input id="wsToken" class="input mono" type="password" autocomplete="off" placeholder="未设置">
+          <button id="saveWsToken" class="btn btn-secondary" type="button">保存</button>
+          <button id="clearWsToken" class="btn btn-ghost" type="button">清空</button>
+        </div>
+        <div class="msg" id="wsTokenMsg" role="status" aria-live="polite"></div>
+        <p class="hint">设置后 daemon 只接受带 token 的连接。推荐用 <code>atb trust-extension --token</code> 生成并写入两端。</p>
+      </div>
+      <div class="field field-gap">
+        <label class="field-label" for="wsTrustMode">信任档位</label>
+        <select id="wsTrustMode" class="select">
+          <option value="compat">兼容（默认）</option>
+          <option value="strict">严格（需 token）</option>
         </select>
+        <div class="msg" id="trustMsg" role="status" aria-live="polite"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h2 class="card-title">身份</h2></div>
+      <div class="field">
+        <label class="field-label" for="profileLabel">Profile Label</label>
+        <div class="field-row">
+          <input id="profileLabel" class="input" type="text" maxlength="40" placeholder="例如 work / personal">
+          <button id="saveProfileLabel" class="btn btn-secondary" type="button">保存</button>
+          <button id="clearProfileLabel" class="btn btn-ghost" type="button">清空</button>
+        </div>
+        <div class="msg" id="profileMsg" role="status" aria-live="polite"></div>
+        <p class="hint">多浏览器 / 多 Profile 时用它区分。需要跨 Profile 唯一性校验时用 CLI 设置。</p>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h2 class="card-title">界面</h2></div>
+      <div class="field-grid">
+        <label class="field">
+          <span class="field-label">主题</span>
+          <select id="themeMode" class="select">
+            <option value="auto">跟随系统</option>
+            <option value="light">浅色</option>
+            <option value="dark">深色</option>
+          </select>
+        </label>
+        <label class="field">
+          <span class="field-label">弹窗宽度</span>
+          <select id="widthMode" class="select">
+            <option value="compact">紧凑 · 340</option>
+            <option value="standard">标准 · 420</option>
+            <option value="wide">宽松 · 560</option>
+          </select>
+        </label>
+        <label class="field">
+          <span class="field-label">间距</span>
+          <select id="densityMode" class="select">
+            <option value="standard">标准</option>
+            <option value="compact">紧凑</option>
+          </select>
+        </label>
+      </div>
+      <p class="hint">宽度与间距只影响工具栏弹窗；在标签页里打开时按页面宽度自适应。</p>
+      <label class="switch-row">
+        <span class="switch-text">
+          <span class="switch-title">页面状态角标</span>
+          <span class="switch-hint">在网页右侧显示连接状态；站点可检测到这个角标</span>
+        </span>
+        <span class="switch"><input id="showBadge" type="checkbox"><i></i></span>
       </label>
+      <div class="msg" id="showBadgeMsg" role="status" aria-live="polite"></div>
     </div>
-    <div class="row">
-      <span id="buildInfo" class="status">运行版本 -</span>
-      <button id="reloadExt">重新加载扩展</button>
+
+    <div class="card">
+      <div class="card-head"><h2 class="card-title">维护</h2></div>
+      <div class="field-row">
+        <button id="reloadExt" class="btn btn-secondary" type="button">重新加载扩展</button>
+        <button id="openOptionsBottom" class="btn btn-ghost" type="button">打开管理页面</button>
+      </div>
+      <p class="hint">改了 manifest、或在 chrome://extensions 里看到报错时，先重新加载扩展。</p>
     </div>
-  </details>
-  <div class="row">
-    <label><input id="showBadge" type="checkbox"> 在页面上显示状态角标</label>
-  </div>
-  <div id="showBadgeMsg" class="status" role="status" aria-live="polite"></div>
-</div>
-<h3>Profile</h3>
-<div class="panel">
-  <div id="profileStatus" class="status" role="status" aria-live="polite">读取 Profile...</div>
-  <details>
-    <summary>Profile 详情</summary>
-    <div id="profileDetail" class="muted"></div>
-  </details>
-  <div class="row">
-    <label>Label <input id="profileLabel" type="text" maxlength="40" placeholder="work"></label>
-    <button id="saveProfileLabel">保存</button>
-    <button id="clearProfileLabel">清空</button>
-  </div>
-  <div id="profileMsg" class="status" role="status" aria-live="polite"></div>
-  <div class="muted">建议用 CLI 设置 label，可校验跨 Profile 唯一性。</div>
-</div>
-<h3>Cookies</h3>
-<div class="panel">
-  <!-- SEC-12：Cookie 操作区的权限与数据边界提示。 -->
-  <div class="muted">需要 cookies 权限：仅在本机 popup 内展示，不会上传；值默认隐藏。</div>
-  <div class="row">
-    <button id="refresh">刷新</button>
-    <button id="toggleCookies">显示值</button>
-    <button id="copyCookies">复制 cookies</button>
-    <label><input id="includeHttpOnly" type="checkbox"> 包含 httpOnly/secure</label>
-  </div>
-  <div class="row">
-    <label>剪贴板自动清除
-      <select id="clipboardTtl">
-        <option value="30">30 秒</option>
-        <option value="60">60 秒</option>
-        <option value="120">120 秒</option>
-        <option value="300">300 秒</option>
-      </select>
-    </label>
-  </div>
-  <div id="cookieMsg" class="status" role="status" aria-live="polite"></div>
-  <pre id="out">点击「刷新」获取 cookies（默认只显示名称与标记）...</pre>
-</div>
+  </section>
+</main>
+
+<script src="ui/common.js"></script>
 <script src="popup.js"></script>
 </body>
 </html>

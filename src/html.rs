@@ -1,6 +1,7 @@
 use html5ever::tendril::TendrilSink;
 use html5ever::{parse_document, serialize, ParseOpts};
 use markup5ever_rcdom::{Handle, NodeData, RcDom, SerializableHandle};
+use std::io::Cursor;
 
 pub fn js_opt_html() -> &'static str {
     include_str!("../assets/simphtml_opt.js")
@@ -46,6 +47,14 @@ pub fn js_page_stealth() -> &'static str {
     include_str!("../assets/page_stealth.js")
 }
 
+/// 列表识别脚本（当前未启用）。
+/// 它会做全量 DOM 遍历并强制触发布局，不能像以前那样"跑一次然后丢掉结果"；
+/// 重新启用时应作为 `scan --list` 的独立能力，把结果返回给调用方。
+#[allow(dead_code)]
+pub fn js_find_main_list() -> &'static str {
+    include_str!("../assets/simphtml_find_list.js")
+}
+
 /// 输入 HTML 的字节上限。
 ///
 /// 超过这个量级就不再交给 html5ever：8MB+ 的文档既可能是几百万层嵌套，也可能是
@@ -73,7 +82,7 @@ pub fn optimize_html_for_tokens(html: &str) -> String {
         // 超限**不继续优化**：直接给纯文本降级结果，并显式标注原因。
         //
         // 丢弃前必须先迭代拆链：`RcDom` 的节点是 `Rc<Node>`，直接让它离开作用域会沿
-        // children 递归析构，深链/宽树都可能把栈打爆（的同一类问题）。
+        // children 递归析构，深链/宽树都可能把栈打爆（同一类问题）。
         discard_subtree(&dom.document);
         return format!("[html nodes > 200k] {}", strip_tags(html));
     }
@@ -200,15 +209,11 @@ fn strip_tags(html: &str) -> String {
 
 /// 大小写不敏感的前缀匹配（输入已转成 `Vec<char>`，按字符比较避免字节边界问题）。
 fn starts_with_ignore_case(chars: &[char], at: usize, needle: &str) -> bool {
-    for (idx, expected) in (at..).zip(needle.chars()) {
-        let Some(actual) = chars.get(idx) else {
-            return false;
-        };
-        if !actual.eq_ignore_ascii_case(&expected) {
-            return false;
-        }
-    }
-    true
+    needle.chars().enumerate().all(|(offset, expected)| {
+        chars
+            .get(at + offset)
+            .is_some_and(|actual| actual.eq_ignore_ascii_case(&expected))
+    })
 }
 
 /// 解码降级路径里最常见的 HTML 实体。
@@ -237,7 +242,7 @@ const MAX_DOM_DEPTH: usize = 512;
 /// 默认 `false`：这两个元素的子树对「页面内容理解」没有价值，却经常占掉
 /// 优化后 HTML 的大半 token。需要调试页面脚本时用 `ATB_HTML_KEEP_SCRIPTS=on` 打开。
 fn keep_scripts() -> bool {
-    crate::settings::env_bool("ATB_HTML_KEEP_SCRIPTS", false)
+    crate::settings::html_keep_scripts()
 }
 
 /// 这个节点是否应该整棵丢弃。
@@ -349,7 +354,7 @@ fn clean_node_at(handle: &Handle, depth: usize, keep: bool) {
         for attr in attrs.iter_mut() {
             let key = attr.name.local.as_ref();
             let value = attr.value.to_string();
-            // 全部按字符计数：UTF-8 下 `len()` 是字节数，和 `chars().take()` 混用会让
+            // 全部按字符计数： 下 `len` 是字节数，和 `chars.take` 混用会让
             // 中文 URL / 属性值在没超阈值时就被替换成占位符。
             let value_chars = value.chars().count();
             if key == "src" {
@@ -409,7 +414,7 @@ fn discard_subtree(handle: &Handle) {
 }
 
 pub fn smart_truncate(html: String, budget: usize) -> String {
-    // budget 是「字符」预算（下游按 token/可见字数设计），而 String::len() 是 UTF-8 字节数。
+    // budget 是「字符」预算（下游按 token/可见字数设计），而 String::len 是 字节数。
     // 用字节数比较会让中文页面提前约 3 倍截断，这里统一按 chars().count() 计算。
     // 调用方可能仍然用字节长度做前置判断，所以「其实没超预算」时必须原样返回。
     if html.chars().count() <= budget {
@@ -419,7 +424,7 @@ pub fn smart_truncate(html: String, budget: usize) -> String {
     let marker_len = MARKER.chars().count();
     // 预算装不下标记时直接返回按字符截断的前缀（不加标记）：
     // 旧实现固定留 32 个字符给标记，budget < 32 时算出的 keep 是 0，
-    // 结果变成 13 字符的 " [TRUNCATED]" —— 比预算还长，内容全丢（P3）。
+    // 结果变成 13 字符的 " [TRUNCATED]" —— 比预算还长，内容全丢。
     if budget <= marker_len {
         return html.chars().take(budget).collect();
     }
@@ -427,6 +432,14 @@ pub fn smart_truncate(html: String, budget: usize) -> String {
     let mut result: String = html.chars().take(keep).collect();
     result.push_str(MARKER);
     result
+}
+
+#[allow(dead_code)]
+fn _parse_html_for_validation(html: &str) -> RcDom {
+    parse_document(RcDom::default(), ParseOpts::default())
+        .from_utf8()
+        .read_from(&mut Cursor::new(html.as_bytes()))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

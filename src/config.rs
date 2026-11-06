@@ -33,7 +33,7 @@ impl Default for AppConfig {
 /// 命令留下创建 `~/.atb/config.json` 的副作用。需要「首次运行就落盘」的入口
 /// （`set-extension-port`、daemon 启动）才用 `load_or_create`。
 // 旧注释声称 cmd_status 尚未切换到本函数，实际 cmd_status.rs 已改用 config::load()
-// （v8 修复），过期的 allow(dead_code) 连同该注释一并删除，避免误导后来者。
+// 过期的 allow(dead_code) 连同该注释一并删除，避免误导后来者。
 pub fn load() -> Result<AppConfig> {
     let path = config_path()?;
     match read_json_with_backup::<AppConfig>(&path)? {
@@ -158,11 +158,8 @@ pub fn user_config_dir() -> Result<PathBuf> {
     // `ATB_HOME` 直接指定配置目录：测试桩（mock 扩展自检）必须能跑一份**独立**的
     // daemon，否则会撞上真实 daemon 的 18765/18767。Windows 上 `dirs::home_dir()`
     // 走的是 Known Folder API，改 HOME/USERPROFILE 不生效，只能靠显式环境变量。
-    if let Some(dir) = env::var_os("ATB_HOME") {
-        let dir = PathBuf::from(dir);
-        if !dir.as_os_str().is_empty() {
-            return Ok(dir);
-        }
+    if let Some(dir) = crate::settings::atb_home() {
+        return Ok(dir);
     }
     let home = home_dir().ok_or_else(|| anyhow!("无法定位用户主目录，不能创建 atb 配置文件"))?;
     Ok(home.join(".atb"))
@@ -415,8 +412,8 @@ fn open_lock_file(path: &Path) -> Result<fs::File> {
     // 默认 40 次 × 25ms ≈ 1s（旧实现 10 × 20ms ≈ 200ms）：杀软扫描 / 慢盘上
     // 200ms 就放弃会让 token 写入失败、daemon 起不来。可用
     // `ATB_LOCK_RETRIES` / `ATB_LOCK_RETRY_MS` 调整。
-    let retries = crate::settings::env_u64_clamped("ATB_LOCK_RETRIES", 40, 1, 500) as usize;
-    let retry_ms = crate::settings::env_u64_clamped("ATB_LOCK_RETRY_MS", 25, 1, 2_000);
+    let retries = crate::settings::lock_retries();
+    let retry_ms = crate::settings::lock_retry_ms();
     let mut last_error = None;
     for _ in 0..retries {
         match OpenOptions::new()
@@ -482,8 +479,8 @@ fn lock_path(path: &Path) -> PathBuf {
 
 /// Windows：去掉继承权限与已知宽松 ACE，只保留当前用户可读写。
 ///
-/// 身份优先用当前进程的 SID（`whoami /user` 解析出 `S-1-5-21-...`，用 icacls 的
-/// `*S-1-...` 形式授权），拿不到才退回 `USERDOMAIN\USERNAME`。
+/// 身份优先用当前进程的 SID（`whoami /user` 解析出 `-5-21-...`，用 icacls 的
+/// `*-...` 形式授权），拿不到才退回 `USERDOMAIN\USERNAME`。
 /// 旧实现只用可伪造的 `USERNAME`，且在已有显式 ACE 时 `grant:r` 不会移除那些宽松项。
 ///
 /// 失败返回 `Err` 交由调用方打印警告：权限收紧是加固动作，不该让 daemon 起不来，
@@ -547,7 +544,7 @@ fn restrict_windows_acl(path: &Path) -> Result<(), String> {
     }
 }
 
-/// 当前用户身份：优先 `*S-1-...`（icacls 的 SID 形式），否则 `DOMAIN\User`。
+/// 当前用户身份：优先 `*-...`（icacls 的 SID 形式），否则 `DOMAIN\User`。
 #[cfg(windows)]
 fn current_user_identity() -> Option<String> {
     if let Some(sid) = current_user_sid() {
@@ -708,7 +705,7 @@ pub fn replace_file_atomically(temp_path: &Path, target: &Path) -> std::io::Resu
     }
     // Windows: 先用 Win32 的 `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` —— 同一卷上它是
     // 原子替换，读方任何时刻看到的要么是旧文件、要么是新文件，不会出现「目标不存在」的
-    // 真空期（首轮 #5 /）。
+    // 真空期。
     #[cfg(windows)]
     {
         if let Err(err) = move_file_replace(temp_path, target) {
@@ -1106,13 +1103,13 @@ mod tests {
         let dir = temp_dir("log-private");
         let path = with_home(&dir, || ensure_log_file().expect("ensure log"));
         let file_mode = fs::metadata(&path).expect("stat log").permissions().mode() & 0o777;
-        assert_eq!(file_mode, 0o600, "daemon.log 必须是 0600");
+        assert_eq!(file_mode, 0o600, "daemon.log 必须是 0600（SEC-04）");
         let dir_mode = fs::metadata(dir.join("logs"))
             .expect("stat log dir")
             .permissions()
             .mode()
             & 0o777;
-        assert_eq!(dir_mode, 0o700, "日志目录必须是 0700");
+        assert_eq!(dir_mode, 0o700, "日志目录必须是 0700（SEC-04）");
         fs::remove_dir_all(&dir).ok();
     }
 }

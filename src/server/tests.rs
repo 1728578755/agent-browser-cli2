@@ -1,9 +1,18 @@
 use super::*;
 use axum::http::HeaderValue;
 
+/// 测试用下行队列容量（之后通道有界）：给足空间，只有专门测背压的
+/// 用例才会用小容量把队列填满。
+const TEST_WS_QUEUE: usize = 64;
+
 fn test_state() -> AppState {
-    let (shutdown, _shutdown_rx) = mpsc::unbounded_channel();
-    AppState {
+    // 大多数用例不关心退出信号，丢弃接收端即可（`send` 会返回 Err，无人读）。
+    test_state_with_shutdown().0
+}
+
+fn test_state_with_shutdown() -> (AppState, mpsc::UnboundedReceiver<()>) {
+    let (shutdown, shutdown_rx) = mpsc::unbounded_channel();
+    let state = AppState {
         driver: Arc::new(RwLock::new(DriverState::default())),
         execs: Arc::new(Mutex::new(crate::protocol::ExecRegistry::default())),
         jobs: Arc::new(Mutex::new(JobStore::default())),
@@ -12,7 +21,7 @@ fn test_state() -> AppState {
         ws_bind_error: Arc::new(Mutex::new(None)),
         ext_reload_sent: Arc::new(Mutex::new(HashSet::new())),
         profile_label_lock: Arc::new(Mutex::new(())),
-        net_persist_lock: Arc::new(Mutex::new(())),
+        net_persist_lock: Arc::new(Mutex::new(HashMap::new())),
         started_at: SystemTime::now(),
         last_activity: Arc::new(Mutex::new(Instant::now())),
         inflight: Arc::new(AtomicUsize::new(0)),
@@ -33,7 +42,8 @@ fn test_state() -> AppState {
         // 新增状态字段：与生产构造点保持同步。
         idempotency: Arc::new(Mutex::new(HashMap::new())),
         late_results: Arc::new(Mutex::new(HashMap::new())),
-    }
+    };
+    (state, shutdown_rx)
 }
 
 fn insert_test_session(
@@ -41,9 +51,9 @@ fn insert_test_session(
     browser_id: &str,
     profile_id: &str,
     tab_id: &str,
-) -> mpsc::UnboundedReceiver<String> {
+) -> mpsc::Receiver<String> {
     let session_key = crate::protocol::make_session_key(browser_id, profile_id, tab_id);
-    let (sender, receiver) = mpsc::unbounded_channel();
+    let (sender, receiver) = mpsc::channel::<String>(TEST_WS_QUEUE);
     driver.sessions.insert(
         session_key.clone(),
         Session {
@@ -142,7 +152,7 @@ fn ws_trust_enforces_identity_only_when_configured() {
     assert_eq!(full.token_value(), Some("secret"));
 }
 
-/// / §4.4：坏 JSON 与**空内容**都必须变成 `Corrupt`，绝不能退化成「未配置」
+/// §4.4：坏 JSON 与**空内容**都必须变成 `Corrupt`，绝不能退化成「未配置」
 /// （= 任意扩展可连）。
 #[test]
 fn parse_ws_trust_accepts_valid_json() {
@@ -312,7 +322,7 @@ fn reload_trust_keeps_token_matching_connection() {
 fn ws_conn_guard_unregisters_on_drop() {
     let state = test_state();
     let revoked = Arc::new(AtomicBool::new(false));
-    let (sender, _receiver) = mpsc::unbounded_channel();
+    let (sender, _receiver) = mpsc::channel::<String>(TEST_WS_QUEUE);
     ws_connections_lock(&state).insert(
         7,
         WsConn {
@@ -441,7 +451,7 @@ fn handshake_query_token_is_parsed_and_decoded() {
 
 /// 两段式变更观察的「线上契约」：`tests/mock_extension.mjs` 靠
 /// `__abcMonitor__` 与 `status: 'watching'` 这两处字面量识别脚本并回包，
-/// 改动这两个哨兵必须同步改 mock，否则守卫会红得莫名其妙。
+/// 改动这两个哨兵必须同步改 mock，否则 的守卫会红得莫名其妙。
 #[test]
 fn monitor_scripts_keep_their_wire_contract() {
     let start = monitor_start_script("monitor-1");
@@ -517,7 +527,7 @@ async fn unauthorized_api_request_is_tracked_and_released() {
     );
     assert!(
         probe.last_activity.lock().await.elapsed() >= Duration::from_secs(55),
-        "401 是鉴权失败不是业务活动：不能续期 last_activity"
+        "401 是鉴权失败不是业务活动：不能续期 last_activity（CQ-07）"
     );
     server.abort();
 }
@@ -591,11 +601,9 @@ async fn unauthorized_post_does_not_pollute_idempotency_cache() {
     };
 
     // 第一次：无 token → 401，且不占位、不执行、不写缓存。
-    let (first_status, _) = {
-        tokio::task::spawn_blocking(move || send(false))
-            .await
-            .unwrap()
-    };
+    let (first_status, _) = tokio::task::spawn_blocking(move || send(false))
+        .await
+        .unwrap();
     assert_eq!(first_status, StatusCode::UNAUTHORIZED);
     assert!(
         probe.idempotency.lock().await.is_empty(),
@@ -607,11 +615,9 @@ async fn unauthorized_post_does_not_pollute_idempotency_cache() {
     );
 
     // 第二次：带正确 token、同一个 key 与 body → 必须真正执行（不是回放 401）。
-    let (second_status, second_body) = {
-        tokio::task::spawn_blocking(move || send(true))
-            .await
-            .unwrap()
-    };
+    let (second_status, second_body) = tokio::task::spawn_blocking(move || send(true))
+        .await
+        .unwrap();
     assert_eq!(second_status, StatusCode::OK);
     assert_eq!(
         second_body["ok"],
@@ -742,7 +748,7 @@ async fn reload_trust_requires_token_and_reports_checked() {
     let state = test_state();
     // 预置一条已登记连接：用来验证 `checked` 真的在数登记表，而不是写死 0。
     ws_connections_lock(&state).insert(1, {
-        let (sender, _receiver) = mpsc::unbounded_channel();
+        let (sender, _receiver) = mpsc::channel::<String>(TEST_WS_QUEUE);
         WsConn {
             extension_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
             token_fingerprint: None,
@@ -853,7 +859,7 @@ async fn page_execution_reports_the_session_that_received_the_command() {
         .to_string();
 
     state.driver.write().await.default_session_key = Some("browser-b:profile-b:8".to_string());
-    let (sender, _receiver) = mpsc::unbounded_channel();
+    let (sender, _receiver) = mpsc::channel::<String>(TEST_WS_QUEUE);
     handle_ws_message(
         WsIncoming::Result {
             id: exec_id,
@@ -1006,7 +1012,7 @@ fn exec_registry_tracks_and_clears_entries() {
     assert!(registry.active.is_empty());
 }
 
-/// C-05：淘汰必须按「完成时间升序」，而不是 HashMap 的迭代顺序。
+/// 淘汰必须按「完成时间升序」，而不是 HashMap 的迭代顺序。
 /// 旧实现 `values().take(20)` 会随机删掉刚完成、正等 `job wait` 的新任务。
 #[test]
 fn job_store_evicts_oldest_finished_jobs() {
@@ -1055,7 +1061,7 @@ fn job_store_evicts_oldest_finished_jobs() {
     assert!(store.jobs.contains_key("job-119"));
 }
 
-/// C-05 的另一半：全是 Running 时表也必须有硬上限，且淘汰最旧的。
+/// 的另一半：全是 Running 时表也必须有硬上限，且淘汰最旧的。
 #[test]
 fn job_store_stays_bounded_when_all_jobs_are_running() {
     let mut store = JobStore::default();
@@ -1180,7 +1186,7 @@ fn site_match_pattern_strips_query_and_keeps_regular_hosts() {
         site_match_pattern("https://example.com:8443/a?b=1#c").as_deref(),
         Some("*://example.com/*")
     );
-    // 以前 `starts_with("chrom")` 会误杀这两个正常域名（B-10）。
+    // 以前 `starts_with("chrom")` 会误杀这两个正常域名。
     assert_eq!(
         site_match_pattern("https://chromium.org/docs").as_deref(),
         Some("*://chromium.org/*")
@@ -1327,7 +1333,7 @@ fn test_session_raw(
     browser_id: &str,
     profile_id: &str,
     tab_id: &str,
-    sender: mpsc::UnboundedSender<String>,
+    sender: mpsc::Sender<String>,
 ) -> Session {
     Session {
         session_key: session_key.to_string(),
@@ -1380,7 +1386,7 @@ async fn late_result_from_stale_generation_keeps_pending() {
         let _rx = insert_test_session(&mut driver, "browser-a", "profile-a", "1");
     }
     // 会话归属连接 2（登记的会话表决定 `session_owner_conn` 的返回值）。
-    let (owner_tx, _owner_rx) = mpsc::unbounded_channel();
+    let (owner_tx, _owner_rx) = mpsc::channel::<String>(TEST_WS_QUEUE);
     let mut owned = HashSet::new();
     owned.insert(session_key.clone());
     ws_connections_lock(&state).insert(
@@ -1406,7 +1412,7 @@ async fn late_result_from_stale_generation_keeps_pending() {
         );
     }
 
-    let (feed_tx, _feed_rx) = mpsc::unbounded_channel();
+    let (feed_tx, _feed_rx) = mpsc::channel::<String>(TEST_WS_QUEUE);
     let scratch = std::sync::Mutex::new(HashSet::new());
     handle_ws_message(
         WsIncoming::Result {
@@ -1438,7 +1444,7 @@ async fn late_result_from_stale_generation_keeps_pending() {
 async fn disconnect_cleanup_falls_back_to_sender_for_zero_conn_id() {
     let state = test_state();
     let session_key = crate::protocol::make_session_key("browser-a", "profile-a", "1");
-    let (sender, _receiver) = mpsc::unbounded_channel();
+    let (sender, _receiver) = mpsc::channel::<String>(TEST_WS_QUEUE);
     {
         let mut driver = state.driver.write().await;
         let session = test_session_raw(&session_key, "browser-a", "profile-a", "1", sender.clone());
@@ -1488,8 +1494,8 @@ async fn disconnect_cleanup_falls_back_to_sender_for_zero_conn_id() {
 async fn disconnect_cleanup_skips_zero_conn_id_other_sender() {
     let state = test_state();
     let session_key = crate::protocol::make_session_key("browser-a", "profile-a", "1");
-    let (owner_sender, _owner_rx) = mpsc::unbounded_channel();
-    let (other_sender, _other_rx) = mpsc::unbounded_channel();
+    let (owner_sender, _owner_rx) = mpsc::channel::<String>(TEST_WS_QUEUE);
+    let (other_sender, _other_rx) = mpsc::channel::<String>(TEST_WS_QUEUE);
     {
         let mut driver = state.driver.write().await;
         let session = test_session_raw(&session_key, "browser-a", "profile-a", "1", owner_sender);
@@ -1625,4 +1631,551 @@ fn ws_handshake_trust_modes_enforce_identity() {
     assert!(ws_handshake_check(WsTrustMode::Both, &both, id, Some("s3cret")).is_ok());
     assert!(ws_handshake_check(WsTrustMode::Both, &both, id, None).is_err());
     assert!(ws_handshake_check(WsTrustMode::Both, &token_only, id, Some("s3cret")).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// 补充用例
+// ---------------------------------------------------------------------------
+
+/// 下行队列有界。满了必须给出 `ws_backpressure`（可重试），
+/// 对端关闭必须给出 `ws_disconnected`——两者都不能是"静默丢弃"或"无限等待"。
+#[tokio::test]
+async fn send_downstream_reports_backpressure_and_disconnect() {
+    let (sender, mut receiver) = mpsc::channel::<String>(1);
+    assert!(
+        send_downstream(&sender, "first".to_string()).await.is_ok(),
+        "队列有空位时必须入队成功"
+    );
+    let err = send_downstream_within(&sender, "second".to_string(), Duration::from_millis(30))
+        .await
+        .expect_err("队列已满时必须报背压，而不是无限等待");
+    let typed = err
+        .downcast_ref::<SessionSelectError>()
+        .expect("背压必须是结构化错误");
+    assert_eq!(typed.code, "ws_backpressure");
+    assert!(typed.retryable, "背压是暂时状态，必须可重试");
+
+    // 消费一条后队列腾出位置，同一通道可以继续用。
+    assert_eq!(receiver.recv().await.as_deref(), Some("first"));
+    assert!(send_downstream(&sender, "third".to_string()).await.is_ok());
+
+    drop(receiver);
+    let err = send_downstream(&sender, "fourth".to_string())
+        .await
+        .expect_err("接收端已关闭时必须报断开");
+    assert_eq!(
+        err.downcast_ref::<SessionSelectError>()
+            .expect("断开必须是结构化错误")
+            .code,
+        "ws_disconnected"
+    );
+}
+
+/// WS 入站 90s 静默判定的纯函数。定时分支与单测共用同一个判据，
+/// 不会出现"测的和跑的两条线"。
+#[test]
+fn inbound_silence_turns_half_open_only_after_ninety_seconds() {
+    assert_eq!(WS_INBOUND_SILENCE_LIMIT, Duration::from_secs(90));
+    assert!(!inbound_is_half_open(Duration::ZERO));
+    assert!(!inbound_is_half_open(Duration::from_secs(89)));
+    assert!(
+        !inbound_is_half_open(WS_INBOUND_SILENCE_LIMIT),
+        "阈值当刻仍算健康（扩展可能正好卡在边界上）"
+    );
+    assert!(inbound_is_half_open(Duration::from_secs(91)));
+}
+
+/// `ws_hello` 的 proof 必须能用"配置里的 token"复算出来，
+/// 且没配 token 时 `auth_required:false` + `proof:null`。
+#[test]
+fn ws_hello_proves_token_possession() {
+    let extension_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let hello = ws_hello_value(extension_id, Some("s3cret"));
+    assert_eq!(hello["type"], json!("ws_hello"));
+    assert_eq!(hello["v"], json!(1));
+    assert_eq!(hello["auth_required"], json!(true));
+
+    let nonce = hello["nonce"].as_str().expect("nonce 必须是字符串");
+    assert_eq!(nonce.len(), 32, "nonce 必须是 32 位 hex");
+    assert!(
+        nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+        "nonce 必须是小写 hex，实际: {nonce}"
+    );
+    let expected = crate::hmac::hex_lower(&crate::hmac::hmac_sha256(
+        b"s3cret",
+        format!("{nonce}|{extension_id}").as_bytes(),
+    ));
+    assert_eq!(
+        hello["proof"],
+        json!(expected),
+        "proof 必须是 HMAC-SHA256(token, nonce|extension_id) 的小写 hex"
+    );
+
+    // 每次握手换一个 nonce：固定挑战等于把 proof 变成可重放的静态口令。
+    let again = ws_hello_value(extension_id, Some("s3cret"));
+    assert_ne!(again["nonce"], hello["nonce"]);
+
+    // 没配 token（含空白 token）：保持兼容路径，不要求扩展校验。
+    for token in [None, Some("   ")] {
+        let open = ws_hello_value(extension_id, token);
+        assert_eq!(open["type"], json!("ws_hello"));
+        assert_eq!(open["auth_required"], json!(false));
+        assert!(
+            open["proof"].is_null(),
+            "auth_required=false 时 proof 必须是 null"
+        );
+    }
+}
+
+/// 线协议固定向量：锁住 `nonce|extension_id` 的**拼接顺序与分隔符**。
+///
+/// 上面的 `ws_hello_proves_token_possession` 是自证（同一份 HMAC 算自己拼的串），
+/// 改分隔符/换顺序也测不出来。这条用固定 nonce 断言一条与三方对拍过的完整 proof：
+/// `src/hmac.rs` ↔ Node/OpenSSL `createHmac` ↔ 扩展 WebCrypto（`tests/extension_closeout.test.mjs`
+/// 里固化的 known-answer 是同一条向量）。任一侧改了 hex 大小写、补零或拼接格式，
+/// Rust 侧与 JS 侧会同时红，不必等真机。
+#[test]
+fn ws_hello_wire_vector_matches_the_extension_known_answer() {
+    let hello = ws_hello_with_nonce(
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        Some("s3cret"),
+        "0123456789abcdef0123456789abcdef",
+    );
+    assert_eq!(hello["type"], json!("ws_hello"));
+    assert_eq!(hello["v"], json!(1));
+    assert_eq!(hello["auth_required"], json!(true));
+    assert_eq!(
+        hello["proof"],
+        json!("74449fac6d934bb2f057e6804daa06b19a372d64d4c17ea7a85b37d05eb45958"),
+        "proof 与扩展侧 WebCrypto / Node createHmac 必须逐字节一致，否则真机判 daemon_auth_failed"
+    );
+    let proof = hello["proof"].as_str().expect("proof 是字符串");
+    assert_eq!(proof.len(), 64);
+    assert!(
+        proof
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+        "proof 必须是 64 位小写 hex"
+    );
+}
+
+/// 空闲退出判定的单轮驱动（直接用生产函数 `idle_tick`）。
+///
+/// 覆盖三条必须成立的语义：有扩展连接不退、有在途请求不退、都没有时走完
+/// 宽限期才退。
+#[tokio::test]
+async fn idle_tick_keeps_running_until_nothing_is_connected() {
+    let state = test_state();
+    let mut disconnected_since = None;
+    let ttl = state.idle_shutdown_ttl;
+    // 把"最后一次业务请求"拨到 TTL 之前，模拟"已经空闲很久"。
+    let expired_at = || {
+        Instant::now()
+            .checked_sub(ttl + Duration::from_secs(30))
+            .expect("测试用的 TTL 足够小")
+    };
+
+    {
+        let mut driver = state.driver.write().await;
+        let _receiver = insert_test_session(&mut driver, "browser-a", "profile-a", "1");
+    }
+    *state.last_activity.lock().await = expired_at();
+    assert!(
+        matches!(
+            idle_tick(&state, &mut disconnected_since).await,
+            IdleAction::KeepAlive
+        ),
+        "还有活标签页时不能退出（重连代价远大于留着一个连接）"
+    );
+    assert!(
+        state.last_activity.lock().await.elapsed() < Duration::from_secs(1),
+        "连接期间必须续期 last_activity，否则 /health.ttl_remaining 会谎报"
+    );
+
+    // 在途请求（未达卡死阈值）同样阻止退出。
+    {
+        let mut driver = state.driver.write().await;
+        for session in driver.sessions.values_mut() {
+            session.disconnected_at = Some(Instant::now());
+        }
+    }
+    *state.last_activity.lock().await = expired_at();
+    state.inflight.store(1, Ordering::Relaxed);
+    *state.inflight_since.lock().await = Some(Instant::now());
+    assert!(
+        matches!(
+            idle_tick(&state, &mut disconnected_since).await,
+            IdleAction::KeepAlive
+        ),
+        "有健康在途请求时必须继续等（否则长命令被腰斩）"
+    );
+
+    // 既没有连接也没有在途：第一轮只开始计宽限。
+    state.inflight.store(0, Ordering::Relaxed);
+    *state.last_activity.lock().await = expired_at();
+    assert!(
+        matches!(
+            idle_tick(&state, &mut disconnected_since).await,
+            IdleAction::KeepAlive
+        ),
+        "扩展刚断开要有宽限窗口，别把短暂断线当'没有浏览器'"
+    );
+    assert!(disconnected_since.is_some(), "宽限起点必须被记录");
+
+    // 宽限期过去 → 允许退出。
+    *state.last_activity.lock().await = expired_at();
+    disconnected_since = Some(
+        Instant::now()
+            .checked_sub(EXTENSION_RECONNECT_GRACE + Duration::from_secs(1))
+            .expect("宽限期足够小"),
+    );
+    assert!(matches!(
+        idle_tick(&state, &mut disconnected_since).await,
+        IdleAction::Exit
+    ));
+}
+
+/// `cleanup_conn_sessions` 重复调用必须幂等，且只收拾"本连接登记的"会话。
+#[tokio::test]
+async fn cleanup_conn_sessions_is_idempotent_and_owner_scoped() {
+    let state = test_state();
+    let owned_key = crate::protocol::make_session_key("browser-a", "profile-a", "1");
+    let foreign_key = crate::protocol::make_session_key("browser-b", "profile-b", "2");
+    let (owned_sender, _owned_rx) = mpsc::channel::<String>(TEST_WS_QUEUE);
+    let (foreign_sender, _foreign_rx) = mpsc::channel::<String>(TEST_WS_QUEUE);
+    {
+        let mut driver = state.driver.write().await;
+        let mut owned = test_session_raw(
+            &owned_key,
+            "browser-a",
+            "profile-a",
+            "1",
+            owned_sender.clone(),
+        );
+        owned.conn_id = 3;
+        driver.sessions.insert(owned_key.clone(), owned);
+        let mut foreign =
+            test_session_raw(&foreign_key, "browser-b", "profile-b", "2", foreign_sender);
+        foreign.conn_id = 4;
+        driver.sessions.insert(foreign_key.clone(), foreign);
+    }
+    let registry = registry_with(&[owned_key.clone(), foreign_key.clone()]);
+
+    cleanup_conn_sessions(&state, 3, &owned_sender, &registry).await;
+    {
+        let driver = state.driver.read().await;
+        assert!(
+            !driver.sessions.contains_key(&owned_key),
+            "本连接登记的会话必须被清理"
+        );
+        assert!(
+            driver.sessions.contains_key(&foreign_key),
+            "别的连接的会话不能被误伤"
+        );
+    }
+    assert!(
+        registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty(),
+        "登记表随会话回收"
+    );
+
+    // 幂等：重复调用不 panic、不改变结果、不误清别的连接。
+    cleanup_conn_sessions(&state, 3, &owned_sender, &registry).await;
+    assert!(state
+        .driver
+        .read()
+        .await
+        .sessions
+        .contains_key(&foreign_key));
+}
+
+/// 连接已经收尾（登记表里没有它）之后才到的 tabs 快照，落库必须是
+/// **已断开**，不能插成 active 的幽灵会话——否则 daemon 永不空闲退出。
+#[tokio::test]
+async fn snapshot_from_a_closed_connection_is_stored_as_disconnected() {
+    let state = test_state();
+    let (sender, _receiver) = mpsc::channel::<String>(TEST_WS_QUEUE);
+    let tabs = |title: &'static str| -> Vec<crate::protocol::ExtTab> {
+        serde_json::from_value(json!([
+            { "id": 1, "url": "https://example.com", "title": title }
+        ]))
+        .expect("ext tabs")
+    };
+
+    // 1) 对照：连接仍在登记表里 → 正常活性。
+    ws_connections_lock(&state).insert(
+        42,
+        WsConn {
+            extension_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            token_fingerprint: None,
+            revoked: Arc::new(AtomicBool::new(false)),
+            session_registry: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            sender: sender.clone(),
+        },
+    );
+    apply_tabs_snapshot(
+        &state,
+        &sender,
+        42,
+        "browser-a".to_string(),
+        None,
+        "profile-a".to_string(),
+        None,
+        None,
+        crate::protocol::EXTENSION_PROTOCOL_VERSION,
+        Some(true),
+        tabs("alive"),
+        &std::sync::Mutex::new(HashSet::new()),
+    )
+    .await;
+    assert!(
+        state
+            .driver
+            .read()
+            .await
+            .sessions
+            .values()
+            .all(|session| session.is_active()),
+        "连接还在时快照必须落成 active"
+    );
+
+    // 2) 连接收尾之后快照才到（refresh 兜底的竞态）→ 必须按断开落库。
+    ws_connections_lock(&state).remove(&42);
+    let late_key = crate::protocol::make_session_key("browser-a", "profile-a", "2");
+    apply_tabs_snapshot(
+        &state,
+        &sender,
+        42,
+        "browser-a".to_string(),
+        None,
+        "profile-a".to_string(),
+        None,
+        None,
+        crate::protocol::EXTENSION_PROTOCOL_VERSION,
+        Some(true),
+        serde_json::from_value(json!([
+            { "id": 2, "url": "https://late.example", "title": "late" }
+        ]))
+        .expect("ext tabs"),
+        &std::sync::Mutex::new(HashSet::new()),
+    )
+    .await;
+    let driver = state.driver.read().await;
+    let late = driver.sessions.get(&late_key).expect("迟到的会话仍要落库");
+    assert!(
+        late.disconnected_at.is_some(),
+        "连接已注销时快照晚到必须落成 disconnected（幽灵会话）"
+    );
+    assert!(
+        driver
+            .sessions
+            .values()
+            .filter(|session| session.browser_id == "browser-a"
+                && session.profile_id == "profile-a"
+                && session.tab_id == "2")
+            .all(|session| !session.is_active()),
+        "幽灵会话不能是可操作状态"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 幂等中间件：错误不缓存 / 并发同 key 只执行一次 / 占位随取消释放
+// ---------------------------------------------------------------------------
+
+static IDEMPOTENCY_FAIL_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+async fn idempotency_failing_probe() -> Response {
+    IDEMPOTENCY_FAIL_COUNT.fetch_add(1, Ordering::SeqCst);
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "ok": false, "error_code": "probe_failed" })),
+    )
+        .into_response()
+}
+
+/// 失败响应不能进缓存，同 key 重发必须真的重跑
+/// （否则幂等键会变成"永久失败锁"）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idempotency_does_not_cache_error_responses() {
+    // 测试只关心内存表，关掉落盘避免污染用户目录。
+    std::env::set_var("ATB_IDEMPOTENCY_PERSIST", "off");
+    let state = test_state();
+    let probe = state.clone();
+    let router = Router::new()
+        .route("/probe", post(idempotency_failing_probe))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            idempotency_replay,
+        ))
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+
+    for _ in 0..2 {
+        let status = tokio::task::spawn_blocking(move || {
+            reqwest::blocking::Client::new()
+                .post(format!("http://{addr}/probe"))
+                .header("x-atb-idempotency-key", "fail-key")
+                .header("content-type", "application/json")
+                .body(r#"{"probe":1}"#)
+                .send()
+                .unwrap()
+                .status()
+        })
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(
+        IDEMPOTENCY_FAIL_COUNT.load(Ordering::SeqCst),
+        2,
+        "失败响应不能进缓存：同 key 重发必须真的再执行一次"
+    );
+    assert!(
+        probe.idempotency.lock().await.is_empty(),
+        "失败响应不能留下 Done 条目"
+    );
+    server.abort();
+}
+
+static IDEMPOTENCY_SLOW_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+async fn idempotency_slow_probe() -> Json<Value> {
+    IDEMPOTENCY_SLOW_COUNT.fetch_add(1, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    Json(json!({ "ok": true }))
+}
+
+/// 同一个 key 并发时，只有首个请求真正执行，第二个等它的
+/// 完成通知后回放（不能"两个都执行一次"）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idempotency_concurrent_same_key_executes_once() {
+    std::env::set_var("ATB_IDEMPOTENCY_PERSIST", "off");
+    let state = test_state();
+    let router = Router::new()
+        .route("/probe", post(idempotency_slow_probe))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            idempotency_replay,
+        ))
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+
+    let call = move || {
+        reqwest::blocking::Client::new()
+            .post(format!("http://{addr}/probe"))
+            .header("x-atb-idempotency-key", "slow-key")
+            .header("content-type", "application/json")
+            .body(r#"{"probe":1}"#)
+            .send()
+            .unwrap()
+            .json::<Value>()
+            .unwrap()
+    };
+    let first = tokio::task::spawn_blocking(call);
+    // 让首个请求先进入 handler（拿到占位并开始执行）。
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let second = tokio::task::spawn_blocking(call);
+    let (first, second) = (first.await.unwrap(), second.await.unwrap());
+
+    assert_eq!(
+        IDEMPOTENCY_SLOW_COUNT.load(Ordering::SeqCst),
+        1,
+        "同 key 并发只能执行一次"
+    );
+    assert_eq!(first["ok"], json!(true));
+    assert_eq!(second["ok"], json!(true));
+    assert!(
+        second.get("idempotent_replay") == Some(&json!(true))
+            || first.get("idempotent_replay") == Some(&json!(true)),
+        "等待者必须拿到回放标记，否则调用方无法区分'刚执行'与'重复请求'"
+    );
+    server.abort();
+}
+
+/// 首个请求被取消（客户端断开、task abort）时，
+/// `Pending` 占位必须由 Drop 守卫释放，否则同 key 会被永久钉在 504 上。
+#[tokio::test]
+async fn idempotency_pending_slot_is_released_when_the_lead_is_cancelled() {
+    let state = test_state();
+    let cache_key = "default|guard-key".to_string();
+    let scope = "default|POST|/probe||0000000000000000".to_string();
+
+    let notify = match claim_idempotency_slot(
+        &state,
+        &cache_key,
+        &scope,
+        "guard-key",
+        Duration::from_millis(500),
+    )
+    .await
+    {
+        SlotDecision::Lead(notify) => notify,
+        _ => panic!("首个请求必须拿到占位"),
+    };
+
+    let task = tokio::spawn({
+        let state = state.clone();
+        let cache_key = cache_key.clone();
+        let scope = scope.clone();
+        async move {
+            // 与中间件同构：拿到占位后挂上守卫，然后"永远不完成"。
+            let _guard = IdempotencySlotGuard::new(state, cache_key, scope, notify);
+            std::future::pending::<()>().await;
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        matches!(
+            state
+                .idempotency
+                .lock()
+                .await
+                .get(&cache_key)
+                .map(|slot| &slot.entry),
+            Some(IdempotencyEntry::Pending(_))
+        ),
+        "执行期间槽位必须是 Pending"
+    );
+
+    task.abort();
+    let _ = task.await;
+    // Drop 里的清理是 spawn 出去的，轮询等它跑完（最多 500ms）。
+    let mut released = false;
+    for _ in 0..50 {
+        if state.idempotency.lock().await.get(&cache_key).is_none() {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        released,
+        "首个请求被取消后占位必须释放，否则同 key 永久 504"
+    );
+    assert!(
+        matches!(
+            claim_idempotency_slot(
+                &state,
+                &cache_key,
+                &scope,
+                "guard-key",
+                Duration::from_millis(500)
+            )
+            .await,
+            SlotDecision::Lead(_)
+        ),
+        "释放之后同 key 必须能重新抢到占位"
+    );
 }

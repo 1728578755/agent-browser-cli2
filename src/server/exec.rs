@@ -55,7 +55,7 @@ pub(crate) async fn exec(
             }
         }
         Err(err) => {
-            // 受限站点人话化（/ impl-actions 交叉依赖）：旧实现把 Chrome 原文
+            // 受限站点人话化（impl-actions 交叉依赖）：旧实现把 Chrome 原文
             // 「Cannot access a chrome-extension:// URL of different extension」原样
             // 返回，调用方不知道这是页面隔离、也不知道还有无 eval 通道可用。
             // 这里在错误组装出口统一翻译：稳定 error_code:"page_protected" +
@@ -138,10 +138,17 @@ pub(crate) async fn exec_value(
         &target_options,
     )
     .await?;
-    // 注意：`--max-bytes` 是按**字符**计的上限（与 --max-chars 同口径），
-    // 字段名沿用历史叫法只为保持线协议兼容。
-    if let Some(max_chars) = req.max_bytes.filter(|value| *value > 0) {
-        let truncated = truncate_json_value_chars(&mut result, max_chars);
+    // 预算：`--max-bytes` 显式给了就优先（`0` 表示不限，历史语义），没给就用
+    // daemon 侧默认 `ATB_EXEC_MAX_BYTES`。直连 API 的调用方从来不传
+    // --max-bytes，旧实现等于完全不截断——一条 exec 就能把几百 MB 回包甩给客户端。
+    // 注意：口径是**字符**（与 --max-chars 同口径），字段名沿用历史叫法只为
+    // 保持线协议兼容。
+    let budget = match req.max_bytes {
+        Some(explicit) => explicit,
+        None => crate::settings::exec_max_bytes(),
+    };
+    if budget > 0 {
+        let truncated = truncate_json_value_chars(&mut result, budget);
         if truncated {
             result["truncated"] = json!(true);
         }
@@ -213,6 +220,20 @@ pub(crate) async fn exec_value(
                 result["wait_error"] = json!(message.clone());
             }
         }
+        // `wait.value` 是谓词返回的任意值（有的站点直接返回整页 innerHTML），
+        // 而上面的截断发生在合并之前 —— 它一直不受预算约束。这里用**同一个**预算
+        // 再截一次，并标 `truncated` 让调用方知道 wait 段被削过。
+        if budget > 0 {
+            if let Some(slot) = result
+                .get_mut("js_return")
+                .and_then(|value| value.get_mut("wait"))
+                .and_then(|value| value.get_mut("value"))
+            {
+                if truncate_json_slot_chars(slot, budget) {
+                    result["truncated"] = json!(true);
+                }
+            }
+        }
     }
     Ok(result)
 }
@@ -246,7 +267,7 @@ pub(crate) async fn execute_page_js_with_target(
     execute_page_js_inner(state, script, selector, no_monitor, timeout, options, true).await
 }
 
-/// 与 [`execute_page_js_with_target`] 相，但**注入完成就释放会话锁**。
+/// 与 [`execute_page_js_with_target`] 相同，但**注入完成就释放会话锁**。
 ///
 /// 用于「一次注入、在页面里等很久」的等待类调用（`wait --selector/--text` 的
 /// MutationObserver 分支）：锁跟着等会把同一标签上的 read / click 全部堵死，
@@ -550,7 +571,7 @@ pub(crate) async fn execute_raw_js_inner(
         payload_value["allFrames"] = json!(true);
     }
     let payload = payload_value.to_string();
-    //  「迟到副作用」防护：派发前先看剩余预算。剩不到 50ms 时连一次往返都
+    // 「迟到副作用」防护：派发前先看剩余预算。剩不到 50ms 时连一次往返都
     // 跑不完，派发出去只会在页面里留下一个**没人等的副作用**（调用方早已超时离开，
     // 这里却还是把 click / POST 打出去了）。明确报「未派发、可重试」。
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -580,9 +601,12 @@ pub(crate) async fn execute_raw_js_inner(
             tx,
         },
     );
-    if sender.send(payload).is_err() {
+    // 下行命令通道改有界，发送必须走 `send_downstream`，让「队列满」
+    // 变成结构化 `ws_backpressure` 而不是无限积压（也不能像旧实现那样把 `send`
+    // 的错误直接吞成一句「连接已断开」）。
+    if let Err(err) = crate::server::ws::send_downstream(&sender, payload).await {
         state.execs.lock().await.take(&exec_id);
-        return Err(anyhow!("浏览器扩展连接已断开"));
+        return Err(err);
     }
     // 只要「注入」这一步串行就够了；等待结果期间没必要占着锁。
     if !hold_lock {
@@ -605,7 +629,7 @@ pub(crate) async fn execute_raw_js_inner(
             // 只走已建立的 sender 直发：此刻串行锁可能还在手上（hold_lock），
             // 再走 extension_control 会二次排队甚至自锁；发送失败只记 warning，
             // 绝不改变下面的原始超时错误。
-            notify_exec_cancel(&sender, &exec_id, &tab_id, "exec_timeout");
+            notify_exec_cancel(&sender, &exec_id, &tab_id, "exec_timeout").await;
             // 超时必须作为失败返回：旧行为返回 ok:true + 一段提示字符串，
             // 智能体会误判成功并继续下一步，页面状态已经错乱。
             let detail = if acked {
@@ -635,8 +659,8 @@ pub(crate) async fn execute_raw_js_inner(
 /// 会话锁 + 一次完整往返；而调用点恰恰是「预算已耗尽、串行锁可能仍被本请求持有」，
 /// 再排队会自锁。这里直接复用扩展连接的 sender（无锁、无等待）。
 /// 发送失败只记 warning —— 原始超时错误必须原样返回。
-fn notify_exec_cancel(
-    sender: &mpsc::UnboundedSender<String>,
+async fn notify_exec_cancel(
+    sender: &mpsc::Sender<String>,
     exec_id: &str,
     tab_id: &str,
     reason: &str,
@@ -654,8 +678,18 @@ fn notify_exec_cancel(
         "tabId": tab,
         "reason": reason,
     });
-    if sender.send(frame.to_string()).is_err() {
-        eprintln!("exec: cancel 帧发送失败（扩展连接已断开）exec_id={exec_id}");
+    // 这里不能等满 `send_downstream` 的默认 10s 入队窗口：调用点已判定预算耗尽，
+    // 再花 10s 等队列只会把「超时」拖成「超时 + 10s」。给 500ms 即可 ——
+    // 队列空时立刻成功，满时说明对端确实读不动，cancel 丢掉也不影响错误语义。
+    if crate::server::ws::send_downstream_within(
+        sender,
+        frame.to_string(),
+        Duration::from_millis(500),
+    )
+    .await
+    .is_err()
+    {
+        eprintln!("exec: cancel 帧未能下发（扩展连接已断开或下行队列拥塞）exec_id={exec_id}");
     }
 }
 
@@ -748,6 +782,18 @@ pub(crate) async fn wait_for_js_condition(
         &ExecTargetOptions::default(),
     )
     .await
+}
+
+pub(crate) const WAIT_JS_EVAL_BLOCKED: &str = "wait_js_eval_blocked";
+
+/// 页面通道是否明确回报「页面 CSP 禁止运行时编译字符串谓词」。
+///
+/// 只认契约码 `wait_js_eval_blocked`（CONTRACT §3.2）：`page_wait.js` 把
+/// **CSP 拦截**归到这个码，把**谓词语法错/空谓词**留在 `js_predicate_compile_failed`。
+/// 后者换 CDP 也救不回来（同一个 SyntaxError），走回退只会多绕一次往返并给出
+/// 更奇怪的 `cdp-eval` 报错，所以不触发回退。
+fn is_wait_js_eval_blocked(payload: &Value) -> bool {
+    payload.get("error_code").and_then(Value::as_str) == Some(WAIT_JS_EVAL_BLOCKED)
 }
 
 pub(crate) async fn wait_for_js_condition_with_target(
@@ -843,6 +889,24 @@ pub(crate) async fn wait_for_js_condition_with_target(
                     .unwrap_or(Value::Null);
                 let checks = payload.get("checks").and_then(Value::as_u64).unwrap_or(0);
                 checks_total += checks.max(1);
+                // 页面 CSP 禁 unsafe-eval 时字符串谓词编译不了。页面通道已经
+                // 没有别的办法，这里改用 CDP `Runtime.evaluate` 轮询到 deadline ——
+                // 走的是**同一条**已建立的调试器通道（cdp_call → 扩展 cdp 命令），
+                // 不额外 attach 连接。返回形状与页面通道一致，调用方无需分支。
+                if is_wait_js_eval_blocked(&payload) {
+                    return cdp_wait_for_js_condition(
+                        state,
+                        session_key,
+                        wait_js,
+                        deadline,
+                        Duration::from_millis(interval_ms),
+                        cancel,
+                        target,
+                        injections,
+                        checks_total,
+                    )
+                    .await;
+                }
                 if payload
                     .get("matched")
                     .and_then(Value::as_bool)
@@ -893,6 +957,23 @@ pub(crate) async fn wait_for_js_condition_with_target(
                 // 换页 / 执行上下文销毁 / 注入被拒：换页后条件可能已经成立，
                 // 不能直接判失败，按剩余时间重试。
                 let message = err.to_string();
+                // 注入通道把「CSP 拒绝编译」升级成整条命令的错误时（而不是
+                // 回一个带 error_code 的载荷），同样切到 CDP，否则 CSP 页面无解。
+                // 只认契约码：语法错（`js_predicate_compile_failed`）换通道也救不回来。
+                if message.contains(WAIT_JS_EVAL_BLOCKED) {
+                    return cdp_wait_for_js_condition(
+                        state,
+                        session_key,
+                        wait_js,
+                        deadline,
+                        Duration::from_millis(interval_ms),
+                        cancel,
+                        target,
+                        injections,
+                        checks_total,
+                    )
+                    .await;
+                }
                 repeated_error = if last_error.as_deref() == Some(message.as_str()) {
                     repeated_error + 1
                 } else {
@@ -923,4 +1004,207 @@ pub(crate) async fn wait_for_js_condition_with_target(
         "mode": "js-observer",
         "injections": injections
     }))
+}
+
+/// 把 `--wait-js` 谓词包成 CDP `Runtime.evaluate` 的表达式形态。
+///
+/// 页面通道编译谓词时试三种写法（裸表达式 / `return x` / 多语句），CDP 的
+/// `expression` 只有表达式上下文，所以这里准备两份候选：先按裸表达式求值，
+/// 编译失败（SyntaxError）再退到「函数体」形态。两份候选都与页面侧等价：
+/// 顶层 `return` 只有语句形态能编译，多语句同理。
+fn cdp_expression_form(code: &str) -> String {
+    let trimmed = code.trim().trim_end_matches(';').trim_end();
+    format!("(async () => ({trimmed}\n))()")
+}
+
+fn cdp_statement_form(code: &str) -> String {
+    let trimmed = code.trim();
+    format!("(async () => {{\n{trimmed}\n}})()")
+}
+
+/// JS 真值语义（`Runtime.evaluate` 回的是 JSON 值，Rust 侧没有 `if (x)`）。
+fn js_truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(flag) => *flag,
+        Value::Number(number) => number
+            .as_f64()
+            .map(|f| f != 0.0 && !f.is_nan())
+            .unwrap_or(false),
+        Value::String(text) => !text.is_empty(),
+        Value::Array(_) | Value::Object(_) => true,
+    }
+}
+
+/// 页面通道因 CSP 编译不了字符串谓词时，改用 CDP `Runtime.evaluate` 轮询。
+///
+/// 为什么 `Runtime.evaluate` 不受页面 CSP 约束：它由调试器协议执行，不经过页面的
+/// `unsafe-eval` 检查。这里**复用** `cdp_call` 的既有通道（扩展 cdp 命令 + 同一条
+/// 已建立的调试器会话），不新开连接、不重复 attach。
+///
+/// 返回形状与页面通道对齐：成功 `{ok:true, matched:true, value, polls, mode:"cdp-eval"}`，
+/// 失败 `{ok:false, matched:false, value, error, error_code:"wait_js_failed"}`。
+/// 子 frame（`target.frame_id`）在这一通道上无法定向，回包用
+/// `frame_fallback:"main"` 明示这次求值发生在主框架。
+#[allow(clippy::too_many_arguments)]
+async fn cdp_wait_for_js_condition(
+    state: &AppState,
+    session_key: Option<&str>,
+    wait_js: &str,
+    deadline: Instant,
+    interval: Duration,
+    cancel: Option<&AtomicBool>,
+    target: &ExecTargetOptions,
+    injections: u64,
+    checks_base: u64,
+) -> Result<Value> {
+    let Some(session_key) = session_key else {
+        // 没有确定会话时无从 attach：如实回报「换通道也失败了」，别假装还在等。
+        return Ok(json!({
+            "ok": false,
+            "matched": false,
+            "value": Value::Null,
+            "error": "wait_js_eval_blocked：页面禁止运行时编译字符串谓词，且当前没有可定位的会话，无法改用 CDP 求值",
+            "error_code": WAIT_JS_EVAL_BLOCKED,
+            "polls": checks_base.max(injections),
+            "checks": checks_base,
+            "mode": "cdp-eval",
+            "injections": injections,
+        }));
+    };
+    const METHOD: &str = "Runtime.evaluate";
+    let expr_form = cdp_expression_form(wait_js);
+    let stmt_form = cdp_statement_form(wait_js);
+    let mut use_statement_form = false;
+    let mut polls = checks_base;
+    let mut last_value = Value::Null;
+    let mut last_error: Option<String> = None;
+    let mut repeated_error: u32 = 0;
+    loop {
+        if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Ok(json!({
+                "ok": false,
+                "matched": false,
+                "cancelled": true,
+                "value": last_value,
+                "error": "cancelled",
+                "polls": polls.max(injections),
+                "checks": polls,
+                "mode": "cdp-eval",
+                "injections": injections,
+            }));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        polls += 1;
+        let expression = if use_statement_form {
+            stmt_form.clone()
+        } else {
+            expr_form.clone()
+        };
+        // 单次求值自身只该花毫秒级：给 5s 上限，剩下的预算留给下一轮。
+        let call_timeout = remaining.min(Duration::from_secs(5));
+        let params = json!({
+            "expression": expression,
+            "returnByValue": true,
+            "awaitPromise": true,
+        });
+        match cdp_call(state, session_key, METHOD, params, call_timeout).await {
+            Ok(result) if result.ok => {
+                let data = result.data.unwrap_or(Value::Null);
+                if let Some(details) = data.get("exceptionDetails") {
+                    let text = details
+                        .get("exception")
+                        .and_then(|exception| exception.get("description"))
+                        .or_else(|| details.get("text"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("Runtime.evaluate 抛出异常")
+                        .to_string();
+                    // 第一候选是「裸表达式」：编译失败说明谓词是语句形态（顶层 return /
+                    // 多语句），换第二候选再试一次；这不是执行错误，不能算失败。
+                    if !use_statement_form
+                        && details
+                            .get("exception")
+                            .and_then(|exception| exception.get("className"))
+                            .and_then(Value::as_str)
+                            == Some("SyntaxError")
+                    {
+                        use_statement_form = true;
+                        continue;
+                    }
+                    last_error = Some(text);
+                    break;
+                }
+                let value = data
+                    .get("result")
+                    .and_then(|object| object.get("value"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                if js_truthy(&value) {
+                    let mut ok = json!({
+                        "ok": true,
+                        "matched": true,
+                        "value": value,
+                        "error": Value::Null,
+                        "polls": polls,
+                        "checks": polls,
+                        "mode": "cdp-eval",
+                        "injections": injections,
+                    });
+                    // 子 frame 的谓词在 CDP 这条通道上只能落到主框架，明示而不是静默。
+                    if target.frame_id.is_some() {
+                        ok["frame_fallback"] = json!("main");
+                    }
+                    return Ok(ok);
+                }
+                last_value = value;
+                repeated_error = 0;
+            }
+            Ok(result) => {
+                last_error = result
+                    .error
+                    .or_else(|| Some("Runtime.evaluate 回包为失败".to_string()));
+                repeated_error += 1;
+                if repeated_error >= 2 {
+                    break;
+                }
+            }
+            Err(err) => {
+                let err = translate_page_protected_error(err);
+                last_error = Some(err.to_string());
+                // 受限站点 / 禁用调试器：这条通道本就不可能成功，立即收手。
+                if err.downcast_ref::<PageProtectedError>().is_some()
+                    || err.to_string().contains("ATB_NO_DEBUGGER")
+                {
+                    break;
+                }
+                repeated_error += 1;
+                if repeated_error >= 3 {
+                    break;
+                }
+            }
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        tokio::time::sleep(interval.min(remaining)).await;
+    }
+    let mut failed = json!({
+        "ok": false,
+        "matched": false,
+        "value": last_value,
+        "error": last_error,
+        "error_code": "wait_js_failed",
+        "polls": polls.max(injections),
+        "checks": polls,
+        "mode": "cdp-eval",
+        "injections": injections,
+    });
+    if target.frame_id.is_some() {
+        failed["frame_fallback"] = json!("main");
+    }
+    Ok(failed)
 }

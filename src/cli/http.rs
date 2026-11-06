@@ -16,7 +16,7 @@ pub(crate) fn absolutize_path(raw: &str) -> String {
     absolutize_path_inner(raw).0
 }
 
-/// 同 [`absolutize_path`]，额外返回「是否发生了非 UTF-8 有损转换」。
+/// 同 [`absolutize_path`]，额外返回「是否发生了非 有损转换」。
 ///
 /// `Path::to_string_lossy` 会把无法解码的字节替换成 U+FFFD：路径本身仍然「看起来
 /// 正常」，但 daemon 打开的是另一个不存在的文件。调用方应把 `lossy=true` 写进回包
@@ -38,6 +38,16 @@ fn absolutize_path_inner(raw: &str) -> (String, bool) {
     } else {
         PathBuf::from(trimmed)
     };
+    // Windows 盘符相对路径（`C:foo.png`）：`is_absolute()` 为 false，而 `cwd.join()`
+    // 碰到盘符前缀会**直接返回参数本身**（盘符截断了基准路径），于是下发前仍是
+    // `C:foo.png`，daemon 按 home 解析到别处。`std::path::absolute` 走
+    // GetFullPathNameW，按 Windows 自己的「C: 盘当前目录」语义展开。
+    #[cfg(windows)]
+    let expanded = if is_drive_relative(&expanded) {
+        std::path::absolute(&expanded).unwrap_or(expanded)
+    } else {
+        expanded
+    };
     let absolute = if expanded.is_absolute() {
         expanded
     } else {
@@ -48,19 +58,34 @@ fn absolutize_path_inner(raw: &str) -> (String, bool) {
     };
     // `cwd.join("./x.pdf")` 会保留 `./` 片段，报错信息里出现 `...\./x.pdf` 这种混合分隔符。
     let cleaned_path = path_clean::clean(&absolute);
-    // 先判断再 lossy：`to_str()` 为 None 才说明原始字节不是合法 UTF-8。
+    // 先判断再 lossy：`to_str` 为 None 才说明原始字节不是合法。
     let lossy = cleaned_path.to_str().is_none();
     let cleaned = cleaned_path.to_string_lossy().to_string();
     // Windows 上 Chrome 的 `DOM.setFileInputFiles` 只认反斜杠路径：传 `E:/a/b.pdf`
-    // 会「命令成功但文件没挂上」（的一个真实触发面）。
+    // 会「命令成功但文件没挂上」（一个真实触发面）。
     #[cfg(windows)]
     let cleaned = cleaned.replace('/', "\\");
     (cleaned, lossy)
 }
 
+/// Windows 盘符相对路径：`C:foo`（有盘符，但第三个字符不是分隔符）。
+///
+/// `C:foo` 与 `C:\foo` 是两种不同语义：前者相对「C 盘的当前目录」，后者才是绝对路径。
+#[cfg(windows)]
+fn is_drive_relative(path: &Path) -> bool {
+    let Some(raw) = path.to_str() else {
+        return false;
+    };
+    let bytes = raw.as_bytes();
+    if bytes.len() < 2 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' {
+        return false;
+    }
+    !matches!(bytes.get(2), Some(b'/') | Some(b'\\'))
+}
+
 /// 只对「确实是本地路径字段」的键做绝对化，避免误改选择器/URL。
 ///
-/// 任一字段发生非 UTF-8 有损转换时，在 payload 顶层写 `path_lossy: true`。
+/// 任一字段发生非 有损转换时，在 payload 顶层写 `path_lossy: true`。
 pub(crate) fn absolutize_payload_paths(payload: &mut Value, keys: &[&str]) {
     let Some(object) = payload.as_object_mut() else {
         return;
@@ -116,7 +141,7 @@ pub(crate) fn http_client() -> Result<&'static Client> {
     // 改为可配置 `ATB_HTTP_NO_PROXY`（默认 `true` 保持现状）。需要把本地
     // 请求交给抓包代理（Charles/mitmproxy）排查时设 `ATB_HTTP_NO_PROXY=0`。
     let mut builder = Client::builder();
-    if crate::settings::env_bool("ATB_HTTP_NO_PROXY", true) {
+    if crate::settings::http_no_proxy() {
         builder = builder.no_proxy();
     }
     let built = builder.build()?;
@@ -336,6 +361,24 @@ pub(crate) fn request(
     unreachable!("request 的两轮重试必定有返回值")
 }
 
+/// 为单条子请求派生稳定的幂等子键。
+///
+/// 只依赖「方法 + URL + 请求体」：同一条命令重跑时子请求内容一致 → 子键一致，
+/// 仍能命中 60s 回放；多请求命令的不同子请求（不同 tab/body）自然分开。
+/// `DefaultHasher::new()` 使用固定键，不是 RandomState，跨进程稳定。
+fn derive_idempotency_key(base: &str, method: &str, url: &str, payload: &Option<Value>) -> String {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    method.hash(&mut hasher);
+    url.hash(&mut hasher);
+    payload
+        .as_ref()
+        .map(Value::to_string)
+        .unwrap_or_default()
+        .hash(&mut hasher);
+    format!("{base}:{:016x}", hasher.finish())
+}
+
 /// 发一次请求并把回包解析成 JSON；不处理 token 重试，也不把 401 翻译成人话。
 ///
 /// 分成两步是为了让 `request` 能在「token 过期」时重发一次：回包必须先解析出来
@@ -361,7 +404,16 @@ fn send_once(
     let builder = builder.header(AGENT_HEADER, agent_id());
     // 幂等键：CLI 全局 flag 透传给 daemon，daemon 对 60s 内同 key 的
     // POST 回放首次响应。旧版 daemon 忽略未知 header，向后兼容。
-    let builder = match IDEMPOTENCY_KEY.get() {
+    //
+    // 一个 `--idempotency-key` 不能原样挂到多请求命令的每一条 POST 上
+    // （`close --tab a,b` 循环 /close、scrape 的 /open + 每个标签 /exec）。daemon 的
+    // 幂等 scope 是 method+path+body，同 key 不同 scope 会直接 409，命令只执行第一条。
+    // 这里按请求内容派生稳定子键：同一条子请求重发仍能回放，不同子请求互不冲突。
+    let builder = match IDEMPOTENCY_KEY
+        .get()
+        .filter(|_| method == "POST")
+        .map(|key| derive_idempotency_key(key, method, url, payload))
+    {
         Some(key) => builder.header("x-atb-idempotency-key", key),
         None => builder,
     };
@@ -728,4 +780,60 @@ pub(crate) fn browser_targets_snapshot() -> Result<Vec<(String, String)>> {
             Some((key.to_string(), url.to_string()))
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 相对路径必须以**当前 shell 的 cwd** 为基准绝对化。
+    #[test]
+    fn absolutize_relative_path_uses_cwd() {
+        let out = absolutize_path("shots/a.png");
+        assert!(Path::new(&out).is_absolute(), "应绝对化，实际 {out}");
+    }
+
+    /// D11 / `C:foo.png` 既不是绝对路径，也不能靠 `cwd.join`（盘符会截断
+    /// 基准路径）。下发前必须是绝对路径。
+    #[cfg(windows)]
+    #[test]
+    fn absolutize_drive_relative_path() {
+        let out = absolutize_path("C:atb-closeout-dryrun-probe.png");
+        assert!(Path::new(&out).is_absolute(), "应绝对化，实际 {out}");
+        assert!(out.starts_with("C:\\"), "应落在 C 盘，实际 {out}");
+    }
+
+    /// 已经是绝对路径的盘符路径不能被改写。
+    #[cfg(windows)]
+    #[test]
+    fn absolutize_drive_absolute_path_kept() {
+        let out = absolutize_path(r"C:\Windows\Temp\atb-closeout.png");
+        assert_eq!(out, r"C:\Windows\Temp\atb-closeout.png");
+        assert!(!is_drive_relative(Path::new(&out)));
+    }
+
+    /// 空串保持原样：调用方用它表示「没传」，不能被绝对化成一个目录。
+    #[test]
+    fn absolutize_empty_returns_empty() {
+        assert_eq!(absolutize_path("   "), "   ");
+    }
+
+    /// 多请求命令（close 多标签 / scrape）不能共用一个裸幂等键，
+    /// 否则 daemon 的 scope 判定会让第 2 个请求 409。子键只依赖请求内容，
+    /// 同一条命令重跑仍然命中回放。
+    #[test]
+    fn idempotency_subkey_is_stable_and_body_sensitive() {
+        let url = format!("http://{HOST}:{PORT}/close");
+        let first = derive_idempotency_key("K", "POST", &url, &Some(json!({ "tab_id": "a" })));
+        let again = derive_idempotency_key("K", "POST", &url, &Some(json!({ "tab_id": "a" })));
+        let other_tab = derive_idempotency_key("K", "POST", &url, &Some(json!({ "tab_id": "b" })));
+        let other_path = format!("http://{HOST}:{PORT}/exec");
+        let other_url =
+            derive_idempotency_key("K", "POST", &other_path, &Some(json!({ "tab_id": "a" })));
+
+        assert!(first.starts_with("K:"), "子键应保留用户 key 前缀：{first}");
+        assert_eq!(first, again, "同一请求必须派生同一个子键（否则无法回放）");
+        assert_ne!(first, other_tab, "不同 body 必须派生不同子键（否则 409）");
+        assert_ne!(first, other_url, "不同 URL 必须派生不同子键");
+    }
 }

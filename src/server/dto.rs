@@ -1,19 +1,24 @@
 use super::*;
 
+/// `/scan` 请求体。`tabs_only`/`text_only` 这类布尔字段以前传成
+/// `tabsOnly` 会被 serde 静默丢掉，命令照样成功却扫了整页——请求 DTO 一律
+/// 拒绝未知字段，历史 camelCase 写法则用 `alias` 兜住。
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ScanRequest {
-    #[serde(default)]
+    #[serde(default, alias = "tabsOnly")]
     pub(crate) tabs_only: bool,
+    #[serde(alias = "switchTabId")]
     pub(crate) switch_tab_id: Option<String>,
     pub(crate) browser: Option<String>,
     pub(crate) profile: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "textOnly")]
     pub(crate) text_only: bool,
     /// 快速模式：单次注入的紧凑文本抽取，超大页面也不整页序列化。
     #[serde(default)]
     pub(crate) fast: bool,
     /// 节点/元素处理上限（0 表示默认）。
-    #[serde(default)]
+    #[serde(default, alias = "maxNodes")]
     pub(crate) max_nodes: Option<usize>,
     /// 页面内容抓取上限（秒）。
     #[serde(default)]
@@ -23,42 +28,53 @@ pub(crate) struct ScanRequest {
 /// `/exec` 请求体。
 ///
 /// `deny_unknown_fields`：字段名写错（`waitTimeout` vs `wait_timeout`）
-/// 以前会被静默忽略，命令照常成功、参数却没生效。这里只对 daemon 内部请求 DTO
-/// 收紧；CLI 与实际字段严格一致。对外兼容用的宽松 DTO（`ScanRequest` 等
-/// 带大量可选字段、会被旧脚本直接打 HTTP 的）保持宽松。
+/// 以前会被静默忽略，命令照常成功、参数却没生效。旧调用方用过 camelCase 的
+/// 历史字段用 `alias` 兜住，只有真正不存在的字段才报错。
+/// 响应侧 DTO（扩展回包）不加 `deny_unknown_fields`：daemon 必须容忍新扩展
+/// 多带字段，否则一次扩展升级就会让旧 daemon 全盘失败。
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ExecRequest {
     #[serde(default)]
     pub(crate) script: String,
+    #[serde(alias = "switchTabId")]
     pub(crate) switch_tab_id: Option<String>,
     pub(crate) browser: Option<String>,
     pub(crate) profile: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "noMonitor")]
     pub(crate) no_monitor: bool,
+    #[serde(alias = "waitJs")]
     pub(crate) wait_js: Option<String>,
-    #[serde(default = "default_wait_timeout")]
+    #[serde(default = "default_wait_timeout", alias = "waitTimeout")]
     pub(crate) wait_timeout: f64,
-    #[serde(default = "default_wait_interval")]
+    #[serde(default = "default_wait_interval", alias = "waitInterval")]
     pub(crate) wait_interval: f64,
     /// 页面脚本执行上限（秒）。后台长任务需要能放宽，默认 60 秒。
     #[serde(default)]
     pub(crate) timeout: Option<f64>,
-    /// 返回值上限（字符）。超出时返回截断预览，避免一条命令占满上下文。
-    #[serde(default)]
+    /// 返回值上限（字节）。超出时返回截断预览，避免一条命令占满上下文。
+    /// 不传时用 `ATB_EXEC_MAX_BYTES`。
+    #[serde(default, alias = "maxBytes")]
     pub(crate) max_bytes: Option<usize>,
     /// 执行环境：MAIN（默认，可访问页面变量）或 ISOLATED（不受页面 CSP 影响）。
     #[serde(default)]
     pub(crate) world: Option<String>,
     /// 指定 iframe 的 frameId；配合 frames 命令使用。
-    #[serde(default)]
+    #[serde(default, alias = "frameId")]
     pub(crate) frame_id: Option<i64>,
     /// 在标签页的所有 frame 里执行。
-    #[serde(default)]
+    #[serde(default, alias = "allFrames")]
     pub(crate) all_frames: bool,
 }
 
+/// `/open` 请求体。
+///
+/// `wait_for` / `warm` / `wait_for_timeout` 以前挂在 `open.rs` 的 `OpenRequestExt`
+/// 上（`#[serde(flatten)]` 包一层）。`flatten` 与 `deny_unknown_fields` 天然冲突
+/// （flatten 会把所有键先缓冲再分派，内层 deny 会把外层的字段全部当成未知），
+/// 直接把这三个字段并进共享结构，调用方 JSON 形状完全不变。
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct OpenRequest {
     pub(crate) target: Option<String>,
     /// 一次打开多个目标：daemon 内部并发执行，只占一个 HTTP 往返。
@@ -68,43 +84,61 @@ pub(crate) struct OpenRequest {
     pub(crate) cwd: Option<PathBuf>,
     #[serde(default = "default_active")]
     pub(crate) active: bool,
+    #[serde(alias = "switchTabId")]
     pub(crate) switch_tab_id: Option<String>,
     pub(crate) browser: Option<String>,
     pub(crate) profile: Option<String>,
     pub(crate) session: Option<String>,
+    #[serde(alias = "groupTitle")]
     pub(crate) group_title: Option<String>,
     #[serde(default)]
     pub(crate) window: bool,
-    #[serde(default)]
+    #[serde(default, alias = "allowFocus")]
     pub(crate) allow_focus: bool,
     /// 保持受控标签页不被 Chrome 内存节省机制丢弃，后台长任务必需。
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", alias = "keepAlive")]
     pub(crate) keep_alive: bool,
-    #[serde(default = "default_open_readiness_timeout")]
+    #[serde(default = "default_open_readiness_timeout", alias = "readinessTimeout")]
     pub(crate) readiness_timeout: f64,
     /// 打开后是否自动处理挑战页：auto（默认）| wait | off。
     #[serde(default)]
     pub(crate) challenge: Option<String>,
     /// 自动等待挑战的总超时（秒）。
-    #[serde(default)]
+    #[serde(default, alias = "challengeTimeout")]
     pub(crate) challenge_timeout: Option<f64>,
+    /// 打开后继续等待的页面条件：dom-quiet | selector:<CSS> | text:<文本>。
+    /// `networkidle` 仍接受，但实现是**近似**的「resource 计数 + DOM 稳定」采样，
+    /// 不是 CDP 在途请求计数。
+    #[serde(default, alias = "waitFor")]
+    pub(crate) wait_for: Option<String>,
+    /// 打开前先 ping 一次扩展，唤醒 service worker。
+    #[serde(default)]
+    pub(crate) warm: bool,
+    /// `--wait-for` 的等待预算（秒）。CLI 已按它扩了 HTTP 预算，
+    /// 服务端必须用**同一个**字段，否则「服务端还在等、CLI 先断开」的旧问题依旧。
+    /// 缺省时回落到 `readiness_timeout`（旧口径）。
+    #[serde(default, alias = "waitForTimeout")]
+    pub(crate) wait_for_timeout: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CleanupRequest {
     /// 不传就用当前请求的调用方身份。
     #[serde(default)]
     pub(crate) agent: Option<String>,
     /// 清理所有智能体打开过的标签页（默认只清自己）。
-    #[serde(default)]
+    #[serde(default, alias = "allAgents")]
     pub(crate) all_agents: bool,
     /// 只列出将要关闭的标签页。
-    #[serde(default)]
+    #[serde(default, alias = "dryRun")]
     pub(crate) dry_run: bool,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CloseRequest {
+    #[serde(alias = "tabId")]
     pub(crate) tab_id: String,
     pub(crate) browser: Option<String>,
     pub(crate) profile: Option<String>,
@@ -113,14 +147,16 @@ pub(crate) struct CloseRequest {
     /// CLI 先换算 id 再逐个关闭，两次请求之间标签可能被切换/重排。带上下发时
     /// daemon 在真正关闭前复核一次，不一致就拒绝，避免关错标签。旧 CLI 不传，
     /// 字段为 None 时行为不变（向后兼容）。
-    #[serde(default)]
+    #[serde(default, alias = "expectUrl")]
     pub(crate) expect_url: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "expectTitle")]
     pub(crate) expect_title: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SnapshotRequest {
+    #[serde(alias = "switchTabId")]
     pub(crate) switch_tab_id: Option<String>,
     pub(crate) browser: Option<String>,
     pub(crate) profile: Option<String>,
@@ -134,9 +170,9 @@ pub(crate) struct SnapshotRequest {
     #[serde(default)]
     pub(crate) js: bool,
     /// 只保留可操作元素（按钮/链接/输入框等），显著缩小大树。
-    #[serde(default)]
+    #[serde(default, alias = "interactiveOnly")]
     pub(crate) interactive_only: bool,
-    /// X-15：页面侧 `page_snapshot.js` 的 `skipGeneric` 开关（JS 侧默认 true，
+    /// 页面侧 `page_snapshot.js` 的 `skipGeneric` 开关（JS 侧默认 true，
     /// 跳过 generic 角色节点）。入站字段是 snake_case `skip_generic`
     /// （兼容 camelCase `skipGeneric`）；下发给页面脚本时才叫 `skipGeneric`。
     /// 以前 daemon 从不下发、CLI 也无对应 flag，属于「不可达配置」；
@@ -145,7 +181,7 @@ pub(crate) struct SnapshotRequest {
     #[serde(default, alias = "skipGeneric")]
     pub(crate) skip_generic: Option<bool>,
     /// 返回节点上限，超出截断（默认 0 表示不限制）。
-    #[serde(default)]
+    #[serde(default, alias = "maxNodes")]
     pub(crate) max_nodes: usize,
     #[serde(default = "default_high_level_timeout")]
     pub(crate) timeout: f64,
@@ -155,18 +191,21 @@ pub(crate) struct SnapshotRequest {
 #[serde(deny_unknown_fields)]
 pub(crate) struct TargetActionRequest {
     pub(crate) target: String,
+    #[serde(alias = "switchTabId")]
     pub(crate) switch_tab_id: Option<String>,
     pub(crate) browser: Option<String>,
     pub(crate) profile: Option<String>,
     #[serde(default)]
     pub(crate) monitor: bool,
+    #[serde(alias = "waitJs")]
     pub(crate) wait_js: Option<String>,
-    #[serde(default = "default_wait_timeout")]
+    #[serde(default = "default_wait_timeout", alias = "waitTimeout")]
     pub(crate) wait_timeout: f64,
-    #[serde(default = "default_wait_interval")]
+    #[serde(default = "default_wait_interval", alias = "waitInterval")]
     pub(crate) wait_interval: f64,
     #[serde(default = "default_high_level_timeout")]
     pub(crate) timeout: f64,
+    #[serde(alias = "frameId")]
     pub(crate) frame_id: Option<i64>,
 }
 
@@ -176,6 +215,7 @@ pub(crate) struct FillRequest {
     pub(crate) target: String,
     #[serde(default)]
     pub(crate) value: String,
+    #[serde(alias = "switchTabId")]
     pub(crate) switch_tab_id: Option<String>,
     pub(crate) browser: Option<String>,
     pub(crate) profile: Option<String>,
@@ -187,39 +227,45 @@ pub(crate) struct FillRequest {
     pub(crate) has_value: bool,
     #[serde(default)]
     pub(crate) monitor: bool,
+    #[serde(alias = "waitJs")]
     pub(crate) wait_js: Option<String>,
-    #[serde(default = "default_wait_timeout")]
+    #[serde(default = "default_wait_timeout", alias = "waitTimeout")]
     pub(crate) wait_timeout: f64,
-    #[serde(default = "default_wait_interval")]
+    #[serde(default = "default_wait_interval", alias = "waitInterval")]
     pub(crate) wait_interval: f64,
     #[serde(default = "default_high_level_timeout")]
     pub(crate) timeout: f64,
+    #[serde(alias = "frameId")]
     pub(crate) frame_id: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SendKeysRequest {
-    #[serde(default)]
+    #[serde(default, alias = "frameId")]
     pub(crate) frame_id: Option<i64>,
     pub(crate) keys: String,
     pub(crate) target: Option<String>,
+    #[serde(alias = "switchTabId")]
     pub(crate) switch_tab_id: Option<String>,
     pub(crate) browser: Option<String>,
     pub(crate) profile: Option<String>,
     #[serde(default)]
     pub(crate) monitor: bool,
+    #[serde(alias = "waitJs")]
     pub(crate) wait_js: Option<String>,
-    #[serde(default = "default_wait_timeout")]
+    #[serde(default = "default_wait_timeout", alias = "waitTimeout")]
     pub(crate) wait_timeout: f64,
-    #[serde(default = "default_wait_interval")]
+    #[serde(default = "default_wait_interval", alias = "waitInterval")]
     pub(crate) wait_interval: f64,
     #[serde(default = "default_high_level_timeout")]
     pub(crate) timeout: f64,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ScreenshotRequest {
+    #[serde(alias = "switchTabId")]
     pub(crate) switch_tab_id: Option<String>,
     pub(crate) browser: Option<String>,
     pub(crate) profile: Option<String>,
@@ -229,17 +275,19 @@ pub(crate) struct ScreenshotRequest {
     #[serde(default = "default_screenshot_format")]
     pub(crate) format: String,
     pub(crate) quality: Option<u8>,
-    #[serde(default)]
+    #[serde(default, alias = "fullPage")]
     pub(crate) full_page: bool,
     /// 整页拼图的设备像素总高上限（CDP 不可用时的回落通道使用）。
-    #[serde(default)]
+    #[serde(default, alias = "maxHeightPx")]
     pub(crate) max_height_px: Option<u32>,
     #[serde(default = "default_high_level_timeout")]
     pub(crate) timeout: f64,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SavePdfRequest {
+    #[serde(alias = "switchTabId")]
     pub(crate) switch_tab_id: Option<String>,
     pub(crate) browser: Option<String>,
     pub(crate) profile: Option<String>,
@@ -250,15 +298,21 @@ pub(crate) struct SavePdfRequest {
     pub(crate) landscape: bool,
     #[serde(default = "default_pdf_scale")]
     pub(crate) scale: f64,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", alias = "printBackground")]
     pub(crate) print_background: bool,
     /// 图片型 PDF 回落时整页拼图的高度上限（设备像素）。
-    #[serde(default)]
+    #[serde(default, alias = "maxHeightPx")]
     pub(crate) max_height_px: Option<u32>,
     #[serde(default = "default_high_level_timeout")]
     pub(crate) timeout: f64,
 }
 
+/// `/tabs` 查询参数。
+///
+/// 这里**不能**加 `deny_unknown_fields`：`tabs.rs` 的 `TabsQueryExt` 用
+/// `#[serde(flatten)]` 把它包在里面并追加了 `mine`，flatten 会把所有键先缓冲再
+/// 分派，内层 deny 会把外层字段一并当未知（serde 的 flatten 与 deny 语义互斥）。
+/// 未知参数仍由外层 wrapper 兜住，不在本结构上收紧。
 #[derive(Debug, Deserialize, Default)]
 pub(crate) struct TabsQuery {
     pub(crate) browser: Option<String>,
@@ -269,7 +323,9 @@ pub(crate) struct TabsQuery {
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CookiesRequest {
+    #[serde(alias = "switchTabId")]
     pub(crate) switch_tab_id: Option<String>,
     pub(crate) browser: Option<String>,
     pub(crate) profile: Option<String>,
@@ -282,10 +338,12 @@ pub(crate) struct CookiesRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct UploadRequest {
     pub(crate) target: String,
     #[serde(default)]
     pub(crate) files: Vec<String>,
+    #[serde(alias = "switchTabId")]
     pub(crate) switch_tab_id: Option<String>,
     pub(crate) browser: Option<String>,
     pub(crate) profile: Option<String>,
@@ -294,12 +352,14 @@ pub(crate) struct UploadRequest {
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct LookupTabQuery {
     pub(crate) browser: Option<String>,
     pub(crate) profile: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct TabtreeQuery {
     pub(crate) tab: Option<String>,
     pub(crate) browser: Option<String>,
@@ -320,15 +380,19 @@ pub(crate) struct SessionTreeItem {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ProfileLabelRequest {
     pub(crate) label: Option<String>,
+    #[serde(alias = "switchTabId")]
     pub(crate) switch_tab_id: Option<String>,
     pub(crate) browser: Option<String>,
     pub(crate) profile: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct TabRequest {
+    #[serde(alias = "switchTabId")]
     pub(crate) switch_tab_id: Option<String>,
     pub(crate) browser: Option<String>,
     pub(crate) profile: Option<String>,
@@ -337,6 +401,7 @@ pub(crate) struct TabRequest {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct NetworkListRequest {
+    #[serde(alias = "switchTabId")]
     pub(crate) switch_tab_id: Option<String>,
     pub(crate) browser: Option<String>,
     pub(crate) profile: Option<String>,
@@ -348,15 +413,18 @@ pub(crate) struct NetworkListRequest {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct NetworkDetailRequest {
+    #[serde(alias = "switchTabId")]
     pub(crate) switch_tab_id: Option<String>,
     pub(crate) browser: Option<String>,
     pub(crate) profile: Option<String>,
+    #[serde(alias = "requestId")]
     pub(crate) request_id: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConsoleListRequest {
+    #[serde(alias = "switchTabId")]
     pub(crate) switch_tab_id: Option<String>,
     pub(crate) browser: Option<String>,
     pub(crate) profile: Option<String>,
@@ -414,6 +482,7 @@ pub(crate) fn default_job_list_limit() -> usize {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct JobSubmitRequest {
     pub(crate) op: String,
     #[serde(default)]
@@ -421,12 +490,16 @@ pub(crate) struct JobSubmitRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct JobListQuery {
     #[serde(default = "default_job_list_limit")]
     pub(crate) limit: usize,
 }
 
+/// `/run`、`/batch` 的单步。`args` 是自由 JSON（按 op 再分发到具体请求 DTO），
+/// 所以未知字段校验发生在下一层；这里只拒绝 step 自身多带的键。
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RunStep {
     pub(crate) op: String,
     #[serde(default)]
@@ -434,10 +507,11 @@ pub(crate) struct RunStep {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RunRequest {
     pub(crate) steps: Vec<RunStep>,
     /// 某一步失败后是否终止后续步骤，默认终止。
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", alias = "stopOnError")]
     pub(crate) stop_on_error: bool,
 }
 
@@ -454,37 +528,43 @@ pub(crate) fn default_batch_concurrency() -> usize {
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ReadRequest {
+    #[serde(alias = "switchTabId")]
     pub(crate) switch_tab_id: Option<String>,
     pub(crate) browser: Option<String>,
     pub(crate) profile: Option<String>,
     pub(crate) selector: Option<String>,
-    #[serde(default = "default_read_max_chars")]
+    #[serde(default = "default_read_max_chars", alias = "maxChars")]
     pub(crate) max_chars: usize,
     #[serde(default)]
     pub(crate) links: bool,
     #[serde(default = "default_true")]
     pub(crate) forms: bool,
     /// 连隐藏内容一起返回（textContent 语义，不做可见性过滤）。
-    #[serde(default)]
+    #[serde(default, alias = "includeHidden")]
     pub(crate) include_hidden: bool,
     /// visible / all，等价于 --include-hidden 的显式写法。
     pub(crate) mode: Option<String>,
     /// 页面内文本抽取时间预算（毫秒）。
+    #[serde(alias = "budgetMs")]
     pub(crate) budget_ms: Option<u64>,
     /// 单次读取最多处理多少个节点。
+    #[serde(alias = "maxNodes")]
     pub(crate) max_nodes: Option<usize>,
     /// 在指定 iframe 内读取。
+    #[serde(alias = "frameId")]
     pub(crate) frame_id: Option<i64>,
     /// DOM 节点数阈值（`page_read.js` 的 `innerTextLimit`，页面侧默认 30000）。
     /// 节点数不超过该值时用 `innerText` 精确抽取；超过则退化为近似可见文本
     /// （`textMode:"visible-approx"`）。**不是字符数上限**——控字符量用 `max_chars`。
-    #[serde(default)]
+    #[serde(default, alias = "innerTextLimit")]
     pub(crate) inner_text_limit: Option<usize>,
     pub(crate) timeout: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct FindRequest {
     pub(crate) selector: Option<String>,
     pub(crate) text: Option<String>,
@@ -495,9 +575,11 @@ pub(crate) struct FindRequest {
     pub(crate) visible: bool,
     #[serde(default)]
     pub(crate) exact: bool,
+    #[serde(alias = "switchTabId")]
     pub(crate) switch_tab_id: Option<String>,
     pub(crate) browser: Option<String>,
     pub(crate) profile: Option<String>,
+    #[serde(alias = "frameId")]
     pub(crate) frame_id: Option<i64>,
     pub(crate) timeout: Option<f64>,
 }
@@ -509,9 +591,11 @@ pub(crate) struct ActionRequest {
     pub(crate) target: Option<Value>,
     #[serde(default)]
     pub(crate) params: Value,
+    #[serde(alias = "switchTabId")]
     pub(crate) switch_tab_id: Option<String>,
     pub(crate) browser: Option<String>,
     pub(crate) profile: Option<String>,
+    #[serde(alias = "frameId")]
     pub(crate) frame_id: Option<i64>,
     pub(crate) timeout: Option<f64>,
 }
@@ -529,9 +613,11 @@ pub(crate) struct WaitRequest {
     pub(crate) interval: f64,
     #[serde(default)]
     pub(crate) visible: bool,
+    #[serde(alias = "switchTabId")]
     pub(crate) switch_tab_id: Option<String>,
     pub(crate) browser: Option<String>,
     pub(crate) profile: Option<String>,
+    #[serde(alias = "frameId")]
     pub(crate) frame_id: Option<i64>,
 }
 
@@ -545,18 +631,91 @@ pub(crate) struct InjectRequest {
     /// MAIN（默认）或 ISOLATED
     pub(crate) world: Option<String>,
     pub(crate) matches: Option<Vec<String>>,
+    #[serde(alias = "frameId")]
     pub(crate) frame_id: Option<i64>,
-    #[serde(default)]
+    #[serde(default, alias = "allFrames")]
     pub(crate) all_frames: bool,
+    #[serde(alias = "switchTabId")]
     pub(crate) switch_tab_id: Option<String>,
     pub(crate) browser: Option<String>,
     pub(crate) profile: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct BatchRequest {
     pub(crate) steps: Vec<RunStep>,
     /// 并发度：同时在多个标签页上执行的上限。
     #[serde(default = "default_batch_concurrency")]
     pub(crate) concurrency: usize,
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+
+    /// 拼错/多余的字段必须报错，而不是静默丢掉（命令成功但参数没生效）。
+    #[test]
+    fn exec_request_rejects_unknown_field() {
+        let err = serde_json::from_str::<ExecRequest>(r#"{"script":"1+1","waitTimout":5}"#)
+            .expect_err("未知字段必须被拒绝");
+        assert!(err.to_string().contains("unknown field"), "{err}");
+    }
+
+    /// 历史 camelCase 写法仍要能解析（alias），否则老调用方会被直接打断。
+    #[test]
+    fn exec_request_accepts_legacy_camel_case() {
+        let req: ExecRequest = serde_json::from_str(
+            r#"{"script":"1+1","waitJs":"window.ok","waitTimeout":2.5,"maxBytes":100}"#,
+        )
+        .expect("camelCase 应该被 alias 接受");
+        assert_eq!(req.wait_js.as_deref(), Some("window.ok"));
+        assert_eq!(req.wait_timeout, 2.5);
+        assert_eq!(req.max_bytes, Some(100));
+    }
+
+    /// CLI 的 `read` / `snapshot` 实际 payload（cmd_page.rs）必须原样被接受：
+    /// 加 deny 之后这里一旦漂移，`atb read` 会直接 400。
+    #[test]
+    fn cli_page_payloads_still_parse() {
+        let read: ReadRequest = serde_json::from_str(
+            r#"{"selector":null,"max_chars":20000,"inner_text_limit":null,"links":false,
+                "forms":true,"include_hidden":false,"budget_ms":null,"max_nodes":null,
+                "frame_id":null,"switch_tab_id":"@1","browser":null,"profile":null,
+                "timeout":30.0}"#,
+        )
+        .expect("read payload");
+        assert_eq!(read.max_chars, 20000);
+        assert!(read.forms);
+
+        let snapshot: SnapshotRequest = serde_json::from_str(
+            r#"{"switch_tab_id":null,"browser":null,"profile":null,"offset":0,"limit":200,
+                "details":false,"js":false,"interactive_only":false,"skip_generic":true,
+                "max_nodes":0,"timeout":30.0}"#,
+        )
+        .expect("snapshot payload");
+        assert_eq!(snapshot.skip_generic, Some(true));
+
+        let action: ActionRequest = serde_json::from_str(
+            r#"{"op":"click","target":{"ref":"e1"},"params":{},"frame_id":null,
+                "switch_tab_id":"@1","browser":null,"profile":null,"timeout":30.0}"#,
+        )
+        .expect("action payload");
+        assert_eq!(action.op, "click");
+    }
+
+    /// 响应/扩展回包方向不走这些 DTO；这里只确认请求 DTO 的默认值与缺省行为不变。
+    #[test]
+    fn request_defaults_are_backward_compatible() {
+        let req: ExecRequest = serde_json::from_str(r#"{"script":"1"}"#).expect("最小请求体");
+        assert_eq!(req.wait_timeout, 3.0);
+        assert_eq!(req.wait_interval, 0.1);
+        assert!(!req.no_monitor);
+        let open: OpenRequest =
+            serde_json::from_str(r#"{"url":"https://example.com"}"#).expect("最小 open 请求体");
+        assert!(open.keep_alive);
+        assert!(open.active);
+        assert!(open.wait_for.is_none());
+        assert!(!open.warm);
+    }
 }

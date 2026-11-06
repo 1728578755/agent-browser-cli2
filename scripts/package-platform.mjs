@@ -39,9 +39,9 @@ fs.copyFileSync(binaryPath, outBinary);
 // 平台包发布的是运行二进制，默认移除符号表以减小 npm 包体积；本地 target/release 保持不变，便于排查。
 //
 // Windows 目标必须跳过：系统没有 `strip`，spawnSync 必然 ENOENT，每次构建打一条噪声
-// 警告；更糟的是 PATH 里若混进 GNU strip，它会把 PE 头改坏而脚本仍然全绿（v6 P3）。
+// 警告；更糟的是 PATH 里若混进 GNU strip，它会把 PE 头改坏而脚本仍然全绿（v6）。
 const isWindowsTarget = meta.os === "win32" || process.platform === "win32";
-if (!isWindowsTarget && process.env.ATB_SKIP_STRIP !== "1") {
+if (!isWindowsTarget && process.env.AGENT_BROWSER_CLI_SKIP_STRIP !== "1") {
   const strip = spawnSync("strip", [outBinary], { stdio: "ignore" });
   if (strip.status !== 0) {
     console.warn(`[package-platform] strip skipped or failed for ${targetName}`);

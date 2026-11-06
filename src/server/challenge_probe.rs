@@ -188,7 +188,7 @@ pub(crate) async fn auto_wait_challenge(
     let mut got: Option<Value> = None;
     // `--challenge-timeout` 是**总预算**，不是每个阶段各给一份。
     // 旧实现：solve_budget=0.8T、reload 再等最多 8s、被动等待又拿完整 T，
-    // 最坏 ≈1.8T+8s —— `--challenge-timeout 15` 实测能等 35~40s（B-06）。
+    // 最坏 ≈1.8T+8s —— `--challenge-timeout 15` 实测能等 35~40s。
     // 从现在起所有阶段都只从 `remaining()` 里取，绝不重新起算。
     let overall_deadline = Instant::now() + secs(timeout_secs.clamp(1.0, 600.0));
     let budget_left = || overall_deadline.saturating_duration_since(Instant::now());
@@ -263,7 +263,7 @@ pub(crate) async fn auto_wait_challenge(
     // 文档还在 loading 时**不能**下结论。上面的重试最多只等 6×250ms≈1.5s，慢站点
     // （CF 边缘拥塞、大页面）超过这个时间还在 pending 很正常；而 pending 期间的
     // 「检测不到挑战」是假阴性，此时返回 cleared:true 会让 `open --challenge` 的
-    // 调用方以为已经进去了（B-12，与函数内注释直接矛盾）。
+    // 调用方以为已经进去了（与函数内注释直接矛盾）。
     // 如实回 `cleared:false + reason:"still_loading"`，让调用方自己决定要不要再等。
     if status
         .get("pending")
@@ -522,7 +522,7 @@ pub(crate) struct ChallengeFrame {
 impl ChallengeFrame {
     /// 局部坐标（iframe 内容坐标，CSS px）→ 页面视口坐标。
     ///
-    /// 不能简单相加：有的站点给挑战 iframe 加 3D 旋转，
+    /// 不能简单相加：有的站点（如 nowsecure.nl 的测试页）给挑战 iframe 加 3D 旋转，
     /// 纯加法点不到勾选框。这里用四角反推仿射基向量，旋转/缩放/斜切都能对上。
     pub(crate) fn to_screen(&self, lx: f64, ly: f64) -> (f64, f64) {
         let [x1, y1, x2, y2, _x3, _y3, x4, y4] = self.quad;
@@ -704,7 +704,7 @@ pub(crate) async fn iframe_doc_url(
 /// 只在已确认「页面存在挑战」时调用，那时页面很小，全量 pierce 的代价可控；
 /// 换来的是不漏掉 shadow root 里的组件。
 ///
-/// 第二个返回值是成败标记：**查询本身失败**（CDP 附不上 / DOM 域不可用）
+/// 第二个返回值是 的成败标记：**查询本身失败**（CDP 附不上 / DOM 域不可用）
 /// 与「文档里真的没有 iframe」是两件事。
 ///
 /// 旧实现先 `DOM.getDocument{depth:1}` 拿 rootId 做 querySelectorAll，
@@ -822,7 +822,7 @@ pub(crate) enum StripFramesOutcome {
 /// 自己注入的 iframe 同样以 `chrome-extension://<own-id>` 开头，必须白名单放行；
 /// 取不到就不删（见 `strip_foreign_extension_frames`）。
 async fn own_extension_id(state: &AppState, session_key: &str) -> Option<String> {
-    let from_env = crate::settings::env_string("ATB_EXTENSION_ID", "");
+    let from_env = crate::settings::extension_id();
     if !from_env.is_empty() {
         return Some(from_env);
     }

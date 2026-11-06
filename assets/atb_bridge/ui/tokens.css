@@ -1,0 +1,118 @@
+/* ATB 扩展的设计变量。
+ *
+ * 所有颜色、字号、圆角、间距只在这里定义一次，popup / options 只允许引用变量，
+ * 不要在页面样式里写死 #hex —— 否则浅色/深色两套主题迟早漂移。
+ *
+ * 主题解析顺序（见 ui/theme-boot.js + ui/common.js）：
+ *   1. 页面加载瞬间按系统 prefers-color-scheme 打 data-resolved，避免白屏闪一下；
+ *   2. 随后读 storage.local.themeMode（auto/light/dark）覆盖 data-resolved；
+ *   3. 只保留 `:root[data-resolved="dark"]` 一套深色变量，不写媒体查询副本。
+ */
+:root {
+  --font-sans: "Segoe UI Variable Text", "Segoe UI", -apple-system, BlinkMacSystemFont,
+    "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
+  --font-mono: "Cascadia Code", "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+
+  --text-xs: 11px;
+  --text-sm: 12px;
+  --text-md: 13px;
+  --text-lg: 15px;
+  --text-xl: 18px;
+
+  --lh-tight: 1.35;
+  --lh-normal: 1.55;
+
+  /* 浅色主题 */
+  --bg: #f5f7fa;
+  /* 标签页里打开 popup.html 时，列容器外的底色（与 --bg 区分，避免“一张纸糊在墙上”） */
+  --bg-page: #e9eef6;
+  --surface: #ffffff;
+  --surface-2: #f2f5f9;
+  --surface-3: #e9eef6;
+  --border: #e3e8f0;
+  --border-strong: #cfd7e4;
+  --text: #101828;
+  --text-2: #475467;
+  --text-3: #6b7789;
+  --accent: #3563e9;
+  --accent-hover: #2a51c9;
+  --accent-weak: #ebf1ff;
+  --accent-text: #2246b8;
+  --ok: #0f7a45;
+  --ok-strong: #0b6136;
+  --ok-bg: #e8f7ef;
+  --ok-border: #bce3cd;
+  --warn: #9a5b00;
+  --warn-bg: #fff6e5;
+  --warn-border: #f2ddb4;
+  --err: #c0362c;
+  --err-bg: #fdeceb;
+  --err-border: #f3c7c2;
+  --info-bg: #eef3fd;
+  --info-border: #cfdcf7;
+  --shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.06);
+  --shadow-md: 0 8px 24px rgba(16, 24, 40, 0.10);
+  --ring: 0 0 0 3px rgba(53, 99, 233, 0.28);
+
+  --radius-xs: 6px;
+  --radius-sm: 8px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --radius-pill: 999px;
+
+  --pad-card: 14px;
+  --gap-row: 10px;
+  --gap-block: 12px;
+  --control-h: 30px;
+  --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --dur: 140ms;
+}
+
+/* 深色主题：只此一处，theme-boot.js 会在 <html> 上打 data-resolved。 */
+:root[data-resolved="dark"] {
+  color-scheme: dark;
+  --bg: #0e1218;
+  --bg-page: #080c11;
+  --surface: #151a22;
+  --surface-2: #1b222c;
+  --surface-3: #242d39;
+  --border: #28313d;
+  --border-strong: #3a4554;
+  --text: #e7ecf3;
+  --text-2: #a9b5c5;
+  --text-3: #8593a5;
+  --accent: #6f9bff;
+  --accent-hover: #8cb0ff;
+  --accent-weak: #1a2540;
+  --accent-text: #a9c0ff;
+  --ok: #4ade80;
+  --ok-strong: #86efac;
+  --ok-bg: #10281c;
+  --ok-border: #1f4532;
+  --warn: #fbbf24;
+  --warn-bg: #2a2110;
+  --warn-border: #4a3a16;
+  --err: #f87171;
+  --err-bg: #2b1414;
+  --err-border: #4c2222;
+  --info-bg: #16203a;
+  --info-border: #26375c;
+  --shadow-sm: none;
+  --shadow-md: 0 10px 28px rgba(0, 0, 0, 0.45);
+  --ring: 0 0 0 3px rgba(111, 155, 255, 0.35);
+}
+
+:root {
+  color-scheme: light;
+}
+:root[data-resolved="dark"] {
+  color-scheme: dark;
+}
+
+/* 密度：只调间距，不改字号，避免小屏下文字被压成一团。 */
+:root[data-density="compact"] {
+  --pad-card: 11px;
+  --gap-row: 8px;
+  --gap-block: 9px;
+  --control-h: 28px;
+}

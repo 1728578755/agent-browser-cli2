@@ -10,14 +10,14 @@ use std::sync::{Mutex, OnceLock};
 /// 现在按 agent 存一个 `VecDeque`（深度可配，默认 8），wait 命中「本 agent 最近
 /// 启动且仍在列表里」的那一条，并在回包里用 `claimed_from` 说明命中来源。
 fn download_registry_depth() -> usize {
-    crate::settings::env_usize_clamped("ATB_DOWNLOAD_REGISTRY_DEPTH", 8, 1, 64)
+    crate::settings::download_registry_depth()
 }
 
-/// 每个 agent 最近若干次下载的登记表。
-type DownloadRegistry = Mutex<HashMap<String, VecDeque<(i64, Instant)>>>;
+/// 每个 agent 最近下载的 (id, 时间) 队列。抽成别名只为满足 clippy 的类型复杂度告警。
+type DownloadRegistry = HashMap<String, VecDeque<(i64, Instant)>>;
 
-fn last_download_registry() -> &'static DownloadRegistry {
-    static REGISTRY: OnceLock<DownloadRegistry> = OnceLock::new();
+fn last_download_registry() -> &'static Mutex<DownloadRegistry> {
+    static REGISTRY: OnceLock<Mutex<DownloadRegistry>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -208,7 +208,7 @@ pub(crate) async fn downloads(
     Json(req): Json<DownloadsRequest>,
 ) -> Json<Value> {
     touch(&state).await;
-    // wait 的超时 / interrupted 是业务失败，外层 ok 必须跟随内层（B-02）。
+    // wait 的超时 / interrupted 是业务失败，外层 ok 必须跟随内层。
     Json(json_result_with_inner_ok(
         downloads_value(&state, req).await,
     ))
@@ -234,7 +234,7 @@ pub(crate) async fn downloads_value(state: &AppState, req: DownloadsRequest) -> 
         if let Some(url) = req.url {
             payload["url"] = json!(url);
         }
-        // 文件名在 daemon 侧就净化（的 daemon 侧对应项）：
+        // 文件名在 daemon 侧就净化（daemon 侧对应项）：
         // 旧实现原样拼进 `${dir}/${fileName}` 交给扩展，只剩 Chrome 兜底，
         // `--filename ../../x` 会写到下载目录之外。
         let mut filename_note: Option<Value> = None;
@@ -302,14 +302,14 @@ pub(crate) async fn downloads_value(state: &AppState, req: DownloadsRequest) -> 
     let timeout = req.wait_timeout.unwrap_or(120.0).clamp(1.0, 3600.0);
     let interval = req.interval.unwrap_or(0.5).clamp(0.05, 5.0);
     // 列表条数可配：固定 50 会让「较早的 id」落在窗口外，只能一路等到超时。
-    let list_limit = crate::settings::env_usize_clamped("ATB_DOWNLOAD_WAIT_LIMIT", 200, 1, 500);
+    let list_limit = crate::settings::download_wait_limit();
     // 超时处理：默认只报超时，不取消——文件可能还在下，杀掉更难恢复。
     let cancel_on_timeout = req
         .cancel_on_timeout
-        .unwrap_or_else(|| crate::settings::env_bool("ATB_DOWNLOAD_CANCEL_ON_TIMEOUT", false));
+        .unwrap_or_else(crate::settings::download_cancel_on_timeout);
     let cancel_erase = req
         .cancel_erase
-        .unwrap_or_else(|| crate::settings::env_bool("ATB_DOWNLOAD_CANCEL_ERASE", false));
+        .unwrap_or_else(crate::settings::download_cancel_erase);
     let deadline = Instant::now() + secs(timeout);
     let mut polls: u64 = 0;
     let mut last: Value = Value::Null;
@@ -343,7 +343,7 @@ pub(crate) async fn downloads_value(state: &AppState, req: DownloadsRequest) -> 
     //
     // 旧实现直接取 `items.first()`：只要列表里还有一条**历史的** complete 记录，
     // 第一次轮询就命中并返回 `ok:true`——等待类命令的假成功比超时更难发现，
-    // 调用方会拿着一份旧文件当成本次下载的产物（B-16）。
+    // 调用方会拿着一份旧文件当成本次下载的产物。
     // 现在的规则：进循环时记下列表里的最大 id，之后只认「id 比基线大」的记录；
     // 唯一例外是**最新一条仍在进行中**（`download` 紧接着 `download-wait` 的常见路径）。
     //

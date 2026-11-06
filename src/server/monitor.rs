@@ -113,7 +113,7 @@ pub(crate) async fn scan_page(
 /// `MutationRecord` 原样 push 进数组，长观察（几十分钟的 SPA）会一直涨到标签页 OOM。
 /// 值域 `1..=500`，默认 50；超出的条数只进 `overflow` 计数。
 fn monitor_sample_limit() -> usize {
-    crate::settings::env_usize_clamped("ATB_MONITOR_SAMPLES", 50, 1, 500)
+    crate::settings::monitor_samples()
 }
 
 /// 把用户脚本包进「MutationObserver 记录 + 执行」的一次注入里。
@@ -179,16 +179,25 @@ pub(crate) fn wrap_with_mutation_watch(script: &str) -> String {
     if (!__abcCompilesAsPlain) {{
       __abcResult = await (new __abcAsync(trimmed))();
     }} else {{
-      // eval 的 SyntaxError 一定发生在执行之前；探针没置位 ⇒ 一行都没跑，
-      // 此时换 AsyncFunction 才是安全的（覆盖 `a(); return b` 这类脚本上下文非法写法）。
-      // 探针已置位还抛 SyntaxError，就是用户代码运行时自己抛的，绝不能再跑第二次。
-      let __abcStarted = false;
       try {{
-        const value = eval('__abcStarted = true;\n' + trimmed);
-        __abcResult = value instanceof Promise ? await value : value;
+        // 用户代码**直接** eval，不加任何前缀。
+        // 旧实现 `eval('__abcStarted = true;\n' + trimmed)` 让首行 `"use strict"` 不再是
+        // 指令序言（整段退化成非严格模式），行号也整体 +1；monitor 这条路径当时漏改了。
+        const __abcValue = eval(trimmed);
+        __abcResult = __abcValue instanceof Promise ? await __abcValue : __abcValue;
       }} catch (__abcError) {{
-        if (__abcError instanceof SyntaxError && !__abcStarted) {{
-          __abcResult = await (new __abcAsync(trimmed))();
+        if (__abcError instanceof SyntaxError) {{
+          // 走到这里时 `new Function(trimmed)` 已经通过，正常只可能是用户代码**运行时**
+          // 自己抛 SyntaxError（不能再跑第二次）。只有「编译期非法」才允许换
+          // AsyncFunction 重跑；判定方式与 page_data.rs 同口径：把同一段代码包进
+          // 恒假的 if 块再 eval 一次——只编译、不执行。
+          let __abcEvalLegal = true;
+          try {{ eval('if (false) {{' + trimmed + '\n}}'); }} catch (_) {{ __abcEvalLegal = false; }}
+          if (!__abcEvalLegal) {{
+            __abcResult = await (new __abcAsync(trimmed))();
+          }} else {{
+            throw __abcError;
+          }}
         }} else {{
           throw __abcError;
         }}

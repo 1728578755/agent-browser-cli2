@@ -15,18 +15,15 @@ pub(crate) fn submit_job(op: &str, args: Value) -> Result<Value> {
     // 后台任务按「一条命令一个目标」建模；多目标提交会被拆成 N 个 job，
     // 但调用方只拿到一个 id，结果必然对不上。这里直接说清楚怎么改。
     if let Some(tab) = args.get("switch_tab_id").and_then(Value::as_str) {
-        // 解析已由 finalize_page_payload 完成，这里只判定形态。
-        let spec =
-            TargetSpec::parse(tab).map_err(|err| usage_failure(err.code, err.message, err.hint))?;
-        if spec.is_multi() || spec.needs_daemon_resolution() {
-            return Ok(preflight::Problem::new(
-                "unsupported_combination",
-                "--async 不能和 all / @N / url: 这类需要解析的 --tab 一起用",
-                "要么去掉 --async（多标签会并发执行并一次返回），要么用明确的 tab id 逐个提交",
-            )
-            .with_example("atb exec --tab all 'return document.title'")
-            .to_json());
+        if let Some(problem) = async_target_problem(tab)? {
+            return Ok(problem.to_json());
         }
+    }
+    // 防御性第二道闸：所有调用点都应在 `ensure_server` 之前走
+    // [`async_dry_run_plan`]；万一以后新增的调用点漏了那一步，这里也绝不能把动作
+    // 真的提交成后台 job——dry-run 的承诺是「不产生任何页面副作用」。
+    if DRY_RUN.load(Ordering::Relaxed) {
+        return Ok(async_plan_json(op, args));
     }
     request(
         "POST",
@@ -34,6 +31,91 @@ pub(crate) fn submit_job(op: &str, args: Value) -> Result<Value> {
         Some(json!({ "op": op, "args": args })),
         15.0,
     )
+}
+
+/// `--dry-run` + `--async` 的统一短路，返回 `true` 表示已输出计划、调用方应直接返回。
+///
+/// 异步路径以前绕过了所有 dry-run 检查：`atb click '#pay' --async --dry-run` 会真的
+/// 创建 job 并在后台点击。这里在**任何** `ensure_server` / HTTP 之前
+/// 收口，且 args 仍走与真实提交同一份收尾（路径绝对化 + 预检 + 目标语法解析），
+/// 避免 dry-run 报「假绿」。
+pub(crate) fn async_dry_run_plan(op: &str, payload: &Value, is_async: bool) -> Result<bool> {
+    if !is_async || !DRY_RUN.load(Ordering::Relaxed) {
+        return Ok(false);
+    }
+    let mut args = payload.clone();
+    if let Err(problem) = finalize_page_payload(op, &mut args) {
+        usage_error(&problem)?;
+        return Ok(true);
+    }
+    enforce_write_tab(op, args.get("switch_tab_id").and_then(Value::as_str))?;
+    if let Some(tab) = args.get("switch_tab_id").and_then(Value::as_str) {
+        if let Some(problem) = async_target_problem(tab)? {
+            print_json(problem.to_json());
+            return Ok(true);
+        }
+    }
+    print_json(async_plan_json(op, args));
+    Ok(true)
+}
+
+/// 异步提交的目标形态校验（供 [`submit_job`] 与 [`async_dry_run_plan`] 共用）。
+fn async_target_problem(tab: &str) -> Result<Option<preflight::Problem>> {
+    // 解析多半已由 finalize_page_payload 完成，这里只判定形态。
+    let spec =
+        TargetSpec::parse(tab).map_err(|err| usage_failure(err.code, err.message, err.hint))?;
+    if spec.is_multi() || spec.needs_daemon_resolution() {
+        return Ok(Some(
+            preflight::Problem::new(
+                "unsupported_combination",
+                "--async 不能和 all / @N / url: 这类需要解析的 --tab 一起用",
+                "要么去掉 --async（多标签会并发执行并一次返回），要么用明确的 tab id 逐个提交",
+            )
+            .with_example("atb exec --tab all 'return document.title'"),
+        ));
+    }
+    Ok(None)
+}
+
+/// `--dry-run --async` 的计划体：字段名固定为 `would.op` / `would.args`，
+/// 与同步 dry-run 的 `args` 同形（都经过绝对化与预检），Agent 可以用同一套解析。
+fn async_plan_json(op: &str, args: Value) -> Value {
+    let mut args = args;
+    redact_plan_script(&mut args);
+    json!({
+        "ok": true,
+        "dry_run": true,
+        "async": true,
+        "would": {
+            "op": op,
+            "args": args,
+            "endpoint": "POST /job/submit（dry-run 下不会发出）",
+        },
+        "note": "去掉 --dry-run 才会真的提交 job；args 已按当前工作目录绝对化并通过本地预检",
+    })
+}
+
+/// 计划里的脚本/代码只回显前 2000 字符：dry-run 输出给人看，几十 KB 的脚本原样
+/// 回显没有价值；真正会被 daemon 解释的路径类字段保持完整。
+fn redact_plan_script(payload: &mut Value) {
+    const PREVIEW_CHARS: usize = 2000;
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
+    for key in ["script", "code"] {
+        let preview = match object.get(key) {
+            Some(Value::String(text)) if text.chars().count() > PREVIEW_CHARS => Some((
+                text.chars().take(PREVIEW_CHARS).collect::<String>(),
+                text.len(),
+            )),
+            _ => None,
+        };
+        if let Some((head, bytes)) = preview {
+            object.insert(key.to_string(), json!(head));
+            object.insert(format!("{key}_bytes"), json!(bytes));
+            object.insert(format!("{key}_truncated"), json!(true));
+        }
+    }
 }
 
 pub(crate) fn run_job_command(args: JobCommand) -> Result<()> {
@@ -87,8 +169,8 @@ pub(crate) fn run_job_command(args: JobCommand) -> Result<()> {
 
 pub(crate) fn wait_job(args: &JobWaitArgs) -> Result<()> {
     // 负值 / nan / inf 以前被 `.max(0.1)` 静默夹成 0.1s：调用方写 `--timeout -5`
-    // 本意是「立刻返回」，实际却报 job_wait_timeout，而退出码/文本都指向「job 太慢」
-    // 。这是用法问题，必须在发请求前就以 exit 2 拒绝。
+    // 本意是「立刻返回」，实际却报 job_wait_timeout，而退出码/文本都指向「job 太慢」。
+    // 这是用法问题，必须在发请求前就以 exit 2 拒绝。
     if !args.timeout.is_finite() || args.timeout <= 0.0 {
         return Err(usage_failure(
             "invalid_argument",
@@ -234,7 +316,6 @@ fn echo_stop_on_error(value: &mut Value, stop_on_error: bool) {
 }
 
 pub(crate) fn cmd_run(args: RunArgs, is_async: bool) -> Result<()> {
-    let _ = is_async;
     if is_async {
         return Err(usage_failure(
             "unsupported_flag",
@@ -471,5 +552,87 @@ fn json_kind(value: &Value) -> &'static str {
         Value::String(_) => "字符串",
         Value::Array(_) => "数组",
         Value::Object(_) => "对象",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `DRY_RUN` 是进程级全局量：多个测试并行时各自 `store(true)` 再「恢复原值」
+    /// 会互相覆盖（恢复出的 `true` 会漏给后面的测试）。这里串行化并固定收尾为
+    /// `false`，不依赖任何「进入时的值」。
+    fn with_dry_run<T>(f: impl FnOnce() -> T) -> T {
+        static LOCK: Mutex<()> = Mutex::new(());
+        let guard = LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        DRY_RUN.store(true, Ordering::Relaxed);
+        let out = f();
+        DRY_RUN.store(false, Ordering::Relaxed);
+        drop(guard);
+        out
+    }
+
+    /// 计划体必须带齐四个判据字段，且 args 原样透出（Agent 用同一套解析）。
+    #[test]
+    fn async_plan_json_has_contract_shape() {
+        let plan = async_plan_json("click", json!({ "target": "#go" }));
+        assert_eq!(plan["ok"], json!(true));
+        assert_eq!(plan["dry_run"], json!(true));
+        assert_eq!(plan["async"], json!(true));
+        assert_eq!(plan["would"]["op"], json!("click"));
+        assert_eq!(plan["would"]["args"]["target"], json!("#go"));
+        // 一旦计划体被误改回「真的提交」，endpoint 会指向真实路径而不是这句说明。
+        assert!(plan["would"]["endpoint"]
+            .as_str()
+            .unwrap()
+            .contains("dry-run"));
+    }
+
+    /// 长脚本只回显预览，但字节数必须保留，调用方才知道自己传了多大的东西。
+    #[test]
+    fn async_plan_json_truncates_long_script() {
+        let plan = async_plan_json("exec", json!({ "script": "x".repeat(5000) }));
+        let preview = plan["would"]["args"]["script"].as_str().unwrap();
+        assert_eq!(preview.chars().count(), 2000);
+        assert_eq!(plan["would"]["args"]["script_bytes"], json!(5000));
+        assert_eq!(plan["would"]["args"]["script_truncated"], json!(true));
+    }
+
+    /// `--dry-run --async` 必须在发请求前短路。
+    #[test]
+    fn async_dry_run_plan_short_circuits() {
+        let handled =
+            with_dry_run(|| async_dry_run_plan("click", &json!({ "target": "#go" }), true));
+        assert!(handled.unwrap(), "dry-run + async 必须由计划路径接管");
+    }
+
+    /// 同步路径仍由 `dispatch_page` 的 dry-run 分支处理，不能被这个助手抢走。
+    #[test]
+    fn async_dry_run_plan_leaves_sync_path_alone() {
+        let handled =
+            with_dry_run(|| async_dry_run_plan("click", &json!({ "target": "#go" }), false));
+        assert!(!handled.unwrap());
+    }
+
+    /// 防御性第二道闸：即使调用点忘了先走计划路径，submit_job 也不能真提交。
+    #[test]
+    fn submit_job_returns_plan_under_dry_run() {
+        let value = with_dry_run(|| submit_job("scan", json!({ "timeout": 30.0 }))).unwrap();
+        assert_eq!(value["dry_run"], json!(true));
+        assert_eq!(value["async"], json!(true));
+        assert_eq!(value["would"]["op"], json!("scan"));
+    }
+
+    /// 多目标 + async 在计划阶段就要拒绝（否则 dry-run 假绿、真跑 exit 2）。
+    #[test]
+    fn async_dry_run_plan_rejects_multi_target() {
+        let handled = with_dry_run(|| {
+            async_dry_run_plan(
+                "click",
+                &json!({ "target": "#go", "switch_tab_id": "all" }),
+                true,
+            )
+        });
+        assert!(handled.unwrap());
     }
 }

@@ -1,11 +1,11 @@
 use super::*;
 
-/// 旧版本（未按 profile 隔离）使用的固定注入名，仅用于清理残留（B-03）。
+/// 旧版本（未按 profile 隔离）使用的固定注入名，仅用于清理残留。
 pub(crate) const LEGACY_NET_HOOK_NAME: &str = "__net_hook";
 
 /// 持久化注入名：扩展侧 `chrome.storage.local.persistInjections` 按字符串键全局存，
 /// 不分 browser/profile。名字必须带 profile 摘要，否则 B 的 `net hook --persist`
-/// 会覆盖 A 的条目，A 的 `net reset` 又会删掉 B 的共享条目（B-03）。
+/// 会覆盖 A 的条目，A 的 `net reset` 又会删掉 B 的共享条目。
 ///
 /// 用 FNV-1a 而不是 `DefaultHasher`：后者不保证跨 Rust 版本稳定，而这个名字会写进
 /// 扩展的持久存储，必须保证 daemon 重启/升级后同一个 profile 还能算出同一个名字。
@@ -36,7 +36,7 @@ pub(crate) async fn install_net_hook(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    // fail-closed：没有 match pattern 就不注册，绝不退回 <all_urls>（B-10）。
+    // fail-closed：没有 match pattern 就不注册，绝不退回 <all_urls>。
     if matches.is_empty() {
         return Ok(json!({
             "ok": false,

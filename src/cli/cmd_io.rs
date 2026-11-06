@@ -156,8 +156,8 @@ pub(crate) fn confirm_install() -> Result<bool> {
 
 pub(crate) fn resolve_skill_source() -> Result<PathBuf> {
     let mut candidates = Vec::new();
-    if let Some(package_dir) = config::env_compat("PACKAGE_DIR") {
-        candidates.push(PathBuf::from(package_dir).join("skills/atb"));
+    if let Some(package_dir) = crate::settings::package_dir() {
+        candidates.push(package_dir.join("skills/atb"));
     }
     if let Ok(exe) = env::current_exe() {
         for ancestor in exe.ancestors().take(6) {
@@ -298,7 +298,7 @@ pub(crate) fn create_symlink_dir(source: &Path, target: &Path) -> Result<()> {
 /// 默认 false：与 open/screenshot 的同步/异步路径一致，先把 `out`/`files`/`dir`
 /// 等路径绝对化再下发。对应 CLI flag `--allow-relative-out` 由 args 侧补。
 fn allow_relative_out() -> bool {
-    crate::settings::env_bool("ATB_ALLOW_RELATIVE_OUT", false)
+    crate::settings::allow_relative_out()
 }
 
 pub(crate) fn run_broadcast(args: BroadcastArgs) -> Result<()> {
@@ -306,7 +306,7 @@ pub(crate) fn run_broadcast(args: BroadcastArgs) -> Result<()> {
         Some(text) => match serde_json::from_str::<Value>(text) {
             Ok(value) => value,
             // 与 net --body 同一口径：非法 JSON 是用法错（退出码 2），
-            // 以前是 anyhow → 退出码 1，调用方会当成可重试（/ X-04）。
+            // 以前是 anyhow → 退出码 1，调用方会当成可重试。
             Err(err) => {
                 return Err(usage_failure(
                     "invalid_json",
@@ -367,8 +367,8 @@ pub(crate) fn run_broadcast(args: BroadcastArgs) -> Result<()> {
         "concurrency": args.concurrency,
     });
     // dry-run 必须在本地短路：广播是跨浏览器副作用最大的命令，不能先拉 daemon
-    // 再指望它「什么都不做」。当前分发层会先拒绝 broadcast --dry-run；
-    // 这里仍保留本地短路，供后续放开该 flag 时直接生效。
+    // 再指望它「什么都不做」。分发层已不拒绝 `broadcast --dry-run`，
+    // 这里就是真正的计划出口。
     if DRY_RUN.load(Ordering::Relaxed) {
         print_json(json!({
             "ok": true,
@@ -444,7 +444,7 @@ fn download_suggestion(target: &str) -> Option<&'static str> {
     }
 }
 
-/// 下载文件名净化（与 同因）。
+/// 下载文件名净化（同因）。
 ///
 /// 文件名会被扩展拼进 `${dir}/${fileName}`，不净化等于把路径穿越能力交给调用方。
 /// strict（默认）：只接受 basename，拒绝分隔符 / 绝对路径 / `..` / Windows 保留名；
@@ -608,7 +608,6 @@ pub(crate) fn run_target_command(
     args: TargetCommandArgs,
     is_async: bool,
 ) -> Result<()> {
-    ensure_server()?;
     let payload = json!({
         "target": args.target,
         "switch_tab_id": args.tab,
@@ -621,6 +620,11 @@ pub(crate) fn run_target_command(
         "timeout": args.timeout,
         "frame_id": args.frame,
     });
+    // dry-run + async 必须在 ensure_server/HTTP 之前短路。
+    if async_dry_run_plan(op, &payload, is_async)? {
+        return Ok(());
+    }
+    ensure_server()?;
     if is_async {
         print_json(submit_job(op, payload)?);
     } else {
@@ -638,7 +642,6 @@ pub(crate) fn run_target_command(
 }
 
 pub(crate) fn run_fill_command(args: FillCommandArgs, is_async: bool) -> Result<()> {
-    ensure_server()?;
     let has_value = args.value.is_some();
     let value = args.value.unwrap_or_default();
     let payload = json!({
@@ -657,6 +660,11 @@ pub(crate) fn run_fill_command(args: FillCommandArgs, is_async: bool) -> Result<
         "timeout": args.timeout,
         "frame_id": args.frame,
     });
+    // dry-run + async 必须在 ensure_server/HTTP 之前短路。
+    if async_dry_run_plan("fill", &payload, is_async)? {
+        return Ok(());
+    }
+    ensure_server()?;
     if is_async {
         print_json(submit_job("fill", payload)?);
     } else {
@@ -674,7 +682,6 @@ pub(crate) fn run_fill_command(args: FillCommandArgs, is_async: bool) -> Result<
 }
 
 pub(crate) fn run_send_keys_command(args: SendKeysCommandArgs, is_async: bool) -> Result<()> {
-    ensure_server()?;
     let payload = json!({
         "keys": args.keys,
         "frame_id": args.frame,
@@ -688,6 +695,11 @@ pub(crate) fn run_send_keys_command(args: SendKeysCommandArgs, is_async: bool) -
         "wait_interval": args.wait_interval,
         "timeout": args.timeout,
     });
+    // dry-run + async 必须在 ensure_server/HTTP 之前短路。
+    if async_dry_run_plan("send-keys", &payload, is_async)? {
+        return Ok(());
+    }
+    ensure_server()?;
     if is_async {
         print_json(submit_job("send-keys", payload)?);
     } else {
@@ -705,7 +717,6 @@ pub(crate) fn run_send_keys_command(args: SendKeysCommandArgs, is_async: bool) -
 }
 
 pub(crate) fn run_screenshot_command(args: ScreenshotArgs, is_async: bool) -> Result<()> {
-    ensure_server()?;
     let payload = json!({
         "switch_tab_id": args.tab,
         "browser": args.browser,
@@ -719,6 +730,11 @@ pub(crate) fn run_screenshot_command(args: ScreenshotArgs, is_async: bool) -> Re
         "max_height_px": args.max_height,
         "timeout": args.timeout,
     });
+    // dry-run + async 必须在 ensure_server/HTTP 之前短路。
+    if async_dry_run_plan("screenshot", &payload, is_async)? {
+        return Ok(());
+    }
+    ensure_server()?;
     if is_async {
         print_json(submit_job("screenshot", payload)?);
     } else {
@@ -736,7 +752,6 @@ pub(crate) fn run_screenshot_command(args: ScreenshotArgs, is_async: bool) -> Re
 }
 
 pub(crate) fn run_save_pdf_command(args: SavePdfArgs, is_async: bool) -> Result<()> {
-    ensure_server()?;
     let payload = json!({
         "switch_tab_id": args.tab,
         "browser": args.browser,
@@ -749,6 +764,11 @@ pub(crate) fn run_save_pdf_command(args: SavePdfArgs, is_async: bool) -> Result<
         "max_height_px": args.max_height,
         "timeout": args.timeout,
     });
+    // dry-run + async 必须在 ensure_server/HTTP 之前短路。
+    if async_dry_run_plan("save-pdf", &payload, is_async)? {
+        return Ok(());
+    }
+    ensure_server()?;
     if is_async {
         print_json(submit_job("save-pdf", payload)?);
     } else {

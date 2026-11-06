@@ -1,6 +1,6 @@
 # 隐私说明
 
-适用于 `atb` 命令行工具（npm 包 `@g1728578755/atb`）与配套 Chrome 扩展 **ATB**（扩展文件版本 5.3.0）。
+适用于 `atb` 命令行工具（npm 包 `@g1728578755/atb`）与配套 Chrome 扩展 **ATB**（扩展文件版本 5.4.2）。
 
 安全边界与威胁模型见 [SECURITY.md](./SECURITY.md)；外部来源与依赖许可见 [SOURCES.md](./SOURCES.md)。
 
@@ -30,7 +30,7 @@ atb CLI（每次命令一个进程）
 | 路径 | 内容 | 用途 | 删除 |
 | --- | --- | --- | --- |
 | `~/.atb/config.json` | `{"extension_port":18765}` | 扩展连接端口 | 删除后回默认 18765 |
-| `~/.atb/api-token` | 随机 token（权限 0600，Windows 走 ACL） | CLI 调 daemon 的鉴权 | 删除后新 daemon 重新生成 |
+| `~/.atb/api-token` | 随机 token（Unix 权限 0600；Windows 上由 ACL 收紧，效果等同 Unix 0600） | CLI 调 daemon 的鉴权 | 删除后新 daemon 重新生成 |
 | `~/.atb/ws-trust.json` | 扩展白名单与握手 token（权限 0600 / Windows ACL，与 `api-token` 同等） | `trust-extension` 的可选加固 | 删除后回到兼容模式 |
 | `~/.atb/idempotency.jsonl` | 幂等记录：默认只存 `key` / `scope` / 时间 / HTTP 状态，**不存响应体** | 60 秒内重发同一 `--idempotency-key` 时回放首次结果 | 删除即清空；不影响后续命令 |
 | `~/.atb/net-hooks.json` | 按 `browser:profile` 存的网络规则 | daemon 重启后恢复 `net` 规则 | 删除即清空规则 |
@@ -48,7 +48,7 @@ atb CLI（每次命令一个进程）
 | `full` | 上面的元数据 + 响应体（单条 256KB 上限，60 秒 TTL） | 需显式开启；响应体可能含页面正文 / Cookie / 网络响应，请按敏感数据处理 |
 | `off` | 不落盘 | 纯内存缓存 |
 
-旧版本写入的带 body 行仍可回放；升级后新写入的 `redacted` 行不能回放，只是元数据。
+默认 `ATB_IDEMPOTENCY_PERSIST=redacted` 只存 `{key, scope, at, status}`，不存响应体，因此 daemon 重启后不可回放；只有 `full` 模式才存响应体、重启后可回放。旧版本写入的带 body 行仍可回放；升级后新写入的 `redacted` 行只是元数据。
 
 
 ## 会接触的浏览器数据

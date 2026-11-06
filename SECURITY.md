@@ -4,11 +4,11 @@
 
 ## 支持版本
 
-只有最新 minor 接受安全修复。当前线是 `0.7.x`，最新版 `0.7.3`。
+只有最新 minor 接受安全修复。当前线是 `0.7.x`，最新版 `0.7.4`。
 
 - 报告前先升级到最新 `0.7.x`，旧补丁版的问题可能在当前版已修复。
 - `0.6.x` 及更早不再接受安全修复。
-- 扩展版本需与 CLI 配套（当前扩展 `5.3.0`，消息协议 `4`）。
+- 扩展版本需与 CLI 配套（当前扩展 `5.4.2`，消息协议 `4`）。
 
 ## 报告漏洞
 
@@ -35,7 +35,7 @@
 攻击面：
 
 - `127.0.0.1:18765`：扩展接入的 WebSocket，默认「装了扩展就能连」（`ATB_WS_TRUST_MODE=compat`）。
-- `127.0.0.1:18767`：CLI 调 daemon 的 HTTP API，需要 `api-token`；`Host` 头只接受回环名（`127.0.0.1` / `localhost` / `[::1]`），其余返回 403 `host_not_allowed`。
+- `127.0.0.1:18767`：CLI 调 daemon 的 HTTP API，需要 `api-token`；`Host` 头只接受回环名（`127.0.0.1` / `localhost` / `[::1]` / `::1`），其余返回 403 `host_not_allowed`。
 - `~/.atb/api-token`：文件权限 0600；Windows 上在写入前收紧 ACL（去继承 + 移除 Everyone / Users 等宽松 ACE + 当前用户 SID 授权）。
 - `~/.atb/ws-trust.json`：白名单与握手 token，可选；权限与 `api-token` 同等收紧（Unix 0600、Windows `icacls`，先收紧再写入）。
 - `chrome.debugger`：attach 后能读写该标签页的网络与控制台。
@@ -47,7 +47,7 @@
 
 | 取舍 | 现状 | 后果 |
 | --- | --- | --- |
-| `trust-extension` 单向 | 只约束「谁能连 daemon」，扩展不校验对端 | 空窗期里冒充 daemon 的本机进程仍可能被扩展接受 |
+| `trust-extension` 双向校验（配 token 时） | daemon 在 WS upgrade 后立刻下发 `ws_hello`（nonce + HMAC proof）；扩展配了 token 时必须先验 proof 才发 `ext_ready` | 不知道 token 的本机进程无法冒充 daemon 拿到标签数据；**没配 token 时仍是单向**，扩展无法证明对端身份 |
 | daemon 空闲退出 | 默认 300 秒无活动且无扩展连接时退出（`ATB_IDLE_TTL`）；扩展断开有 60 秒宽限 | 退出到下次启动之间，18765 可能被同机进程抢占 |
 | `debugger` 权限 | `snapshot` 默认、纯 CSS 的 `click`/`fill`、`mouse-click`、`send-keys`、`upload`、`network`/`console`、整页/元素截图、`save-pdf`、`net mock --engine cdp`、挑战求解/点击会 attach | 浏览器顶部出现调试横幅，页面可感知 |
 | `<all_urls>` 注入 | 内容脚本在所有站点与所有帧运行 | 页面可探测到本工具的信号面，用 `stealth audit` 量化 |
@@ -74,6 +74,28 @@ ATB_WS_TRUST_MODE=both atb restart           # 重启后生效（daemon 读环�
 ```
 
 `whitelist` / `token` / `both` 都是 fail-closed：配置缺失或校验失败直接拒绝握手，不会退回 `compat`。`trust-extension --clear` / `--clear-token` 清空配置后，请同时把 `ATB_WS_TRUST_MODE` 改回 `compat`，否则 daemon 会持续拒绝所有连接。
+
+### 双向握手（`ws_hello`）
+
+`token` / `both` 档位下，daemon 在 WS upgrade 成功后**立即**下发：
+
+```json
+{"type":"ws_hello","v":1,"nonce":"<32 hex>","proof":"<64 hex>","auth_required":true}
+```
+
+`proof = HMAC-SHA256(key = ws-trust.json 的 token, msg = nonce + "|" + extension_id)`。
+扩展侧：
+
+1. 本地配了 `wsToken` 时，`onopen` **不发** `ext_ready`，先等 5 秒内的 `ws_hello`；
+2. 用 WebCrypto 复算 HMAC，恒定时间比较；不一致 → 断开并记 `daemon_auth_failed`；
+3. 校验通过才发 `ext_ready`（标签列表、版本、后续命令能力都在这一帧之后）。
+
+因此「18765 被本机进程抢占」不再等价于「拿到全浏览器控制」：攻击者不知道 token 就算不出
+proof，扩展不会泄露任何标签数据。**没配 token 时** `auth_required:false`，扩展会走旧的
+即时 `ext_ready` 路径（兼容档），此时仍没有对端身份证明 —— 共用机器请务必设置 token。
+
+`atb status` 的 `security` 块会显示当前档位与 `mutual_auth` 是否开启；`atb doctor` 在
+`compat` 且未配 token 时给出 `ws_trust` 警告。
 
 ### HTTP API 的两个前提
 
@@ -108,6 +130,21 @@ ATB_WS_TRUST_MODE=both atb restart           # 重启后生效（daemon 读环�
 - 不要共用同一个浏览器 Profile 与同一个扩展实例。
 - 需要时给 daemon 端口做系统级访问控制，而不是只依赖 token。
 
+## 发布产物校验
+
+下载 Release 或从 npm 安装后，可以逐层核对拿到的确实是本次构建的产物：
+
+- **GitHub Release**：每个普通 tag 都附 `SHA256SUMS`（各平台二进制、npm tgz、`chrome-extensions.zip`）。
+  `sha256sum -c SHA256SUMS` 逐条核对即可。
+- **GPG 签名（可选）**：发布环境配置了 `GPG_PRIVATE_KEY` 时额外产出分离签名 `SHA256SUMS.asc`，
+  用 `gpg --verify SHA256SUMS.asc SHA256SUMS` 校验后再核对哈希。**没有 `.asc` 说明本次发布未签名**，
+  Release notes 会明确标注 unsigned，不要把它当成「签名丢失」。
+- **npm 来源证明**：平台包与主包都用 `npm publish --provenance` 发布，npm 包页面上的 Provenance
+  可以追溯到具体 workflow 与 commit；`npm audit signatures` 会一并校验。
+- **平台包哈希**：主包 `package-lock.json` 里 5 个平台包的 `integrity` 与 registry 的 `dist.integrity`
+  一致（发布门禁 `node scripts/check-lock.mjs --strict-integrity --registry` 强制要求）。
+  平台包是原生二进制，`npm ci` 不做内容校验，所以这层哈希是唯一的内容锚点。
+
 ## 安全相关命令
 
 | 命令 | 作用 | 何时用 |
@@ -138,7 +175,7 @@ Report privately through GitHub Security Advisories. If unavailable, open an iss
 
 The local user is trusted; other local processes and page content are not. Traffic between the CLI, daemon and extension stays on `127.0.0.1`, using WebSocket 18765 (extension) and HTTP 18767 (CLI, `api-token`).
 
-Known trade-offs: one-way `trust-extension`, a port window after the extension disconnects and the daemon idles out, no daemon authentication by the extension, `chrome.debugger` attach, `<all_urls>` injection, readable cookies, and challenge handling that interacts with the widget, lets the agent click by coordinates as a fallback, and hands over to a human only when needed — without bypassing access control.
+Known trade-offs: `trust-extension` proves the peer only when a token is configured (`ws_hello` + HMAC); without a token the extension cannot verify the daemon. A port window remains after the extension disconnects and the daemon idles out. `chrome.debugger` attach, `<all_urls>` injection, readable cookies, and challenge handling that interacts with the widget, lets the agent click by coordinates as a fallback, and hands over to a human only when needed.
 
 WebSocket trust has four modes via `ATB_WS_TRUST_MODE`: `compat` (default; shape-only, warning header), `whitelist`, `token`, and `both` (whitelist + token, fail-closed). `compat` accepts a forged `Origin` from any local process by design; switch to `both` to close that. The HTTP API only accepts loopback `Host` headers and still requires `api-token`.
 

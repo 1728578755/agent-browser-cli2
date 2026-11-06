@@ -14,7 +14,7 @@ use super::*;
 /// 第二个返回值是排障诊断：定位要过 文档 → iframe 元素 → 盒模型 三关，
 /// 任何一关失败都表现为「没找到组件」，没有诊断就只能瞎猜。
 ///
-/// 第三个返回值 `query_failed` 是判据：**查询本身失败**（CDP 附不上 /
+/// 第三个返回值 `query_failed` 是 的判据：**查询本身失败**（CDP 附不上 /
 /// DOM 域不可用 / 回包缺失）与「页面上真的没有 iframe」必须分开。旧实现把两种
 /// 情况都压成空集合，求解决策里「组件消失」被当成「点击被接收」（widget-removed），
 /// 于是一次 attach 失败就让整轮求解提前停手等结论。
@@ -97,8 +97,7 @@ pub(crate) async fn challenge_frames(
     // srcdoc / about:blank 的包裹 iframe 的 URL 里没有挑战特征，光靠
     // URL 子串匹配会漏掉。对这类 iframe 追加「面积 > 阈值 + hit-test 命中自身」
     // 两个判据，阈值可配（默认 2000 px²）。
-    let srcdoc_min_area =
-        crate::settings::env_f64_clamped("ATB_CHALLENGE_SRCDOC_MIN_AREA", 2000.0, 0.0, 1.0e9);
+    let srcdoc_min_area = crate::settings::challenge_srcdoc_min_area();
     for node_id in iframe_ids {
         if deadline_left(deadline).is_none() {
             deadline_exhausted = true;
@@ -233,7 +232,7 @@ pub(crate) async fn challenge_frames(
     }
     // 面积大的排前面：页面里常有一个「小尺寸 / 隐形」的挑战 iframe（站点自己的检测框、
     // CF 的 hidden 探针），DOM 顺序上它可能排第一。调用方取 `frames.first()` 时就会
-    // 永远点到那个点不动的组件（B-07）。`width/height` 已经在上面按 >=4.0 校验过。
+    // 永远点到那个点不动的组件。`width/height` 已经在上面按 >=4.0 校验过。
     out.sort_by(|left, right| {
         (right.width * right.height)
             .partial_cmp(&(left.width * left.height))
@@ -512,11 +511,11 @@ pub(crate) async fn challenge_wait_result(
     // 只在第一次发现「窗口不可见」时恢复一次：反复切标签会把正在跑的验证打断，
     // 而已经跑废的挑战也不会因为窗口恢复就复活（那需要调用方 reload）。
     let mut env_restored = false;
-    // 「已经拦了多久」由 daemon 记并下发（页面脚本刻意不写 window.*，见 B-05）。
+    // 「已经拦了多久」由 daemon 记并下发（页面脚本刻意不写 window.*，见）。
     let mut first_blocking_at: Option<Instant> = None;
     loop {
         tokio::time::sleep(Duration::from_millis(350)).await;
-        //  （同一预算约束链）：单次 status 查询只能用**本函数剩余**里的量。
+        // （同一预算约束链）：单次 status 查询只能用**本函数剩余**里的量。
         // 固定 8s 时，扩展挂死会让「被动等待」在 deadline 之后再多耗 8s，
         // `--challenge-timeout 15` 就会被顶成 23s。
         let left = deadline.saturating_duration_since(Instant::now());
@@ -525,7 +524,7 @@ pub(crate) async fn challenge_wait_result(
         }
         // 只有「真的探测过」的 status 才能参与判定：空载荷（Value::Null）上
         // detected / blocking 全是 false，下面的 `!detected` 会立刻判 cleared:true，
-        // 这正是假通过路径。拿不到结论就按「还没结论」继续等/超时。
+        // 这正是 的假通过路径。拿不到结论就按「还没结论」继续等/超时。
         let Some(status) = challenge_page_call(
             state,
             session_key,

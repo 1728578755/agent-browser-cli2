@@ -263,7 +263,7 @@ test('background.js registers the navigation and debugger listeners when the API
 // 只查「监听器注册了几个」不够——注册了但一触发就抛错/产生未处理
 // Promise rejection，扩展在真实页面里同样会失效，而测试全绿。这里给每个已注册
 // 的监听器喂一次典型事件，并捕获整轮里的 unhandledRejection。
-test('each registered extension listener survives a typical event without throwing ', async () => {
+test('each registered extension listener survives a typical event without throwing', async () => {
   const source = await readFile(backgroundPath, 'utf8');
   const { context, lists, dynamicRuleCalls } = createBackgroundContext();
 

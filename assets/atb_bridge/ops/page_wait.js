@@ -17,9 +17,10 @@ function __abcWait(opts) {
   //      走 executeScript({func}) 不触发 eval，也就不受页面 CSP 约束；
   //   2) opts.js 是字符串 —— 只能在页面里 new AsyncFunction 编译。
   //
-  // 旧错误文案声称「CSP 页面编译失败 ⇒ 上层走 CDP 回退」，
-  // 但本文件（以及扩展注入通道）**没有任何 CDP 回退**：字符串路径失败就是失败。
-  // 现在如实返回结构化错误，不把调用方引向一条不存在的通道。
+  // 契约 §3.2：字符串路径被 CSP 拒绝时，本文件**不假装**有回退 ——
+  // 它只负责把原因如实结构化（error_code=wait_js_eval_blocked），由 daemon 侧
+  // `wait_for_js_condition_with_target` 据此改走 CDP Runtime.evaluate。页面内写
+  // 「已回退 CDP」是假话（本文件没有任何 CDP 通道），别再加这类文案。
   const jsFunc = typeof opts.jsFunc === 'function' ? opts.jsFunc : null;
   const jsCode = !jsFunc && opts.js ? String(opts.js) : '';
   const visible = opts.visible === true;
@@ -172,7 +173,7 @@ function __abcWait(opts) {
 
   // 谓词编译：三种写法都要支持——语句级 return、裸表达式、多语句 + await。
   // 编译只做一次。**在页面里 new AsyncFunction 等于 eval**：页面 CSP 禁
-  // unsafe-eval 时会同步抛 EvalError。这里不掩饰这一点，只把失败如实交回上层。
+  // unsafe-eval 时会同步抛错。这里不掩饰这一点，只把失败如实交回上层。
   function compilePredicate(code) {
     const trimmed = String(code || '').trim();
     if (!trimmed) throw new Error('wait: js 为空');
@@ -184,23 +185,55 @@ function __abcWait(opts) {
     return new AsyncFunction(trimmed);
   }
 
+  /// 失败是不是「被页面 CSP 拦下」而不是「谓词本身写错」。
+  ///
+  /// Chrome 被 CSP 拦时抛 EvalError（"Refused to evaluate a string as JavaScript
+  /// because 'unsafe-eval' is not an allowed source..."），个别版本/注入通道会退化成
+  /// 普通 Error 只带同一句文案，所以两条都要认：只看 name 会漏，只看 message 会误判
+  /// 用户谓词里恰好出现的同名文本（那种情况不是 CSP，交回 CDP 也救不回来）。
+  function isEvalBlocked(error) {
+    const name = String((error && error.name) || '');
+    if (name === 'EvalError') return true;
+    const detail = String((error && error.message) || error || '');
+    return /unsafe-eval|Refused to evaluate|Content Security Policy/i.test(detail);
+  }
+
   let predicate = jsFunc;
   if (!predicate && jsCode) {
+    let compileError = null;
     try {
       predicate = compilePredicate(jsCode);
     } catch (e) {
-      const detail = (e && e.message) || String(e);
+      compileError = e;
+    }
+    if (compileError) {
+      const detail = (compileError && compileError.message) || String(compileError);
+      // 契约 §3.2：CSP 拦截必须给独立错误码，daemon 据此改走 CDP Runtime.evaluate
+      // 轮询；其余编译失败（谓词语法错、空谓词）换通道也救不回来，保持原码。
+      if (isEvalBlocked(compileError)) {
+        return {
+          ok: false,
+          matched: false,
+          mode: 'js-observer',
+          error: 'wait_js_eval_blocked: ' + detail,
+          error_code: 'wait_js_eval_blocked',
+          hint: '页面 CSP 禁止 unsafe-eval：字符串谓词无法在页面内编译。'
+            + '由调用方改走 CDP Runtime.evaluate（daemon 侧按 error_code 自动切换），'
+            + '或把谓词编译成函数后再下发（opts.jsFunc）',
+          polls: 0,
+          checks: 0,
+          elapsed_ms: 0
+        };
+      }
       return {
         ok: false,
         matched: false,
         mode: 'js-observer',
         error: 'js_predicate_compile_failed: ' + detail,
         error_code: 'js_predicate_compile_failed',
-        // 归因写清楚：可能是 CSP（禁 unsafe-eval），也可能是谓词本身语法错。
-        // 无论哪种，本通道都没有 CDP 回退 —— 请改用 selector/text 条件，
-        // 或由调用方把谓词编译成函数后再下发（opts.jsFunc）。
-        hint: '字符串谓词在页面内编译失败（页面 CSP 禁止 unsafe-eval，或谓词本身语法错误）；'
-          + '本通道没有 CDP 回退，请改用 --selector/--text，或把谓词编译成函数下发',
+        // 语法错误：与 CSP 无关，换执行通道也一样失败。
+        hint: '字符串谓词在页面内编译失败（谓词本身语法错误）：修正谓词，'
+          + '或改用 --selector/--text 条件',
         polls: 0,
         checks: 0,
         elapsed_ms: 0

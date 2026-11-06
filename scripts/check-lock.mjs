@@ -15,13 +15,64 @@
 //   5. package-lock.json 的 5 个平台包条目：version / os / cpu / resolved / integrity
 //      与 scripts/platforms.json + 当前版本一致
 //
-// 用法：node scripts/check-lock.mjs
+// 两种模式：
+//   默认       日常开发/CI：平台包 integrity 允许「刚 bump、还没重新 npm install」的
+//              临时缺失（resolved 已指向当前版本），只记一条 warning。
+//   --strict-integrity
+//              发布门禁：任何平台包缺 integrity 都直接失败，不吃 resolved 兜底，
+//              也不认 ATB_LOCK_ALLOW_MISSING_INTEGRITY。平台包是原生二进制、
+//              npm ci 不校验其内容，哈希必须在发布前就有。
+//   --registry 额外查询 npm registry 的 dist.integrity 并与 lock 比对（发布后核对）。
+//              预发布期平台包尚未上架（E404）时该模式本来就该失败——它只在
+//              「平台包已全部发布、主包还没发」这个窗口里跑。
+//
+// 用法：
+//   node scripts/check-lock.mjs
+//   node scripts/check-lock.mjs --strict-integrity
+//   node scripts/check-lock.mjs --strict-integrity --registry
+//   node scripts/check-lock.mjs --registry --registry-url https://registry.npmmirror.com
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig, platformPackageNames } from './platforms.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+
+/// 校验参数。--registry 的查询要容忍 registry 的提交延迟（刚 publish 完，
+/// 元数据通常几秒内可见，但 CDN 边缘可能更慢），默认重试 6 次、每次间隔 5s。
+function parseArgs(argv) {
+  const options = {
+    strictIntegrity: false,
+    registry: false,
+    registryUrl: null,
+    registryRetries: Number(process.env.ATB_REGISTRY_RETRIES ?? 6),
+    registryRetryMs: Number(process.env.ATB_REGISTRY_RETRY_MS ?? 5000),
+  };
+  for (let i = 0; i < argv.length; i += 1) {
+    const current = argv[i];
+    if (current === '--strict-integrity') options.strictIntegrity = true;
+    else if (current === '--registry') options.registry = true;
+    else if (current === '--registry-url') {
+      options.registry = true;
+      options.registryUrl = argv[++i] ?? null;
+    } else if (current.startsWith('--registry-url=')) {
+      options.registry = true;
+      options.registryUrl = current.slice('--registry-url='.length);
+    } else if (current === '--help' || current === '-h') {
+      console.log(
+        '用法: check-lock.mjs [--strict-integrity] [--registry [--registry-url <url>]]\n' +
+          '  --strict-integrity  平台包缺 integrity 直接失败（发布门禁用）\n' +
+          '  --registry          查询 npm registry 的 dist.integrity 并与 lock 比对',
+      );
+      process.exit(0);
+    } else {
+      throw new Error(`未知参数: ${current}`);
+    }
+  }
+  if (!Number.isFinite(options.registryRetries) || options.registryRetries < 1) options.registryRetries = 1;
+  if (!Number.isFinite(options.registryRetryMs) || options.registryRetryMs < 0) options.registryRetryMs = 0;
+  return options;
+}
 
 /// 去掉行尾注释；引号内的 `#` 不算注释（依赖的 url/feature 里可能有）。
 function stripComment(line) {
@@ -206,8 +257,9 @@ function compareList(actual, expected) {
   return left.length === right.length && left.every((item, index) => item === right[index]);
 }
 
-function checkPlatformPackages(pkg, pkgLock, platforms, registry) {
+function checkPlatformPackages(pkg, pkgLock, platforms, registry, options = {}) {
   const problems = [];
+  const warnings = [];
   const version = pkg.version;
   const expected = platformPackageNames(pkg.name, platforms);
   const declared = pkg.optionalDependencies ?? {};
@@ -253,21 +305,101 @@ function checkPlatformPackages(pkg, pkgLock, platforms, registry) {
       problems.push(`${key} 的 resolved = ${entry.resolved ?? '(缺失)'}，应为 ${tarball}`);
     }
     if (entry.integrity === undefined) {
-      // 刚 bump 完、还没重新 npm install 时新 tarball 的 integrity 无法离线算出，
+      // 默认模式：刚 bump 完、还没重新 npm install 时新 tarball 的 integrity 无法离线算出，
       // 这是唯一合法缺失场景（resolved 已指向当前版本）。其余缺失说明 lock 被手改过。
+      // --strict-integrity（发布门禁）下不接受任何「临时缺失」：这个兜底条件恰好总被
+      // `sync-version --deps` 满足，于是「临时」会变成永久缺失。
       const resolvedIsCurrent = typeof entry.resolved === 'string' && entry.resolved.includes(`-${version}.tgz`);
-      if (!resolvedIsCurrent && process.env.ATB_LOCK_ALLOW_MISSING_INTEGRITY !== '1') {
+      if (options.strictIntegrity) {
+        problems.push(
+          `${key} 的 integrity 缺失（--strict-integrity：平台包是原生二进制，npm ci 不校验内容，哈希必须在发布前写入 lock）`,
+        );
+      } else if (!resolvedIsCurrent && process.env.ATB_LOCK_ALLOW_MISSING_INTEGRITY !== '1') {
         problems.push(`${key} 的 integrity 缺失（resolved 也不是当前版本 ${version}）`);
+      } else {
+        warnings.push(`${key} 的 integrity 缺失（预发布期允许；发布门禁 --strict-integrity 会失败）`);
       }
     } else if (!/^sha(1|512)-[A-Za-z0-9+/=]+$/.test(entry.integrity)) {
       problems.push(`${key} 的 integrity 格式非法: ${entry.integrity}`);
     }
   }
+  return { problems, warnings };
+}
+
+// ---------------------------------------------------------------------------
+// --registry：向 npm registry 核对平台包哈希
+// ---------------------------------------------------------------------------
+
+/// 作用域包名在 registry 上是 `@scope%2Fname`。保留 `@`，只转义 `/`，
+/// 这样报错信息与 npm 文档里的 URL 形状一致，方便手工复核。
+function registryPackageUrl(registry, name) {
+  const slash = name.indexOf('/');
+  const encoded = slash === -1 ? name : `${name.slice(0, slash)}%2F${name.slice(slash + 1)}`;
+  return `${registry.replace(/\/+$/, '')}/${encoded}`;
+}
+
+async function fetchRegistryDoc(registry, name, options) {
+  const url = registryPackageUrl(registry, name);
+  let lastError = null;
+  for (let attempt = 1; attempt <= options.registryRetries; attempt += 1) {
+    try {
+      const response = await fetch(url, {
+        headers: { accept: 'application/json' },
+        signal: AbortSignal.timeout(20000),
+      });
+      if (response.status === 404) {
+        return { missing: true, url, detail: 'E404' };
+      }
+      if (!response.ok) {
+        lastError = `HTTP ${response.status}`;
+      } else {
+        return { data: await response.json(), url };
+      }
+    } catch (error) {
+      lastError = error.message;
+    }
+    if (attempt < options.registryRetries) {
+      await new Promise((done) => setTimeout(done, options.registryRetryMs));
+    }
+  }
+  return { error: lastError ?? '未知错误', url };
+}
+
+async function checkRegistryIntegrity(pkg, pkgLock, platforms, registry, options) {
+  const problems = [];
+  const version = pkg.version;
+  for (const platform of platforms) {
+    const name = `${pkg.name}-${platform.name}`;
+    const entry = pkgLock.packages?.[`node_modules/${name}`] ?? {};
+    const result = await fetchRegistryDoc(registry, name, options);
+    if (result.missing) {
+      problems.push(`registry 上找不到 ${name}（尚未发布？发布链路必须在平台包发布之后再跑这一步）: ${result.url}`);
+      continue;
+    }
+    if (result.error) {
+      problems.push(`查询 ${name} 失败（${result.error}）：registry 不可用或网络受限: ${result.url}`);
+      continue;
+    }
+    const published = result.data?.versions?.[version]?.dist?.integrity;
+    if (!published) {
+      problems.push(`${name} 在 registry 上没有版本 ${version} 的 dist.integrity（实际版本: ${Object.keys(result.data?.versions ?? {}).join(', ') || '(无)'}）`);
+      continue;
+    }
+    if (!entry.integrity) {
+      problems.push(`${name}@${version} 在 registry 上的 integrity = ${published}，但 package-lock.json 里缺失`);
+      continue;
+    }
+    if (entry.integrity !== published) {
+      problems.push(`${name}@${version} 的 integrity 与 registry 不一致：lock = ${entry.integrity}，registry = ${published}`);
+    }
+  }
   return problems;
 }
 
-function main() {
+async function main() {
+  const options = parseArgs(process.argv.slice(2));
   const problems = [];
+  const warnings = [];
 
   const cargoTomlPath = join(ROOT, 'Cargo.toml');
   const cargoLockPath = join(ROOT, 'Cargo.lock');
@@ -276,7 +408,7 @@ function main() {
 
   if (!existsSync(cargoLockPath)) {
     problems.push('Cargo.lock 不存在：--locked 构建会直接失败，请先 cargo generate-lockfile');
-    report(problems);
+    report(problems, warnings, options);
     return;
   }
 
@@ -335,25 +467,38 @@ function main() {
   }
   if (existsSync(packageLockPath)) {
     const { registry, platforms } = loadConfig();
-    problems.push(...checkPlatformPackages(pkg, pkgLock, platforms, registry));
+    const platformResult = checkPlatformPackages(pkg, pkgLock, platforms, registry, options);
+    problems.push(...platformResult.problems);
+    warnings.push(...platformResult.warnings);
+    if (options.registry) {
+      // registry 查询放在最后：lock 本身的字段问题更便宜、更好定位，先报出来。
+      problems.push(...(await checkRegistryIntegrity(pkg, pkgLock, platforms, options.registryUrl ?? registry, options)));
+    }
   }
 
-  report(problems);
+  report(problems, warnings, options);
 }
 
-function report(problems) {
+function report(problems, warnings = [], options = {}) {
+  for (const warning of warnings) console.error(`警告: ${warning}`);
   if (problems.length === 0) {
-    console.log('lock 一致');
+    console.log(`lock 一致${options.strictIntegrity ? '（严格 integrity）' : ''}`);
     return;
   }
   console.error('lock 不一致：');
   for (const problem of problems) console.error(`  - ${problem}`);
   console.error('修复：版本号用 `npm run sync-version` 同步；依赖变动后运行 `cargo generate-lockfile`。');
+  if (options.strictIntegrity) {
+    console.error(
+      '严格模式：平台包 integrity 必须齐全。平台包发布后执行 `npm install --package-lock-only` 或手工补 dist.integrity，' +
+        '使其与 registry 一致后再发主包。',
+    );
+  }
   process.exit(1);
 }
 
 try {
-  main();
+  await main();
 } catch (error) {
   console.error(`lock 检查执行失败: ${error.message}`);
   process.exit(1);

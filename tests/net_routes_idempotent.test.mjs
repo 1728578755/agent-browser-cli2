@@ -116,7 +116,7 @@ function blockAfter(text, anchorIndex) {
 ///
 /// 兼容三种写法：`"route" => {}`、`"route" | "mock" => {}`、`action == "route" {}`。
 /// 注意 `[^;{}]*` 限定在 `=>` 之前不能跨过 `{`——否则 `matches!(action.as_str(), "route" | ...) {`
-/// 这种判断语句会被误认成分支，导致对错误位置做断言（v6 P3 的「fixture 与实现脱节」）。
+/// 这种判断语句会被误认成分支，导致对错误位置做断言（v6 的「fixture 与实现脱节」）。
 function findBranchBlock(text, action) {
   const patterns = [
     new RegExp(`"${action}"\\s*\\|[^;{}]*=>`),
@@ -213,7 +213,7 @@ if (routesBlock) {
 
   if (calls.length === 0) {
     // 旧写法在这里 check(..., true)：一旦实现改了、fixture 找不到调用，断言自动通过，
-    // 守卫彻底失效（v6 P3）。「找不到」必须失败，并把原因说清楚。
+    // 守卫彻底失效（v6）。「找不到」必须失败，并把原因说清楚。
     check(
       'routes 分支仍能定位到 net_cdp_broadcast 调用',
       false,
@@ -259,7 +259,7 @@ for (const [action, label] of [
 ]) {
   const block = findBranchBlock(source, action);
   // 旧写法 `if (!block) continue;`：一旦分支改名或文件被拆走，这个 action 一条断言
-  // 都不产生，脚本仍然全绿（v6 P3）。找不到分支必须显式失败。
+  // 都不产生，脚本仍然全绿（v6）。找不到分支必须显式失败。
   if (!block) {
     check(`找到 net ${label} 分支`, false, `未匹配到 "${action}" 分支（实现可能改名/拆分，测试锚点已脱节）`);
     continue;
@@ -281,7 +281,7 @@ for (const [action, label] of [
   check(`net ${label} 分支下发的是规则数组`, bad.length === 0, bad.map((c) => (c.args || []).join(' | ')).join(' ; '));
 }
 
-// 3) 死代码 / 旧字段不该被捡回来（的「腰带」）。
+// 3) 死代码 / 旧字段不该被捡回来（「腰带」）。
 // 真正的行为断言在 mock_extension 的 6c2（走真 daemon 看 change 形状）；
 // 这里只做低成本的静态兜底，防止整页 HTML 对比那套实现复活。
 //
@@ -300,7 +300,7 @@ check(
 check(
   'src/server 不再产出 top_change 字段',
   !/["']top_change["']\s*:/.test(stripComments(source)),
-  'top_change 回传原始 HTML 片段，是回归点',
+  'top_change 回传原始 HTML 片段，是 BUG-27 的回归点',
 );
 
 const failed = results.filter((item) => !item.ok);

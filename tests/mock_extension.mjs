@@ -193,26 +193,6 @@ export function startMockExtension({ waitForReady = true, port = DEFAULT_EXT_POR
         ],
       };
     }
-    // `--details` 的批量补详情脚本：daemon 把 ELEMENT_DOM_SCRIPT 与 [ref, selector]
-    // 目标表拼成一段脚本下发（src/server/snapshot.rs 的 collect_dom_details_via_js）。
-    // 这里按目标表回同样的形状，tag 用大写（CDP 的 DOM.describeNode 也是大写）。
-    if (/const __abcDescribe =/.test(code)) {
-      const details = {};
-      for (const match of code.matchAll(/\["(@e\d+)","([^"]*)"\]/g)) {
-        details[match[1]] = {
-          tag: "BUTTON",
-          text: "Go",
-          type: null,
-          href: null,
-          disabled: false,
-          rect: { x: 1, y: 2, w: 40, h: 20 },
-          selector: match[2],
-          visible: true,
-        };
-      }
-      return { ok: true, details };
-    }
-
     if (/__abcSnapshot\(/.test(code)) {
       return {
         ok: true,
@@ -295,7 +275,7 @@ export function startMockExtension({ waitForReady = true, port = DEFAULT_EXT_POR
         };
       }
       if (isHook) {
-        // 真实 page_net 的 hook 回包同时给计数与真实数组（的回归点：
+        // 真实 page_net 的 hook 回包同时给计数与真实数组（回归点：
         // daemon 必须持久化 routes_list，而不是把计数当规则存进去）。
         if (Array.isArray(netOpts.routes)) state.netRoutes = netOpts.routes.slice();
         return {
@@ -411,11 +391,7 @@ export function startMockExtension({ waitForReady = true, port = DEFAULT_EXT_POR
         return {
           ...base,
           action: "wait",
-          ok: true,
-          matched: true,
           cleared: true,
-          probed: true,
-          detected: true,
           vendor: profile.vendor,
           blocking: false,
           interactive: profile.interactive,
@@ -427,12 +403,8 @@ export function startMockExtension({ waitForReady = true, port = DEFAULT_EXT_POR
         return {
           ...base,
           action: "wait",
-          ok: true,
-          matched: true,
           cleared: true,
           via: "token",
-          probed: true,
-          detected: true,
           vendor: "turnstile",
           token_fields: tokenFields,
           blocking: false,
@@ -455,11 +427,7 @@ export function startMockExtension({ waitForReady = true, port = DEFAULT_EXT_POR
           return {
             ...base,
             action: "wait",
-            ok: false,
-            matched: false,
             cleared: false,
-            probed: true,
-            detected: true,
             reason: "timeout",
             vendor: "turnstile",
             hints: ["页面里存在验证码组件：可正常浏览，提交前需要人完成"],
@@ -470,11 +438,7 @@ export function startMockExtension({ waitForReady = true, port = DEFAULT_EXT_POR
         return {
           ...base,
           action: "wait",
-          ok: false,
-          matched: false,
           cleared: false,
-          probed: true,
-          detected: true,
           reason: "need_human",
           need_human: true,
           vendor: "turnstile",
@@ -487,11 +451,7 @@ export function startMockExtension({ waitForReady = true, port = DEFAULT_EXT_POR
       return {
         ...base,
         action: "wait",
-        ok: false,
-        matched: false,
         cleared: false,
-        probed: true,
-        detected: true,
         reason: "timeout",
         hints: ["页面里存在验证码组件：可正常浏览，提交前需要人完成"],
         checks: 8,
@@ -1039,13 +999,7 @@ function runSelfTest() {
     const snap = await run(["snapshot", "--limit", "10", "--details"]);
     const snapTree = JSON.stringify(snap.json?.result?.tree ?? []);
     assert(snap.json?.ok === true, "snapshot 成功", snap.stdout);
-    const snapPagination = snap.json?.result?.pagination || {};
-    // CDP 路径给 total_operable；回退到 JS 快照时只有 returned（同口径的窗口内条数）。
-    assert(
-      (snapPagination.total_operable ?? snapPagination.returned ?? 0) >= 1,
-      "至少一个 @e 引用",
-      snapPagination,
-    );
+    assert((snap.json?.result?.pagination?.total_operable ?? 0) >= 1, "至少一个 @e 引用", snap.json?.result?.pagination);
     assert(/"tag":"BUTTON"/.test(snapTree), "详情已合并进树", snapTree.slice(0, 200));
     assert(!/dom_error/.test(snapTree), "详情无错误", snapTree.slice(0, 200));
 
@@ -1165,7 +1119,7 @@ function runSelfTest() {
     // click --monitor 的 change 必须与 js --monitor 同构（结构化摘要），
     // 不能再回传原始 HTML 片段（top_change）。断言只锁「回归点 + 关键字段类型」，
     // 不锁字段集合——以后新增字段不应该让测试红。
-    console.log("6c2) click --monitor 的 change 形状");
+    console.log("6c2) click --monitor 的 change 形状（BUG-27）");
     result = await run(["click", jsRef, "--monitor", "--tab", tabId]);
     const monitorChange = result.json?.result?.change;
     assert(result.json?.ok === true, "click --monitor 成功", result.stdout);
@@ -1305,7 +1259,7 @@ function runSelfTest() {
 
     // hook --persist 之后 daemon 持久化的必须是真实规则数组（routes_list），
     // 而不是 hook 回包里的计数（routes: 1）。把计数当数组存，后续 net routes 会读回空。
-    console.log("6j) hook --persist 后 net routes 仍能读回规则");
+    console.log("6j) hook --persist 后 net routes 仍能读回规则（BUG-08）");
     await run(["net", "mock", "/persist-api", "--tab", tabId]);
     const hooked = await run(["net", "hook", "--persist", "--tab", tabId]);
     assert(hooked.json?.ok === true, "hook --persist 成功", hooked.stdout);
@@ -1385,15 +1339,9 @@ function runSelfTest() {
     result = await run(["challenge", "solve", "--tab", tabId, "--timeout", "6"]);
     const chSolveToken = result.json?.result || {};
     assert(chSolveToken.passed === true && chSolveToken.via === "token", "拿到令牌时 via=token", chSolveToken);
-    // status 已报 token_ready 时 solve 走快路径直接通过，允许 injections=0；
-    // 但不能出现「没 token 也报 via=token」的假通过（上面已断言 via=token 且 passed=true）。
-    assert(
-      chSolveToken.injections >= 0,
-      "token 场景允许快路径通过（status 已报 token_ready）",
-      chSolveToken.injections,
-    );
+    assert(chSolveToken.injections >= 1, "token 场景 blocking=true 卡住快路径，必走循环", chSolveToken.injections);
 
-    // 验证码一直没完成：必须 passed=false，且不得出现 passed=true（的假通过回归点）。
+    // 验证码一直没完成：必须 passed=false，且不得出现 passed=true（假通过回归点）。
     mock.state.challengeScenario = "timeout";
     result = await run(["challenge", "solve", "--tab", tabId, "--timeout", "2"]);
     const chSolveTimeout = result.json?.result || {};

@@ -1,0 +1,453 @@
+/* popup 布局。
+ *
+ * 尺寸策略（视觉重做）：
+ *   - 宽度跟随可用视口，永远不超出 100vw；三档宽度存在 storage.popupWidthMode；
+ *   - 头部与分区条固定，只有内容区滚动，避免「整页滚 + 列表滚」双层滚动；
+ *   - 高度上限 600px（Chrome 弹窗上限），内容更少时按内容收缩。
+ */
+html,
+body {
+  min-height: 0;
+}
+
+/* 窄标签页里 body 只有 420px，外层不能留白底，否则像一张纸浮在墙上。 */
+html {
+  background: var(--bg);
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  /* 固定 px，不用 min(...,100vw)：扩展弹窗里 100vw 会按“内容宽度”解析，
+     min() 会把宽度收缩成内容最小宽度（实测弹窗卡在窄条）。 */
+  width: 420px;
+  max-height: 600px;
+  /* 弹窗里 body 就是窗口宽度，auto 边距等于 0；在窄标签页里则把 420px 的
+     列居中，不再贴在左上角。 */
+  margin: 0 auto;
+  background: var(--bg);
+}
+
+body[data-width="compact"] {
+  width: 340px;
+}
+
+body[data-width="wide"] {
+  width: 560px;
+}
+
+/* ------------------------------------------------------------- 顶栏 */
+
+.appbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex: 0 0 auto;
+  padding: 10px 12px 6px;
+  background: var(--bg);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.brand-logo {
+  border-radius: 5px;
+  display: block;
+}
+
+.brand-name {
+  font-size: var(--text-md);
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.brand-ver {
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+
+.appbar-right {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+#connPill {
+  max-width: 132px;
+}
+
+#connPill .dot {
+  background: var(--text-3);
+}
+
+#connPill.ok .dot {
+  background: var(--ok);
+}
+
+#connPill.err .dot {
+  background: var(--err);
+}
+
+#connPill.warn .dot {
+  background: var(--warn);
+}
+
+/* ------------------------------------------------------------- 分区条 */
+
+.tabs {
+  display: flex;
+  gap: 2px;
+  flex: 0 0 auto;
+  margin: 0 12px 8px;
+  padding: 3px;
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+}
+
+.tab {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  flex: 1 1 0;
+  min-height: 26px;
+  padding: 0 6px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-2);
+  font-family: inherit;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  cursor: pointer;
+  transition: background var(--dur) var(--ease), color var(--dur) var(--ease),
+    box-shadow var(--dur) var(--ease);
+}
+
+.tab:hover {
+  color: var(--text);
+}
+
+.tab[aria-selected="true"] {
+  background: var(--surface);
+  border-color: var(--border);
+  color: var(--text);
+  box-shadow: var(--shadow-sm);
+}
+
+.tab-count {
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: var(--radius-pill);
+  background: var(--surface-3);
+  color: var(--text-3);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
+}
+
+/* ------------------------------------------------------------- 内容区 */
+
+.content {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 0 12px 12px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.panel {
+  display: flex;
+  flex-direction: column;
+}
+
+body[data-width="compact"] .content {
+  padding: 0 10px 10px;
+}
+
+/* ------------------------------------------------------------- 状态卡片 */
+
+.hero {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.hero-main {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  min-width: 0;
+}
+
+.status-dot {
+  flex: 0 0 auto;
+  width: 9px;
+  height: 9px;
+  margin-top: 5px;
+  border-radius: 50%;
+  background: var(--text-3);
+  box-shadow: 0 0 0 3px var(--surface-2);
+}
+
+.status-dot[data-state="ok"] {
+  background: var(--ok);
+  box-shadow: 0 0 0 3px var(--ok-bg);
+}
+
+.status-dot[data-state="warn"] {
+  background: var(--warn);
+  box-shadow: 0 0 0 3px var(--warn-bg);
+}
+
+.status-dot[data-state="err"] {
+  background: var(--err);
+  box-shadow: 0 0 0 3px var(--err-bg);
+}
+
+.hero-text {
+  min-width: 0;
+}
+
+.hero-title {
+  font-size: var(--text-lg);
+  font-weight: 650;
+  line-height: 1.3;
+  letter-spacing: 0.01em;
+}
+
+.hero-sub {
+  margin-top: 2px;
+  font-size: var(--text-xs);
+  color: var(--text-3);
+  overflow-wrap: anywhere;
+}
+
+#reconnect {
+  flex: 0 0 auto;
+}
+
+/* ------------------------------------------------------------- 工具条 */
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: nowrap;
+}
+
+.toolbar-wrap {
+  margin-top: 8px;
+  flex-wrap: wrap;
+  justify-content: space-between;
+}
+
+.filter-row {
+  margin-top: 8px;
+}
+
+.cookie-list {
+  /* 不做内层滚动：整个「数据」分区只有页面一条滚动条，避免出现
+     「列表滚到一半被裁断 + 外层再滚」的双层滚动（同一个坑）。 */
+  margin-top: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+  overflow: hidden;
+}
+
+.cookie-list:empty {
+  display: none;
+}
+
+.cookie-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 2px 8px;
+  padding: 7px 10px;
+  border-top: 1px solid var(--border);
+}
+
+.cookie-item:first-child {
+  border-top: none;
+}
+
+.cookie-name {
+  font-size: var(--text-sm);
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cookie-flags {
+  display: inline-flex;
+  gap: 3px;
+  align-items: center;
+}
+
+.flag {
+  height: 15px;
+  padding: 0 4px;
+  border-radius: 4px;
+  background: var(--surface-3);
+  color: var(--text-3);
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  line-height: 15px;
+}
+
+.flag.h {
+  background: var(--accent-weak);
+  color: var(--accent-text);
+}
+
+.cookie-value {
+  grid-column: 1 / -1;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+
+.cookie-item.is-secret .cookie-value {
+  color: var(--text-3);
+}
+
+/* ------------------------------------------------------------- 设置 */
+
+.field-gap {
+  margin-top: 12px;
+}
+
+code {
+  padding: 1px 4px;
+  white-space: nowrap;
+  border-radius: 4px;
+  background: var(--surface-2);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-2);
+}
+
+#buildInfo {
+  white-space: nowrap;
+}
+
+/* 窄窗口下把按钮组整体换行，而不是把一个操作拆成两行。 */
+body[data-width="compact"] .toolbar {
+  flex-wrap: wrap;
+}
+
+body[data-width="compact"] .hero {
+  flex-direction: column;
+  align-items: stretch;
+}
+
+body[data-width="compact"] #reconnect {
+  align-self: flex-start;
+}
+
+body[data-width="compact"] .kv-row {
+  grid-template-columns: minmax(64px, auto) minmax(0, 1fr);
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 8px;
+  background: var(--border-strong);
+  background-clip: content-box;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+
+/* ------------------------------------------------ 标签页内打开（页面模式）
+ *
+ * 直接在标签页里打开 popup.html（管理页的「预览」按钮、或手动输 URL）时，
+ * 420px 的弹窗宽度会显得又窄又贴在左边。popup.js 会用 chrome.tabs.getCurrent()
+ * 判断当前是不是标签页：是则给 <html>/<body> 打 data-mode="page"，这里切成
+ * 「整页滚动 + 居中 900px 列」的布局；弹窗里不受影响。
+ */
+html[data-mode="page"] {
+  background: var(--bg-page);
+}
+
+body[data-mode="page"] {
+  width: 100%;
+  max-width: none;
+  max-height: none;
+  min-height: 100vh;
+  margin: 0 auto;
+}
+
+body[data-mode="page"] .appbar {
+  position: sticky;
+  top: 0;
+  z-index: 4;
+  width: 100%;
+  max-width: 780px;
+  margin: 0 auto;
+  padding: 18px 24px 10px;
+  background: var(--bg);
+}
+
+/* 三个分区不需要铺满 900px：限宽并和卡片左边缘对齐（宽屏时按内容列偏移）。 */
+body[data-mode="page"] .tabs {
+  width: min(380px, calc(100% - 48px));
+  margin-left: max(24px, calc((100% - 780px) / 2 + 24px));
+  margin-right: auto;
+  margin-bottom: 14px;
+}
+
+body[data-mode="page"] .content {
+  width: 100%;
+  max-width: 780px;
+  margin: 0 auto;
+  padding: 0 24px 40px;
+  overflow: visible;
+}
+
+/* 页面模式下列宽了，表单控件不能跟着拉满 —— 端口/token 输入框按内容宽度收住，
+   主题/宽度/间距三列也限宽，否则 780px 下会看到 600px 长的端口输入框。 */
+body[data-mode="page"] .field-row > .input {
+  flex: 0 1 320px;
+}
+
+body[data-mode="page"] .field-row > .input[type="number"] {
+  flex-basis: 140px;
+}
+
+body[data-mode="page"] .field-row > .select,
+body[data-mode="page"] .field > .select,
+body[data-mode="page"] .field > .input {
+  max-width: 320px;
+}
+
+/* 页面模式固定三列：主题 / 弹窗宽度 / 间距 一行放下，不会出现「第三个掉到下一行」。 */
+body[data-mode="page"] .field-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+/* 页头版本号后面标一下来源，避免误以为这是官方独立页面。 */
+body[data-mode="page"] .brand-ver::after {
+  content: " · 页面预览";
+  color: var(--text-3);
+}

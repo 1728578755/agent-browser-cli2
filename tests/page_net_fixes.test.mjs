@@ -1,13 +1,13 @@
-// page_net.js 在 里被点出的几条「静默失效」的回归测试。
+// page_net.js 在 v5 审阅里被点出的几条「静默失效」的回归测试。
 //
 // 这些都是「跑起来不报错、但行为和文档不一致」的问题，靠读代码很难守住：
-//   相对 URL 不解析 → 用户按直觉写的 match 永远不命中
-//   子串被当正则 → `app.js` 会命中 `appXjs`
-//   更新规则排到队尾 → 命中顺序翻转，宽规则吃掉具体规则
-//   net fetch 走被自己 hook 的 fetch → 自证循环的假象
-//   capture 阻塞返回 → SSE 页面 fetch 永不 resolve
-//   mock 构造抛错 → 页面 reject 且日志里查不到这次请求
-//   响应改写丢 url / 非必要缓冲
+// 相对 URL 不解析 → 用户按直觉写的 match 永远不命中
+// 子串被当正则 → `app.js` 会命中 `appXjs`
+// 更新规则排到队尾 → 命中顺序翻转，宽规则吃掉具体规则
+// net fetch 走被自己 hook 的 fetch → 自证循环的假象
+// capture 阻塞返回 → SSE 页面 fetch 永不 resolve
+// mock 构造抛错 → 页面 reject 且日志里查不到这次请求
+// 响应改写丢 url / 非必要缓冲
 //
 // 这里把 page_net.js 放进 vm 跑，用一个能模拟「无内容状态码不能带 body」的
 // FakeResponse 当浏览器，逐条断言可观察行为。
@@ -131,41 +131,41 @@ function logs(net) {
   return Array.isArray(out.items) ? out.items : [];
 }
 
-// ---- ：相对 URL 也要能命中按域名写的规则 ----
+// ---- 相对 URL 也要能命中按域名写的规则 ----
 {
   const { context, net } = createContext();
   net({ action: 'hook', routes: [{ match: 'example.com/api', status: 418, body: 'teapot' }] });
   const response = await withTimeout(context.window.fetch('/api/user'), 'fetch /api/user');
   check(
-    ' 相对 URL 能命中按绝对地址写的规则',
+    '相对 URL 能命中按绝对地址写的规则',
     response && response.status === 418,
     'status=' + (response && response.status),
   );
 }
 
-// ---- ：字面量匹配不再被当正则 ----
+// ---- 字面量匹配不再被当正则 ----
 {
   const { context, net } = createContext();
   net({ action: 'hook', routes: [{ match: 'app.js', status: 418, body: 'teapot' }] });
   const wrong = await withTimeout(context.window.fetch('https://example.com/appXjs'), 'fetch appXjs');
   const right = await withTimeout(context.window.fetch('https://example.com/app.js'), 'fetch app.js');
   check(
-    ' 字面量 `app.js` 不再命中 `appXjs`',
+    '字面量 `app.js` 不再命中 `appXjs`',
     wrong && wrong.status === 200,
     'status=' + (wrong && wrong.status),
   );
-  check(' 字面量仍然命中同名文件', right && right.status === 418, 'status=' + (right && right.status));
+  check('字面量仍然命中同名文件', right && right.status === 418, 'status=' + (right && right.status));
 }
 
-// ---- JS-16b：显式 regex:true 才启用正则 ----
+// ---- 显式 regex:true 才启用正则 ----
 {
   const { context, net } = createContext();
   net({ action: 'hook', routes: [{ match: '^https://example\\.com/v\\d+/', regex: true, status: 418, body: 'x' }] });
   const hit = await withTimeout(context.window.fetch('https://example.com/v2/items'), 'fetch v2/items');
-  check(' 显式 regex:true 时按正则匹配', hit && hit.status === 418, 'status=' + (hit && hit.status));
+  check('显式 regex:true 时按正则匹配', hit && hit.status === 418, 'status=' + (hit && hit.status));
 }
 
-// ---- ：更新规则是原位替换，不改变命中优先级 ----
+// ---- 更新规则是原位替换，不改变命中优先级 ----
 {
   const { context, net } = createContext();
   // 具体规则在前、宽规则在后（用户配的顺序）。更新具体规则时如果被「先删再 push」
@@ -174,32 +174,32 @@ function logs(net) {
   net({ action: 'route', rule: { match: '/api/', status: 200, body: 'wide' } });
   const replaced = net({ action: 'route', rule: { match: '/api/user', status: 202, body: 'user2' } });
   const order = replaced.all.map((rule) => rule.match).join(',');
-  check(' 更新规则后条数不变', replaced.routes === 2, 'routes=' + replaced.routes);
-  check(' 更新规则保持原位置（不挪到队尾）', order === '/api/user,/api/', order);
-  check(' 回显 replaced=true', replaced.replaced === true, JSON.stringify(replaced.replaced));
+  check('更新规则后条数不变', replaced.routes === 2, 'routes=' + replaced.routes);
+  check('更新规则保持原位置（不挪到队尾）', order === '/api/user,/api/', order);
+  check('回显 replaced=true', replaced.replaced === true, JSON.stringify(replaced.replaced));
   net({ action: 'hook' });
   const response = await withTimeout(context.window.fetch('https://example.com/api/user'), 'fetch api/user');
   check(
-    ' 具体规则仍然优先于宽规则',
+    '具体规则仍然优先于宽规则',
     response && response.status === 202,
     'status=' + (response && response.status),
   );
 }
 
-// ---- ：net fetch 走原始 fetch，不被自己的规则骗 ----
+// ---- net fetch 走原始 fetch，不被自己的规则骗 ----
 {
   const { context, net } = createContext();
   net({ action: 'hook', routes: [{ match: 'example.com/data', status: 418, body: 'mocked' }] });
   const diagnostic = await net({ action: 'fetch', url: 'https://example.com/data' });
   check(
-    ' net fetch 返回真实响应而不是自己的 mock',
+    'net fetch 返回真实响应而不是自己的 mock',
     diagnostic.status === 200,
     'status=' + diagnostic.status,
   );
-  check(' 结果标注 bypassed_hooks', diagnostic.bypassed_hooks === true, JSON.stringify(diagnostic.bypassed_hooks));
+  check('结果标注 bypassed_hooks', diagnostic.bypassed_hooks === true, JSON.stringify(diagnostic.bypassed_hooks));
 }
 
-// ---- ：captureBodies 不能阻塞页面自己的 fetch ----
+// ---- captureBodies 不能阻塞页面自己的 fetch ----
 {
   const { context, net } = createContext(async () => {
     const response = new FakeResponse('stream', { status: 200, headers: { 'content-type': 'text/plain' } });
@@ -212,10 +212,10 @@ function logs(net) {
     withTimeout(context.window.fetch('https://example.com/slow'), 'fetch slow').then(() => 'fetch'),
     new Promise((resolve) => setTimeout(() => resolve('timeout'), 300)),
   ]);
-  check(' body 读不完时 fetch 仍然立即返回', winner === 'fetch', winner);
+  check('body 读不完时 fetch 仍然立即返回', winner === 'fetch', winner);
 }
 
-// ---- JS-02b：SSE 直接跳过捕获并写明原因 ----
+// ---- SSE 直接跳过捕获并写明原因 ----
 {
   const { context, net } = createContext(async () => {
     const response = new FakeResponse('data: 1\n\n', {
@@ -229,13 +229,13 @@ function logs(net) {
   await withTimeout(context.window.fetch('https://example.com/stream'), 'fetch stream');
   const entry = logs(net).find((item) => String(item.url).includes('/stream'));
   check(
-    ' 流式响应标注 body_capture_skipped',
+    '流式响应标注 body_capture_skipped',
     !!entry && /event-stream/.test(String(entry.body_capture_skipped || '')),
     JSON.stringify(entry && entry.body_capture_skipped),
   );
 }
 
-// ---- ：非法 status 的 mock 不把异常抛给页面，且留下日志 ----
+// ---- 非法 status 的 mock 不把异常抛给页面，且留下日志 ----
 {
   const { context, net } = createContext();
   net({ action: 'hook', routes: [{ match: '/bad', status: 999, body: 'x' }] });
@@ -246,13 +246,13 @@ function logs(net) {
   } catch (e) {
     threw = e;
   }
-  check(' 非法 status 不抛给页面', threw === null, String(threw && threw.message));
-  check(' 放行真实请求', response && response.status === 200, 'status=' + (response && response.status));
+  check('非法 status 不抛给页面', threw === null, String(threw && threw.message));
+  check('放行真实请求', response && response.status === 200, 'status=' + (response && response.status));
   const entry = logs(net).find((item) => item.mock_invalid);
-  check(' 日志里能查到 mock_invalid', !!entry, JSON.stringify(logs(net).slice(-2)));
+  check('日志里能查到 mock_invalid', !!entry, JSON.stringify(logs(net).slice(-2)));
 }
 
-// ---- JS-12b：204 + body 不再抛（无内容状态码强制清空 body） ----
+// ---- 204 + body 不再抛（无内容状态码强制清空 body） ----
 {
   const { context, net } = createContext();
   net({ action: 'hook', routes: [{ match: '/no-content', status: 204, body: 'should-be-dropped' }] });
@@ -263,11 +263,11 @@ function logs(net) {
   } catch (e) {
     threw = e;
   }
-  check(' 204 带 body 不抛 TypeError', threw === null, String(threw && threw.message));
-  check(' 204 正常返回空响应', response && response.status === 204, 'status=' + (response && response.status));
+  check('204 带 body 不抛 TypeError', threw === null, String(threw && threw.message));
+  check('204 正常返回空响应', response && response.status === 204, 'status=' + (response && response.status));
 }
 
-// ---- ：只改 status/headers 时透传 body 流，并保留 url ----
+// ---- 只改 status/headers 时透传 body 流，并保留 url ----
 {
   const { context, net } = createContext(async () => {
     const response = new FakeResponse('payload', { status: 200, headers: { 'content-type': 'application/json' } });
@@ -276,19 +276,19 @@ function logs(net) {
   });
   net({ action: 'hook', routes: [{ match: '/rewrite', response: { status: 201, headers: { 'x-rewritten': '1' } } }] });
   const response = await withTimeout(context.window.fetch('https://example.com/rewrite'), 'fetch rewrite');
-  check(' 改写后 status 生效', response && response.status === 201, 'status=' + (response && response.status));
+  check('改写后 status 生效', response && response.status === 201, 'status=' + (response && response.status));
   check(
-    ' 改写后 url 不丢',
+    '改写后 url 不丢',
     response && response.url === 'https://example.com/original',
     'url=' + (response && response.url),
   );
   check(
-    ' 改写后 type 不丢',
+    '改写后 type 不丢',
     response && response.type === 'default',
     'type=' + (response && response.type),
   );
   const entry = logs(net).find((item) => item.body_stream_passthrough);
-  check(' 日志标明走的是流式透传（没有整段缓冲）', !!entry, JSON.stringify(logs(net).slice(-2)));
+  check('日志标明走的是流式透传（没有整段缓冲）', !!entry, JSON.stringify(logs(net).slice(-2)));
 }
 
 // ---- 结果汇总 ----

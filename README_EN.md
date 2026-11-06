@@ -10,7 +10,7 @@ Tab scanning · Page reading · JS execution · Click and fill · Screenshots / 
   <a href="https://github.com/1728578755/atb-cli"><img src="https://img.shields.io/badge/CLI-atb-2ea44f" alt="CLI atb"></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-green" alt="License MIT"></a>
   <a href="https://github.com/1728578755/atb-cli"><img src="https://img.shields.io/badge/sys-win%2Fmac%2Flinux-0078D6?labelColor=0078D6&color=C0C0C0" alt="sys win/mac/linux"></a>
-  <a href="https://github.com/1728578755/atb-cli/releases"><img src="https://img.shields.io/badge/release-v0.7.3-orange" alt="release v0.7.3"></a>
+  <a href="https://github.com/1728578755/atb-cli/releases"><img src="https://img.shields.io/badge/release-v0.7.4-orange" alt="release v0.7.4"></a>
   <a href="https://github.com/1728578755/atb-cli/pulls"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen" alt="PRs welcome"></a>
 </p>
 
@@ -104,7 +104,8 @@ Point `ATB_BIN` at the built binary to avoid mixing it with a global install.
 1. Download `chrome-extensions.zip` from the [latest Release](https://github.com/1728578755/atb-cli/releases/latest) and extract it into a fixed directory (the zip root is the extension itself, with `manifest.json` directly inside), or use `assets/atb_bridge` from the repo.
 2. Open `chrome://extensions` (Edge: `edge://extensions`), enable developer mode, click "Load unpacked", and select the directory that directly contains `manifest.json`.
 3. Keep at least one normal web page tab open — not only `about:blank` or `chrome://` pages.
-4. **This release requires extension 5.3.0.** After you replace the extension directory the daemon asks the extension to reload on the next handshake; if the daemon is not running, click "Reload" on the extension page yourself — copying files without reloading keeps the old code running in pages.
+4. **This release requires extension 5.4.2.** After you replace the extension directory the daemon asks the extension to reload on the next handshake; if the daemon is not running, click "Reload" on the extension page yourself — copying files without reloading keeps the old code running in pages.
+5. Click the ATB toolbar icon to open the popup: connection status on top, then three tabs — Status / Data / Settings. The gear at the top right opens the **management page** (also reachable from `chrome://extensions` → Details → Extension options) where you can change the port, token, trust mode, theme, popup width and density, and inspect cookies, heartbeat and self-check results.
 
 ### Verify
 
@@ -134,7 +135,7 @@ When the `atb` binary finds no daemon it starts a resident process that listens 
 
 ### Extension bridge
 
-The extension opens a WebSocket to `127.0.0.1:18765`, using `extension_port` from `~/.atb/config.json`. The daemon sends commands, the extension runs them in the tab and returns JSON. Reloading the extension or restarting the browser invalidates every tab id under that browser and yields `session_gone`: `open` again, or run `tabs` for a fresh list.
+The extension opens a WebSocket to `127.0.0.1:18765`, using `extension_port` from `~/.atb/config.json`. The daemon sends commands, the extension runs them in the tab and returns JSON. `browser_label` in `status` / `tabs` / `browsers` carries the brand and full version (for example `Chrome 156.0.8078.79 · Windows · #cac3`), so parallel browsers are distinguishable at a glance. Reloading the extension or restarting the browser invalidates every tab id under that browser and yields `session_gone`: `open` again, or run `tabs` for a fresh list.
 
 ### Agent identity
 
@@ -146,9 +147,9 @@ Resolution order: `--agent` → `ATB_AGENT` → terminal session id (`WT_SESSION
 
 ### Protocols
 
-Three versions must line up: the CLI ↔ daemon API protocol (currently **5**), the extension message protocol (currently **4**), and the extension file version (currently **5.3.0**). The `compatibility` field of `atb status` reports expected and actual values, with `fixes[]` when they disagree.
+Three versions must line up: the CLI ↔ daemon API protocol (currently **5**), the extension message protocol (currently **4**), and the extension file version (currently **5.4.2**). The `compatibility` field of `atb status` reports expected and actual values, with `fixes[]` when they disagree.
 
-### New in 0.7.2 / extension 5.3.0
+### New in 0.7.4 / extension 5.4.2
 
 | Capability | Notes |
 | --- | --- |
@@ -162,6 +163,9 @@ Three versions must line up: the CLI ↔ daemon API protocol (currently **5**), 
 | `tabs --limit 0` | Means "no truncation"; `tabs_count` stays the original total |
 | `logs` | Returns JSON: `{ok, lines[], path, truncated}` |
 | WS trust tiers | `ATB_WS_TRUST_MODE=compat\|whitelist\|token\|both`, default `compat`; use `both` on shared machines |
+| WS mutual auth | With a token in `ws-trust.json`, the daemon sends `ws_hello` (nonce + HMAC-SHA256 proof) during the handshake and the extension verifies it before `ext_ready`; behaviour is unchanged when no token is configured |
+| Stricter result semantics | A page-level `ok:false` from `read` / `find` now fails the command; invalid `--world` exits 2; `--dry-run --async` only returns a plan and creates no job |
+| Extension UI | Popup with Status / Data / Settings tabs plus a management page (theme, popup width 340 / 420 / 560, density, badge toggle, token and trust tier, cookies, diagnostics); settings live in `storage.local` and stay in sync between both entries; opening `popup.html` in a tab switches to a 780px page layout |
 
 ## Common workflows
 
@@ -241,7 +245,7 @@ atb challenge click --at 320,410             # the agent clicks it itself, no hu
 atb challenge focus                          # only for image/SMS checks that need a human
 ```
 
-`open` and `challenge solve` do not just wait: they locate the widget, click it with trusted mouse events that include a movement path, then wait for the token or navigation. If the solver fails, the agent can fall back to `widget` + `click --at`; `challenge wait` is the passive path and `focus` is the last resort for a human. Passing is not guaranteed, and this does not bypass access control. Details in [docs/ANTI_DETECTION_AND_CHALLENGE.md](./docs/ANTI_DETECTION_AND_CHALLENGE.md).
+`open` and `challenge solve` do not just wait: they locate the widget, click it with trusted mouse events that include a movement path, then wait for the token or navigation. If the solver fails, the agent can fall back to `widget` + `click --at`; `challenge wait` is the passive path and `focus` is the last resort for a human. Details in [docs/ANTI_DETECTION_AND_CHALLENGE.md](./docs/ANTI_DETECTION_AND_CHALLENGE.md).
 
 ## Command reference
 
@@ -306,14 +310,14 @@ atb logs --tail 100
 
 | Item | Value |
 | --- | --- |
-| CLI / daemon | `0.7.3` |
+| CLI / daemon | `0.7.4` |
 | CLI ↔ daemon API protocol | `5` |
 | Extension message protocol | `4` |
-| Extension file version | `5.3.0` |
+| Extension file version | `5.4.2` |
 | Minimum Chrome | `120` |
 
-- Current version: `0.7.3`
-- Companion extension: `5.3.0` (display name `ATB`)
+- Current version: `0.7.4`
+- Companion extension: `5.4.2` (display name `ATB`)
 
 ```bash
 atb status
@@ -483,7 +487,7 @@ Every threshold, tier and switch can be tuned with `ATB_*`; the legacy `AGENT_BR
 - The extension requests `cookies`, `tabs`, `tabGroups`, `activeTab`, `debugger`, `scripting`, `alarms`, `storage`, `declarativeNetRequest`, `webNavigation` and `downloads` (the manifest is authoritative); page data is read only when you or the CLI issue a command; `blockingExtensions` now reports only the blocking extension's id / origin, not its name.
 - WS trust defaults to `compat`: any local process can connect to 18765. On shared machines set a whitelist plus token and switch `ATB_WS_TRUST_MODE` to `both`, then `atb restart` — configuring without switching has no effect. `security.warning` in `atb status` reports the current tier.
 - Idempotency defaults to `ATB_IDEMPOTENCY_PERSIST=redacted` (key / scope / time / status, no response body); `daemon.log` is 0600 in a 0700 directory, and `ws-trust.json` gets the same treatment as `api-token`.
-- `challenge` interacts with the page's verification widget (click and wait) but does not guarantee passage; image reading and SMS/email checks still need a human.
+- `challenge` interacts with the page's verification widget (click and wait).
 
 Report vulnerabilities per [SECURITY.md](./SECURITY.md); the local data inventory and deletion steps are in [PRIVACY.md](./PRIVACY.md). Both documents promise only what the code can guarantee and mark everything else as a boundary.
 
@@ -496,9 +500,9 @@ What it explicitly cannot do:
 - No prebuilt packages for Windows ARM64 (`win32-arm64`) or Alpine / musl — build from source.
 - The debug banner is Chrome's own UI and cannot be removed at runtime; the only switch is a launch flag, and applying it requires restarting the browser via `atb launch --restart`.
 - Firefox / Safari are not supported; it needs a Chromium-based browser plus the extension.
-- No fingerprint spoofing: UA, canvas, WebGL and hardware values stay as the browser reports them; `stealth` only removes what this tool wrote into the page.
-- No bypassing CAPTCHAs or access control; JS challenges and clickable Turnstile widgets can be handled automatically, while image selection and SMS checks still need a human.
-- When the extension bridge is down, no tab can be driven. That is by design, not a defect.
+- Fingerprint spoofing (UA / canvas / WebGL / hardware values) is not yet implemented and is listed as future work; `stealth` currently only removes what this tool wrote into the page.
+- JS challenges and clickable Turnstile are handled automatically; image selection, sliders, and SMS/email checks are not yet implemented (future work).
+- When the extension bridge is down, no tab can be driven.
 
 ## Documentation map
 

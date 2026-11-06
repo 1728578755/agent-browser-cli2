@@ -16,7 +16,7 @@
 //   node scripts/deploy-extension.mjs --dry-run
 //
 // 目标目录没有默认值：写死本机路径只对作者有效，换台机器就会在错误位置
-// 静默建出一套扩展（v6 P3）。必须用 --to 或 ATB_EXT_DIR 显式指定。
+// 静默建出一套扩展（v6）。必须用 --to 或 ATB_EXT_DIR 显式指定。
 import { createHash } from 'node:crypto';
 import {
   copyFileSync,
@@ -41,6 +41,13 @@ import { fileURLToPath } from 'node:url';
 /// 写入走 `<记录>.tmp` + rename；崩溃恢复时只认最终文件名，`.tmp` 一律当残留清掉，
 /// 绝不把半截临时文件当成有效记录。
 const DEPLOY_RECORD = '.atb-deployed.json';
+
+/// 构建指纹：扩展自检读它判断「磁盘上的文件变了没」。
+///
+/// 只哈希 background.js 时，改 popup.html / options.css / manifest.json 都不会
+/// 触发重载，浏览器会一直跑旧界面（2026-11-05 连续踩了三次）。这里把**所有**部署
+/// 文件的哈希汇总成一个 digest，任何文件变化都会变。
+const BUILD_STAMP = '.atb-build.json';
 
 function parseArgs(argv) {
   const args = { target: undefined, dryRun: false, check: false };
@@ -235,6 +242,40 @@ function writeRecord(target, record) {
   }
 }
 
+/// 计算整包指纹：`rel:sha256` 排序后再哈希，任何文件变化都会改 digest。
+function buildDigest(source, files) {
+  const lines = files.map((rel) => `${rel}:${sha256(join(source, rel))}`);
+  return createHash('sha256').update(lines.join('\n')).digest('hex');
+}
+
+/// 写构建指纹（原子写）。自检只读这一个文件，比逐个 fetch 源文件稳。
+function writeBuildStamp(target, manifest, digest, count) {
+  const stampPath = join(target, BUILD_STAMP);
+  const payload = JSON.stringify(
+    {
+      name: manifest.name,
+      version: manifest.version,
+      builtAt: new Date().toISOString(),
+      files: count,
+      digest,
+    },
+    null,
+    2,
+  );
+  const tmp = `${stampPath}.tmp`;
+  try {
+    writeFileSync(tmp, `${payload}\n`, 'utf8');
+    renameSync(tmp, stampPath);
+  } catch (error) {
+    try {
+      rmSync(tmp, { force: true });
+    } catch {
+      // 不覆盖真正原因。
+    }
+    throw error;
+  }
+}
+
 /// 只接受目标目录内的相对路径，防止记录文件被篡改成 `../../x` 后误删。
 function isSafeRelative(rel) {
   if (typeof rel !== 'string' || rel.length === 0) return false;
@@ -371,7 +412,7 @@ function main() {
   // 上次部署记录 → 本次源里已不存在的文件。没有记录时退回只清理 ops/ 旧脚本。
   const previous = readRecord(target);
   const stale = previous
-    ? previous.filter((rel) => !files.includes(rel))
+    ? previous.filter((rel) => !files.includes(rel) && rel !== BUILD_STAMP)
     : legacyStale(target, files);
 
   console.log(`源      ${source}`);
@@ -384,6 +425,7 @@ function main() {
     for (const rel of files) {
       console.log(`  计划  ${rel}  (${statSync(join(source, rel)).size} 字节)`);
     }
+    console.log(`  计划  ${BUILD_STAMP}  (整包指纹 ${buildDigest(source, files).slice(0, 12)}…)`);
     // check 只报告将删除什么，不碰目标目录。
     removeStale(target, stale, true);
     pruneBackups(target, files, true);
@@ -419,6 +461,9 @@ function main() {
   rmSync(staging, { recursive: true, force: true });
 
   console.log(`\n已部署 ${files.length}/${files.length} 个文件（逐字节校验通过）`);
+
+  // 指纹必须最后写：写早了而后续步骤失败，浏览器会以为「已经是最新」而不重载。
+  writeBuildStamp(target, manifest, buildDigest(source, files), files.length);
 
   const removed = removeStale(target, stale, false);
   if (removed.length) console.log(`已清理 ${removed.length} 个目标目录多余文件: ${removed.join(', ')}`);

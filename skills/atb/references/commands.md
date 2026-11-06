@@ -128,7 +128,7 @@ atb click --tab all '#load-more' --dry-run
 | `console list` | `--level` / `--limit`（默认 100） | console 条目 |
 | `console clear` / `console stop` | 无 | 清空 / 结束 |
 | `downloads` | `--state in_progress\|complete\|interrupted` / `--id` / `--limit` | 下载列表 |
-| `download <url>` | `--filename` / `--dir` | 发起下载；`--filename` 会被净化（basename、拒绝 `..`/保留名/分隔符），回包 `filename_sanitized`；`--dir` 是 Chrome 默认下载目录下的子目录，含 `..` 会被拒 |
+| `download <url>` | `--filename` / `--dir` | 发起下载；`--filename` 会被净化（basename、拒绝 `..`/保留名/分隔符），回包 `filename_sanitized`；`--dir` 相对路径按当前工作目录解析，含 `..` 会被拒 |
 | `download-wait` | `--id` / `--timeout`（默认 120） / `--interval` | 省略 `--id` 时自动认领本 agent 最近一条；`ATB_DOWNLOAD_AUTO_CLAIM=false` 时必须显式给 `--id`（否则 `download_id_required`） |
 
 `net mock --engine cdp` 走扩展侧 Fetch 域，能改写 `responseType=blob` 的二进制响应，也能拦 `img` / `script` 这类静态请求；代价是会 attach 调试器。

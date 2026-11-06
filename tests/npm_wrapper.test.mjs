@@ -2,7 +2,7 @@
 //
 // 为什么单独建这份：包装层是用户安装后唯一会执行的 JS，但此前 tests/ 对它零覆盖
 // （`grep -rn "npm/bin" tests/` 无输出），所以「错误分支里引用不存在的变量 → 用户只看到
-// ReferenceError」这类问题在 CI 完全不可见（v6 P3）。
+// ReferenceError」这类问题在 CI 完全不可见（v6）。
 //
 // 测试全部在子进程里跑，不装包、不起 daemon：
 //   1. 把 wrapper 复制到临时目录，构造「预编译包缺失 + target/release 不存在」的环境；
@@ -32,12 +32,8 @@ function isolatedWrapper() {
     [
       "Object.defineProperty(process, 'platform', { value: process.env.FAKE_PLATFORM });",
       "Object.defineProperty(process, 'arch', { value: process.env.FAKE_ARCH });",
-      'if (process.report) {',
-      '  // 两个方向都要伪造：只伪造 glibc=1 时，Linux runner 上真实的',
-      '  // glibcVersionRuntime 会漏进来，musl 用例被当成 glibc，断言随之失真。',
-      '  process.report.getReport = () => (process.env.FAKE_GLIBC === "1"',
-      "    ? { header: { glibcVersionRuntime: '2.31' } }",
-      '    : { header: {} });',
+      'if (process.env.FAKE_GLIBC === "1" && process.report) {',
+      "  process.report.getReport = () => ({ header: { glibcVersionRuntime: '2.31' } });",
       '}',
       '',
     ].join('\n'),
@@ -151,4 +147,35 @@ test('wrapper 源码里不再有重复的二进制候选名', () => {
     .map((item) => item.trim().replace(/^['"]|['"]$/g, ''))
     .filter(Boolean);
   assert.deepEqual(names, [...new Set(names)], `候选名存在重复：${names.join(', ')}`);
+});
+
+// `npm ci --dry-run` / `npm install --dry-run` 仍会执行 postinstall，但不装
+// optionalDependencies —— 探测必然失败，把「只校验依赖树」误报成安装失败
+// （ci.yml 的第一道锁文件门禁因此在干净 runner 上直接红）。dry-run 必须放行，
+// 非 dry-run 仍要严格失败，否则 的安装期提示又失去意义。
+const POSTINSTALL = join(REPO_ROOT, 'npm', 'postinstall.js');
+
+function runPostinstall(extraEnv) {
+  const env = { ...process.env };
+  for (const key of ['ATB_BIN', 'AGENT_BROWSER_CLI_BIN', 'ATB_SKIP_POSTINSTALL_CHECK', 'npm_config_dry_run']) {
+    delete env[key];
+  }
+  return spawnSync(process.execPath, [POSTINSTALL], {
+    encoding: 'utf8',
+    env: { ...env, ...extraEnv },
+  });
+}
+
+test('dry-run 不因缺原生二进制把安装标成失败', () => {
+  // ATB_PLATFORM_OVERRIDE 指向不存在的平台：保证「非 dry-run 分支必然找不到二进制」，
+  // 这样这条断言在任何机器（含已装好平台包的开发机）上结论一致。
+  const result = runPostinstall({ npm_config_dry_run: 'true', ATB_PLATFORM_OVERRIDE: 'plan9-x64' });
+  assert.equal(result.status, 0, `dry-run 应 exit 0，实际 ${result.status}；stderr: ${result.stderr}`);
+  assert.match(result.stdout, /dry-run/, `dry-run 应说明跳过了探测，实际 stdout: ${result.stdout}`);
+});
+
+test('非 dry-run 仍严格探测原生二进制（ 不回退）', () => {
+  const result = runPostinstall({ ATB_PLATFORM_OVERRIDE: 'plan9-x64' });
+  assert.equal(result.status, 1, `缺二进制应 exit 1，实际 ${result.status}；stdout: ${result.stdout}`);
+  assert.match(result.stderr, /没有找到可执行的 atb 原生二进制/);
 });

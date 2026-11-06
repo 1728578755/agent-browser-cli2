@@ -292,7 +292,7 @@ pub(crate) fn extension_id_from_origin(headers: &HeaderMap) -> Option<String> {
 
 /// 仅作为「Origin 是否是合法扩展」的谓词保留（单元测试与文档用途）；
 /// 生产握手路径用 `extension_id_from_origin`，因为它还要拿 id 做白名单比对。
-#[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn is_allowed_extension_origin(headers: &HeaderMap) -> bool {
     extension_id_from_origin(headers).is_some()
 }
@@ -449,6 +449,14 @@ pub(crate) const WS_INBOUND_CHECK_INTERVAL: Duration = Duration::from_secs(15);
 /// 自愈优先），服务端这条 90s 硬超时是最后一道闸——两者阈值刻意错开，避免同时抖动。
 pub(crate) const WS_INBOUND_SILENCE_LIMIT: Duration = Duration::from_secs(90);
 
+/// 入站静默是否已构成「半开连接」（把判据抽成纯函数，便于直接单测）。
+///
+/// 只比阈值不做任何 IO：连接循环里的定时分支与单测用**同一个**判据，
+/// 避免"测的和跑的不是一条线"。
+pub(crate) fn inbound_is_half_open(silent: Duration) -> bool {
+    silent > WS_INBOUND_SILENCE_LIMIT
+}
+
 /// 单条下行消息的发送上限。
 ///
 /// `socket.send(...).await` 在对端不读时会一直挂着（TCP 缓冲区满），所以它必须
@@ -494,13 +502,116 @@ pub(crate) fn ws_connections_lock(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// 单条连接的下行控制队列上限（`ATB_WS_OUTBOUND_MAX`，默认 512）。
+/// 单条连接的下行队列上限（`ATB_WS_OUTBOUND_MAX`，默认 512）。
 ///
 /// 值域 `8..=65536`：太小会让正常心跳被丢，太大失去「有界」的意义。
-/// 说明：本轮只把它用在 pong 专用队列上；命令队列的完整背压需要跨文件把
-/// `Session.sender` 换成有界通道（见台账残余说明）。
+/// 命令通道与 pong 通道各自独立，但共用一个上限：两条队列都只服务于
+/// **同一条**对端连接，给它两倍缓冲没有意义，反而让「积压」更晚暴露。
 pub(crate) fn ws_outbound_max() -> usize {
-    crate::settings::env_usize_clamped("ATB_WS_OUTBOUND_MAX", 512, 8, 65_536)
+    crate::settings::ws_outbound_max()
+}
+
+/// 等到队列入队成功的最长时间。
+///
+/// 这个值不是「对端不读」的上限（那是 [`WS_SEND_TIMEOUT`]），而是「队列满时
+/// 业务侧愿意等多久」。取与发送同量级：再长会让调用方（HTTP handler）的
+/// 请求预算被通道排队吃掉，用户看到超时却不知道是背压；再短则正常的突发
+/// 批量下发会被误判成背压。
+pub(crate) const WS_OUTBOUND_ENQUEUE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 把一条下行命令放进连接队列。
+///
+/// 旧实现用 `mpsc::unbounded_channel`：扩展读得慢（大 snapshot / 卡住的标签页）时
+/// 命令在内存里无限堆积，daemon 只看到内存上涨，命令方也永远收不到「对端跟不上」。
+/// 现在通道有界，这里负责把「满」和「断」翻译成**结构化**错误：
+/// - `ws_backpressure`：队列在 [`WS_OUTBOUND_ENQUEUE_TIMEOUT`] 内没有腾出空位（可重试）；
+/// - `ws_disconnected`：接收端已关闭（连接已收尾，必须重连）。
+pub(crate) async fn send_downstream(sender: &mpsc::Sender<String>, payload: String) -> Result<()> {
+    send_downstream_within(sender, payload, WS_OUTBOUND_ENQUEUE_TIMEOUT).await
+}
+
+/// [`send_downstream`] 的可配超时版本。
+///
+/// 关机清理这类「一条连接一条命令、不能各等 10s」的路径需要更短的窗口：
+/// daemon 已经在退出，等不到就直接记 `sent:false`，比拖住整个关闭流程划算。
+pub(crate) async fn send_downstream_within(
+    sender: &mpsc::Sender<String>,
+    payload: String,
+    wait: Duration,
+) -> Result<()> {
+    match tokio::time::timeout(wait, sender.send(payload)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(SessionSelectError {
+            code: "ws_disconnected",
+            message: "浏览器扩展连接已断开，命令未下发".to_string(),
+            hint: "扩展连接已收尾（扩展重载 / 浏览器关闭 / daemon 刚重启）；先用 status 确认扩展已重连，再重发".to_string(),
+            retryable: true,
+            retry_after_ms: Some(3000),
+        }
+        .into_anyhow()),
+        Err(_) => Err(SessionSelectError {
+            code: "ws_backpressure",
+            message: format!(
+                "扩展下行队列在 {}ms 内一直是满的，命令未下发（连接仍在，但对端读不过来）",
+                wait.as_millis()
+            ),
+            hint: "对端可能在处理大页面/大响应；减小并发或分批操作，稍后用同一 --idempotency-key 重试".to_string(),
+            retryable: true,
+            retry_after_ms: Some(1000),
+        }
+        .into_anyhow()),
+    }
+}
+
+/// 一次握手的 `nonce`：32 位小写 hex（128bit）。
+///
+/// 取两个 v4 UUID 的前 16 位十六进制拼接：一次 `Uuid::new_v4()` 的熵足够，
+/// 两段的意义是避免「同一毫秒内两个连接拿到同前缀」这种可预测形态，
+/// 同时保持字节级简单（不引 rand / getrandom 直接依赖）。
+pub(crate) fn new_ws_nonce() -> String {
+    let first = Uuid::new_v4().simple().to_string();
+    let second = Uuid::new_v4().simple().to_string();
+    format!("{}{}", &first[..16], &second[..16])
+}
+
+/// 握手挑战帧（契约 §3.1）。
+///
+/// daemon 先证明自己：`proof = HMAC-SHA256(key=ws-trust token, msg=nonce|extension_id)`。
+/// 扩展用本地 `wsToken` 复算并做恒定时间比较——本机进程即使抢占了扩展端口，
+/// 不知道 token 就算不出 proof，无法让扩展发出 `ext_ready`（含全量标签与 exec 能力）。
+///
+/// `auth_required=false`（没配 token）时 `proof` 必须是 `null`：扩展据此保持旧的
+/// 兼容路径（onopen 立即 `ext_ready`），老 daemon 不发这一帧时行为也不变。
+pub(crate) fn ws_hello_value(extension_id: &str, token: Option<&str>) -> Value {
+    ws_hello_with_nonce(extension_id, token, &new_ws_nonce())
+}
+
+/// 用**指定** nonce 构造 `ws_hello`。
+///
+/// 抽出来是为了让「线协议」本身可被固定向量锁住：`ws_hello_value` 每次换 nonce，
+/// 单测只能自证（自己的 HMAC 算自己的串），改了分隔符/拼接顺序也测不出来。这里允许
+/// 传入固定 nonce，测试就能断言一条与扩展侧 WebCrypto 对拍过的完整 proof。
+pub(crate) fn ws_hello_with_nonce(extension_id: &str, token: Option<&str>, nonce: &str) -> Value {
+    let Some(token) = token.map(str::trim).filter(|token| !token.is_empty()) else {
+        return json!({
+            "type": "ws_hello",
+            "v": 1,
+            "nonce": nonce,
+            "proof": Value::Null,
+            "auth_required": false,
+        });
+    };
+    // 消息里带 extension_id：proof 只对这一条扩展有效，避免同一 token 下的
+    // 其它扩展把挑战帧原样转发给被劫持的连接。
+    let message = format!("{nonce}|{extension_id}");
+    let proof = crate::hmac::hmac_sha256(token.as_bytes(), message.as_bytes());
+    json!({
+        "type": "ws_hello",
+        "v": 1,
+        "nonce": nonce,
+        "proof": crate::hmac::hex_lower(&proof),
+        "auth_required": true,
+    })
 }
 
 /// 单帧发送的结果（发送/撤销/超时三态，供命令队列与 pong 队列共用）。
@@ -560,7 +671,7 @@ async fn send_text_guarded(
 pub(crate) async fn cleanup_conn_sessions(
     state: &AppState,
     conn_id: u64,
-    sender: &mpsc::UnboundedSender<String>,
+    sender: &mpsc::Sender<String>,
     registered_ids: &std::sync::Mutex<HashSet<String>>,
 ) {
     let owned: Vec<String> = {
@@ -610,7 +721,7 @@ pub(crate) async fn cleanup_conn_sessions(
     // 连接已断 = 会话确实销毁，会话级缓存（snapshots / page_scale / session_locks）
     // 一并回收；扩展重连会重新 ExtReady 注册，代价只是重新探测一次页面规模。
     //
-    // A2：断线走 `forget_session_after_disconnect`——它额外把「原来的默认目标」记进
+    // 断线走 `forget_session_after_disconnect`——它额外把「原来的默认目标」记进
     // preferred，等重连后同一个 session_key 回到快照时再设回默认。真实关闭（close/prune/
     // tab 关闭事件）仍走 `forget_session`，会把这个记忆一起忘掉。
     for session_key in owned.iter() {
@@ -657,7 +768,7 @@ impl Drop for WsConnGuard {
 pub(crate) struct WsSessionCleanupGuard {
     state: AppState,
     conn_id: u64,
-    sender: mpsc::UnboundedSender<String>,
+    sender: mpsc::Sender<String>,
     registered_ids: Arc<std::sync::Mutex<HashSet<String>>>,
     armed: bool,
 }
@@ -666,7 +777,7 @@ impl WsSessionCleanupGuard {
     pub(crate) fn new(
         state: AppState,
         conn_id: u64,
-        sender: mpsc::UnboundedSender<String>,
+        sender: mpsc::Sender<String>,
         registered_ids: Arc<std::sync::Mutex<HashSet<String>>>,
     ) -> Self {
         Self {
@@ -722,12 +833,12 @@ pub(crate) async fn handle_socket(
     let revoked = Arc::new(AtomicBool::new(false));
     // 下行通道必须先建好：登记表要带着它，断开清理与 refresh 才能按 `same_channel`
     // 找到"这条连接登记过哪些会话"。
-    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-    //  （部分）：pong 走独立的有界控制通道，不再和命令挤同一个无界队列。
     //
-    // 命令队列的背压需要把 `Session.sender`/`WsConn.sender` 一起换成有界
-    // `mpsc::Sender`（跨 protocol.rs/state.rs/sessions.rs/exec.rs），本轮不改
-    // state.rs，因此**结果类消息仍是无界排队**；这里先把「控制帧优先」这一半做掉：
+    // 命令队列换成**有界**通道。旧的无界队列在扩展读得慢时把命令无限堆在
+    // 内存里，发送方也永远察觉不到「对端跟不上」；现在满则走
+    // [`send_downstream`] 的 `ws_backpressure` 背压语义。
+    let (tx, mut rx) = mpsc::channel::<String>(ws_outbound_max());
+    // pong 走独立的有界控制通道，不再和命令挤同一个队列。
     // 控制队列满时丢弃 pong（下个心跳会重发，比拖住命令更划算）。
     let (pong_tx, mut pong_rx) = mpsc::channel::<String>(ws_outbound_max());
     let mut pong_dropped = 0usize;
@@ -754,6 +865,39 @@ pub(crate) async fn handle_socket(
     // 会话清理的异常安全兜底（panic 展开时也能清掉会话）。
     let mut session_guard =
         WsSessionCleanupGuard::new(state.clone(), conn_id, tx.clone(), registered_ids.clone());
+    // 进入收帧循环前**立即**下发握手挑战帧，让扩展先验证"对端确实是持有
+    // token 的 daemon"再发 `ext_ready`（那里带着全量标签、版本与后续 exec 能力）。
+    //
+    // 这是 upgrade 之后的独立 task，不会阻塞 HTTP 握手；发送失败/超时直接 return，
+    // 让上面两个守卫按原有路径注销连接并清理会话（它们已 armed）。
+    {
+        // token 必须取**当前配置**里的值，不是客户端在 `?token=` 里给的那份：
+        // 要证明的是"daemon 持有服务端口令"，用客户端提供的值等于自证。
+        let hello_token = match load_ws_trust() {
+            WsTrustState::Ok(trust) => trust.token_value().map(str::to_string),
+            // 握手阶段已对损坏配置 fail-closed；走到这里只可能是刚被改坏。
+            // 按"没有 token"下发（auth_required:false）比卡住连接更安全：
+            // 扩展配了 token 会把这次当作对端不诚实的失败并重连。
+            WsTrustState::Corrupt(_) => None,
+        };
+        let hello = ws_hello_value(&extension_id, hello_token.as_deref()).to_string();
+        match tokio::time::timeout(WS_SEND_TIMEOUT, socket.send(Message::Text(hello))).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                eprintln!(
+                    "扩展 {extension_id} 的 ws_hello 发送失败，直接断开（connection_id={conn_id}）: {err}"
+                );
+                return;
+            }
+            Err(_) => {
+                eprintln!(
+                    "扩展 {extension_id} 在 {}s 内没有读走 ws_hello，直接断开（connection_id={conn_id}）",
+                    WS_SEND_TIMEOUT.as_secs()
+                );
+                return;
+            }
+        }
+    }
     // 收帧循环只负责「读帧 / 刷新 last_inbound / 跑定时器」，
     // `handle_ws_message` 派发到独立 task 串行执行（独立 channel 保序）。
     //
@@ -856,7 +1000,7 @@ pub(crate) async fn handle_socket(
                 let Message::Text(text) = msg else { continue; };
                 if is_app_ping(&text) {
                     // 回一条应用层 pong（旧实现直接 `continue`，扩展永远收不到回应，
-                    // 只能靠 HTTP 探活兜底）。 ：pong 走独立的有界优先通道，
+                    // 只能靠 HTTP 探活兜底）。pong 走独立的有界优先通道，
                     // 满时丢弃这一条（下个心跳周期会重发），绝不拖住命令下行。
                     let pong = json!({ "type": "pong" }).to_string();
                     if pong_tx.try_send(pong).is_err() {
@@ -912,7 +1056,7 @@ pub(crate) async fn handle_socket(
             // 不会因为心跳检查而把「假活连接」换成「daemon 不肯退出」。
             _ = inbound_tick.tick() => {
                 let silent = last_inbound.elapsed();
-                if silent > WS_INBOUND_SILENCE_LIMIT {
+                if inbound_is_half_open(silent) {
                     eprintln!(
                         "扩展 {extension_id} 已 {}s 没有任何入站消息（connection_id={conn_id}），判定为半开连接，主动断开等待重连",
                         silent.as_secs()
@@ -946,10 +1090,10 @@ pub(crate) async fn handle_socket(
 
 pub(crate) fn should_set_default_session(driver: &DriverState, session_key: &str) -> bool {
     // 读的是「仍然有效的」待生效目标：过期的记忆（6h）在这里当作没有，
-    // 否则一次断线留下的旧 key 会让默认目标再也建立不起来（A2）。
+    // 否则一次断线留下的旧 key 会让默认目标再也建立不起来。
     match driver.preferred_default_session() {
         Some(preferred) => preferred == session_key,
-        // A2 默认目标粘性：**只有当前默认已失效（会话不存在 / 非 active）才允许改选**。
+        // 默认目标粘性：**只有当前默认已失效（会话不存在 / 非 active）才允许改选**。
         //
         // 旧实现只看 `default_session_key.is_none()`，两头的表现都不对：
         // - 默认指向一个「已断开但仍在表内」的会话（`disconnected_at.is_some()`）时永远不换，
@@ -1002,7 +1146,7 @@ pub(crate) async fn store_late_result(state: &AppState, exec_id: &str, value: Va
 /// **锁约束（旧报告 #1 的死锁，防止回归）**：扩展的回包必须先进入这条消息循环
 /// 才能被处理，所以任何"持锁等回包"都是死锁。当前实现遵守：
 /// - `Ack` / `Result` / `Error` 只碰 `execs`（`state.execs`）与**同步**的
-///   `ws_connections` 登记表（的代际比对），不碰 `driver`、不做跨任务等待；
+///   `ws_connections` 登记表（代际比对），不碰 `driver`、不做跨任务等待；
 /// - `driver` 锁只在 `apply_tabs_snapshot` 内短暂持有，持锁期间没有任何 await
 ///   外部回包（登记表合并也挪到了 drop 之后）；
 /// - 需要等结果的地方一律「取 sender → 释放 `driver` 锁 → 等 oneshot」
@@ -1017,7 +1161,7 @@ pub(crate) async fn store_late_result(state: &AppState, exec_id: &str, value: Va
 pub(crate) async fn handle_ws_message(
     incoming: WsIncoming,
     state: &AppState,
-    sender: mpsc::UnboundedSender<String>,
+    sender: mpsc::Sender<String>,
     conn_id: u64,
     registered_ids: &std::sync::Mutex<HashSet<String>>,
 ) {
@@ -1170,7 +1314,7 @@ pub(crate) async fn handle_ws_message(
             warnings,
             tabs,
         } => {
-            // 扩展自检信息以前被 serde 静默丢弃（R-19）：最典型的是
+            // 扩展自检信息以前被 serde 静默丢弃：最典型的是
             // 「queryTabs 失败 → 上报 0 个标签」，用户只看到「没有可用标签页」，
             // 完全不知道扩展自己已经报了错。留最近一次快照给 `/health` 展示。
             if !warnings.is_empty() {
@@ -1265,7 +1409,7 @@ fn tab_enumeration_failed(warnings: &[Value]) -> bool {
 ///   扩展重启后浏览器侧拦截已失效，所以把该 profile 的配置标记
 ///   `cdpRebuildRequired`，下一次 `net route` / `net routes` 用 `start` 整体重下发；
 /// - network / console 抓取的 intent 从来不在 daemon（各自由 CLI 那条命令持有），
-///   daemon 没有可重建的状态，恢复由扩展侧自己完成（见扩展的 修复），
+///   daemon 没有可重建的状态，恢复由扩展侧自己完成（见扩展侧修复），
 ///   这里**不**假装重建。
 pub(crate) fn parse_restart_seq(text: &str) -> Option<(String, String, u32)> {
     let value: Value = serde_json::from_str(text).ok()?;
@@ -1294,7 +1438,14 @@ pub(crate) fn parse_restart_seq(text: &str) -> Option<(String, String, u32)> {
 }
 
 async fn note_extension_restart(state: &AppState, browser_id: &str, profile_id: &str, seq: u32) {
-    let profile_key = format!("{browser_id}:{profile_id}");
+    // key 必须与 net 模块（`net_hooks` 的 `profile_key`）用**同一套净化**口径。
+    // 原始 id 里带 `:`/空格时，旧实现会写进一个没人读的 key——
+    // 「扩展重启后重建 CDP 拦截」于是静默失效，且日志看不出异常。
+    let profile_key = format!(
+        "{}:{}",
+        sanitize_identity_component(browser_id),
+        sanitize_identity_component(profile_id)
+    );
     // 序号没变 = 普通重连，不做任何事：无脑重建会让下一次 `net route` 走 `start`，
     // 而 `start` 会清掉扩展侧的拦截日志与统计。
     let changed = {

@@ -5,7 +5,7 @@ use clap::{Args, Parser, Subcommand};
 /// 可选数值字段为 `None` 时不要下发 `null`。
 ///
 /// `preflight` 把数值字段的 `null` 当成「用户写了 NaN/Inf，`json!` 序列化成了 null」
-/// 并报 `invalid_number`（的检测手段）；但 `Option<usize>` 的 `None` 同样
+/// 并报 `invalid_number`（检测手段）；但 `Option<usize>` 的 `None` 同样
 /// 序列化成 null —— 那是「没传、用服务端默认」，不是错误。两者在 JSON 里无法区分，
 /// 所以在构造 payload 时就把 None 摘掉，让 null 只剩「显式传入非有限值」一种来源。
 fn omit_absent_numbers(payload: &mut Value, keys: &[&str]) {
@@ -22,8 +22,8 @@ fn omit_absent_numbers(payload: &mut Value, keys: &[&str]) {
 /// CLI 侧统一的 HTTP 超时预算：业务超时 + `ATB_HTTP_SLACK_SEC`（默认 10s）。
 ///
 /// 以前每个命令各自写 `args.timeout` / `+5.0` / `+10.0`：同样是 30s 的业务超时，
-/// cookies 只给 30s、snapshot 30s，daemon 还在等待时 CLI 已经断开并报「超时」
-/// 。所有直接用 `args.timeout` 的客户端超时统一走这里。
+/// cookies 只给 30s、snapshot 30s，daemon 还在等待时 CLI 已经断开并报「超时」。
+/// 所有直接用 `args.timeout` 的客户端超时统一走这里。
 pub(crate) fn http_budget(timeout: f64) -> f64 {
     if !timeout.is_finite() {
         return 30.0;
@@ -35,7 +35,7 @@ pub(crate) fn http_budget(timeout: f64) -> f64 {
 ///
 /// 默认行为保持不变：不设环境变量时，缺省 `--tab` 仍作用于 daemon 当前标签页。
 pub(crate) fn require_tab_enabled() -> bool {
-    crate::settings::env_bool("ATB_REQUIRE_TAB", false)
+    crate::settings::require_tab()
 }
 
 /// 写类 op 缺少 `--tab` 时直接以用法错误拒绝。
@@ -196,8 +196,6 @@ fn normalize_dry_run(value: Value) -> Value {
 }
 
 pub(crate) fn cmd_scan(args: ScanArgs, is_async: bool) -> Result<()> {
-    let _ = is_async;
-    ensure_server()?;
     let mut payload = json!({
         "tabs_only": args.tabs_only,
         "text_only": args.text_only,
@@ -209,6 +207,11 @@ pub(crate) fn cmd_scan(args: ScanArgs, is_async: bool) -> Result<()> {
         "timeout": args.timeout,
     });
     omit_absent_numbers(&mut payload, &["max_nodes"]);
+    // dry-run + async 必须在 ensure_server/HTTP 之前短路。
+    if async_dry_run_plan("scan", &payload, is_async)? {
+        return Ok(());
+    }
+    ensure_server()?;
     if is_async {
         print_json(submit_job("scan", payload)?);
     } else {
@@ -257,35 +260,14 @@ pub(crate) fn cmd_exec(args: ExecArgs, is_async: bool) -> Result<()> {
         "wait_interval": args.wait_interval,
         "timeout": args.timeout,
         "max_bytes": args.max_bytes,
-        "world": args.world,
+        "world": args.world.to_ascii_uppercase(),
         "frame_id": args.frame,
         "all_frames": args.all_frames,
     });
     omit_absent_numbers(&mut payload, &["max_bytes"]);
-    // `exec --async --dry-run` 以前会在 is_async 分支里直接提交 job：
-    // dry-run 的承诺是「什么都不执行」，异步路径也必须先短路，且不能先拉起 daemon。
-    if is_async && DRY_RUN.load(Ordering::Relaxed) {
-        let script_bytes = payload
-            .get("script")
-            .and_then(Value::as_str)
-            .map(str::len)
-            .unwrap_or(0);
-        print_json(json!({
-            "ok": true,
-            "result": {
-                "dry_run": true,
-                "command": "exec",
-                "async": true,
-                "would": ["后台执行脚本", "job 提交（POST /job/submit，op=exec）"],
-                "script_bytes": script_bytes,
-                "target": {
-                    "tab": payload.get("switch_tab_id").cloned().unwrap_or(Value::Null),
-                    "browser": payload.get("browser").cloned().unwrap_or(Value::Null),
-                    "profile": payload.get("profile").cloned().unwrap_or(Value::Null),
-                },
-                "note": "去掉 --dry-run 才会真的提交 job；脚本内容已按当前参数读取完毕",
-            },
-        }));
+    // `exec --async --dry-run` 以前会在 is_async 分支里直接提交 job。
+    // 现在与其它命令走同一份计划输出：不 ensure_server、不发任何请求。
+    if async_dry_run_plan("exec", &payload, is_async)? {
         return Ok(());
     }
     ensure_server()?;
@@ -308,8 +290,6 @@ pub(crate) fn cmd_exec(args: ExecArgs, is_async: bool) -> Result<()> {
 }
 
 pub(crate) fn cmd_cookies(args: CookiesArgs, is_async: bool) -> Result<()> {
-    let _ = is_async;
-    ensure_server()?;
     let payload = json!({
         "switch_tab_id": args.tab,
         "browser": args.browser,
@@ -318,6 +298,11 @@ pub(crate) fn cmd_cookies(args: CookiesArgs, is_async: bool) -> Result<()> {
         "action": if args.clear { "clear" } else { "list" },
         "domain": args.domain,
     });
+    // dry-run + async 必须在 ensure_server/HTTP 之前短路。
+    if async_dry_run_plan("cookies", &payload, is_async)? {
+        return Ok(());
+    }
+    ensure_server()?;
     if is_async {
         print_json(submit_job("cookies", payload)?);
     } else {
@@ -335,8 +320,6 @@ pub(crate) fn cmd_cookies(args: CookiesArgs, is_async: bool) -> Result<()> {
 }
 
 pub(crate) fn cmd_upload(args: UploadArgs, is_async: bool) -> Result<()> {
-    let _ = is_async;
-    ensure_server()?;
     let payload = json!({
         "target": args.target,
         "files": args.files,
@@ -345,6 +328,11 @@ pub(crate) fn cmd_upload(args: UploadArgs, is_async: bool) -> Result<()> {
         "profile": args.profile,
         "timeout": args.timeout,
     });
+    // dry-run + async 必须在 ensure_server/HTTP 之前短路。
+    if async_dry_run_plan("upload", &payload, is_async)? {
+        return Ok(());
+    }
+    ensure_server()?;
     if is_async {
         print_json(submit_job("upload", payload)?);
     } else {
@@ -362,8 +350,6 @@ pub(crate) fn cmd_upload(args: UploadArgs, is_async: bool) -> Result<()> {
 }
 
 pub(crate) fn cmd_snapshot(args: SnapshotArgs, is_async: bool) -> Result<()> {
-    let _ = is_async;
-    ensure_server()?;
     let mut payload = json!({
         "switch_tab_id": args.tab,
         "browser": args.browser,
@@ -374,13 +360,18 @@ pub(crate) fn cmd_snapshot(args: SnapshotArgs, is_async: bool) -> Result<()> {
         "js": args.js,
         "interactive_only": args.interactive_only,
         "max_nodes": args.max_nodes,
-        // X-15：daemon 的 /snapshot 早就有 skip_generic 字段，CLI 却一直没有下发通道，
+        // daemon 的 /snapshot 早就有 skip_generic 字段，CLI 却一直没有下发通道，
         // 于是「不想被通用容器节点挤满 @e 编号」的用户无法表达。默认行为保持不变
         // （skip_generic=true），加 --no-skip-generic 才显式关闭。
         "skip_generic": !args.no_skip_generic,
         "timeout": args.timeout,
     });
     omit_absent_numbers(&mut payload, &["max_nodes"]);
+    // dry-run + async 必须在 ensure_server/HTTP 之前短路。
+    if async_dry_run_plan("snapshot", &payload, is_async)? {
+        return Ok(());
+    }
+    ensure_server()?;
     if is_async {
         print_json(submit_job("snapshot", payload)?);
     } else {
@@ -398,12 +389,10 @@ pub(crate) fn cmd_snapshot(args: SnapshotArgs, is_async: bool) -> Result<()> {
 }
 
 pub(crate) fn cmd_read(args: ReadArgs, is_async: bool) -> Result<()> {
-    let _ = is_async;
-    ensure_server()?;
     let mut payload = json!({
         "selector": args.selector,
         "max_chars": args.max_chars,
-        // X-15：页面侧 page_read.js 的 innerTextLimit（默认 30000），None 不下发。
+        // 页面侧 page_read.js 的 innerTextLimit（默认 30000），None 不下发。
         "inner_text_limit": args.inner_text_limit,
         "links": args.links,
         "forms": !args.no_forms,
@@ -420,6 +409,11 @@ pub(crate) fn cmd_read(args: ReadArgs, is_async: bool) -> Result<()> {
         &mut payload,
         &["max_nodes", "budget_ms", "inner_text_limit"],
     );
+    // dry-run + async 必须在 ensure_server/HTTP 之前短路。
+    if async_dry_run_plan("read", &payload, is_async)? {
+        return Ok(());
+    }
+    ensure_server()?;
     if is_async {
         print_json(submit_job("read", payload)?);
     } else {
@@ -437,8 +431,6 @@ pub(crate) fn cmd_read(args: ReadArgs, is_async: bool) -> Result<()> {
 }
 
 pub(crate) fn cmd_find(args: FindArgs, is_async: bool) -> Result<()> {
-    let _ = is_async;
-    ensure_server()?;
     let payload = json!({
         "selector": args.selector,
         "text": args.text,
@@ -452,6 +444,11 @@ pub(crate) fn cmd_find(args: FindArgs, is_async: bool) -> Result<()> {
         "profile": args.profile,
         "timeout": args.timeout,
     });
+    // dry-run + async 必须在 ensure_server/HTTP 之前短路。
+    if async_dry_run_plan("find", &payload, is_async)? {
+        return Ok(());
+    }
+    ensure_server()?;
     if is_async {
         print_json(submit_job("find", payload)?);
     } else {
@@ -469,8 +466,6 @@ pub(crate) fn cmd_find(args: FindArgs, is_async: bool) -> Result<()> {
 }
 
 pub(crate) fn cmd_inject(args: InjectArgs, is_async: bool) -> Result<()> {
-    let _ = is_async;
-    ensure_server()?;
     let (action, name, code) = if args.list {
         ("list", None, None)
     } else if let Some(name) = args.remove.clone() {
@@ -491,7 +486,7 @@ pub(crate) fn cmd_inject(args: InjectArgs, is_async: bool) -> Result<()> {
     };
     let mut payload = json!({
         "action": action,
-        "world": args.world,
+        "world": args.world.to_ascii_uppercase(),
         "frame_id": args.frame,
         "all_frames": args.all_frames,
         "switch_tab_id": args.tab,
@@ -507,8 +502,14 @@ pub(crate) fn cmd_inject(args: InjectArgs, is_async: bool) -> Result<()> {
     if !args.matches.is_empty() {
         payload["matches"] = json!(args.matches);
     }
-    // `--async inject` 以前静默同步执行（P3 CLI 一致性）：/job/submit 支持 inject，
+    // dry-run + async 必须在 ensure_server/HTTP 之前短路
+    // （inject 会改动页面，是最不能「静默照做」的一类命令）。
+    if async_dry_run_plan("inject", &payload, is_async)? {
+        return Ok(());
+    }
+    // `--async inject` 以前静默同步执行（CLI 一致性）：/job/submit 支持 inject，
     // 这里补上真正的后台提交。
+    ensure_server()?;
     if is_async {
         print_json(submit_job("inject", payload)?);
         return Ok(());
@@ -526,13 +527,16 @@ pub(crate) fn cmd_inject(args: InjectArgs, is_async: bool) -> Result<()> {
 }
 
 pub(crate) fn cmd_frames(args: FramesArgs, is_async: bool) -> Result<()> {
-    let _ = is_async;
-    ensure_server()?;
     let payload = json!({
         "switch_tab_id": args.tab,
         "browser": args.browser,
         "profile": args.profile,
     });
+    // dry-run + async 必须在 ensure_server/HTTP 之前短路。
+    if async_dry_run_plan("frames", &payload, is_async)? {
+        return Ok(());
+    }
+    ensure_server()?;
     // 同 inject：frames 在 JOB_OPS 里，`--async frames` 应该真的异步。
     if is_async {
         print_json(submit_job("frames", payload)?);

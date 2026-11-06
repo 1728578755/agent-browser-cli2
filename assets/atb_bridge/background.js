@@ -55,7 +55,7 @@ let wsPort = DEFAULT_WS_PORT;
 // 可选的 WebSocket 鉴权 token（对应 daemon 的 <用户配置目录>/ws-trust.json）。
 // 空串 = 不启用：此时连接 URL 与历史版本一字不差，绝不改变默认行为。
 let wsToken = '';
-// 信任档位（/ 报告方案 C）：compat（默认，与历史行为完全一致）| strict。
+// 信任档位（方案 C）：compat（默认，与历史行为完全一致）| strict。
 // strict 下「无 token 的连接」只放行只读命令，高危命令（exec / cdp / cookies / inject…）
 // 返回结构化拒绝 —— 端口被本机其它进程抢占时，最多只能看到浏览器状态，拿不到会话与任意脚本执行。
 // 注意：真正的对端身份校验必须由 daemon 侧完成（core-ws 的 ATB_WS_TRUST_MODE），
@@ -108,10 +108,65 @@ function detectOsName() {
   return 'Unknown';
 }
 
+/// 浏览器元信息：品牌 + 完整版本 + 平台。
+///
+/// Service Worker 里可能没有 userAgentData（不同版本不一样），所以先用 UA 解析兜底，
+/// 有 UA-CH 再用 fullVersionList 换成完整版本（如 156.0.8078.79）。
+let browserMeta = null;
+let browserMetaPromise = null;
+
+function parseBrowserFromUA() {
+  const ua = String(navigator.userAgent || '');
+  const name = detectBrowserBrand();
+  const patterns = name === 'Edge' ? [/Edg\/([\d.]+)/, /Chrome\/([\d.]+)/]
+    : name === 'Opera' ? [/OPR\/([\d.]+)/, /Chrome\/([\d.]+)/]
+      : name === 'Firefox' ? [/Firefox\/([\d.]+)/]
+        : [/Chrome\/([\d.]+)/];
+  let version = '';
+  for (const re of patterns) {
+    const m = ua.match(re);
+    if (m) { version = m[1]; break; }
+  }
+  return { name, version, platform: detectOsName() };
+}
+
+async function detectBrowserMeta() {
+  const base = parseBrowserFromUA();
+  try {
+    const uaData = navigator.userAgentData;
+    if (uaData && typeof uaData.getHighEntropyValues === 'function') {
+      const hi = await uaData.getHighEntropyValues(['fullVersionList', 'platform']);
+      const list = Array.isArray(hi.fullVersionList) ? hi.fullVersionList : [];
+      const prefer = base.name === 'Edge' ? /Microsoft Edge/i
+        : base.name === 'Chrome' ? /Google Chrome/i
+          : base.name === 'Chromium' ? /Chromium/i : null;
+      const hit = prefer ? list.find((b) => prefer.test(String((b && b.brand) || ''))) : list[0];
+      if (hit && hit.version) base.version = hit.version;
+      if (hi.platform) base.platform = hi.platform;
+    }
+  } catch (_) {
+    // 高熵值被策略禁用时保留 UA 版本。
+  }
+  return base;
+}
+
+/// 握手前等一次：保证 ext_ready 里带的标签已经是完整版本号。
+function ensureBrowserMeta() {
+  if (browserMeta) return Promise.resolve(browserMeta);
+  if (!browserMetaPromise) {
+    browserMetaPromise = detectBrowserMeta()
+      .then((meta) => (browserMeta = meta))
+      .catch(() => (browserMeta = parseBrowserFromUA()));
+  }
+  return browserMetaPromise;
+}
+
 /// 「Edge · Windows · 工作机 · #3f2a」——最后一个短码来自 browserId，
 /// 保证同名浏览器也能区分（比如开了两个 Edge profile）。
 function composeBrowserLabel() {
-  const parts = [detectBrowserBrand(), detectOsName()];
+  const meta = browserMeta || parseBrowserFromUA();
+  const brand = meta.version ? `${meta.name} ${meta.version}` : meta.name;
+  const parts = [brand, meta.platform || detectOsName()];
   const custom = String(browserLabelCustom || '').trim();
   if (custom) parts.push(custom);
   const short = String(browserId || '').replace(/^browser-/, '').slice(0, 4);
@@ -353,6 +408,16 @@ const PAGE_OP_WORLD = {
   stealth: 'MAIN'
 };
 
+/// world 归一化：daemon 侧把 world 当字符串透传，大小写并不稳定
+/// （`isolated` / `Isolated`）。旧写法 `=== 'ISOLATED' ? 'ISOLATED' : 'MAIN'`
+/// 会把小写 isolated 静默落到 MAIN —— 本该只活在扩展隔离世界的 `__abcRead`/`__abcExec`
+/// 直接挂到页面 window 上，等于给站点一个「这是自动化」的判定依据。
+/// 无法识别的值返回 ''，由调用方按自己的默认口径兜底（页面 op 有决策表，注入默认 MAIN）。
+function normalizeWorld(world) {
+  const value = String(world === undefined || world === null ? '' : world).trim().toUpperCase();
+  return value === 'ISOLATED' || value === 'MAIN' ? value : '';
+}
+
 async function handlePageOp(msg) {
   const tabId = Number(msg.tabId);
   if (!Number.isInteger(tabId) || tabId <= 0) return { ok: false, error: 'tabId is required' };
@@ -362,9 +427,7 @@ async function handlePageOp(msg) {
   // world 解析三级：显式指定（daemon 有调用方依赖这个语义）> op 决策表 > 兜底 ISOLATED。
   // 以前的写法是 `=== 'ISOLATED' ? 'ISOLATED' : 'MAIN'`，等于默认全挂到 MAIN，
   // 把 __abcRead/__abcAct 这些名字直接暴露在页面 window 上 —— 一句话就能判定访客是自动化。
-  const world = msg.world === 'MAIN' || msg.world === 'ISOLATED'
-    ? msg.world
-    : (PAGE_OP_WORLD[op] || 'ISOLATED');
+  const world = normalizeWorld(msg.world) || (PAGE_OP_WORLD[op] || 'ISOLATED');
   const target = buildScriptTarget(tabId, msg);
   const args = msg.args === undefined ? {} : msg.args;
   const invoke = async () => {
@@ -418,7 +481,8 @@ async function handlePageOp(msg) {
 async function runUserCodeInTab(tabId, code, world, target) {
   const result = await chrome.scripting.executeScript({
     target: target || { tabId },
-    world: world === 'ISOLATED' ? 'ISOLATED' : 'MAIN',
+    // 小写 isolated 也必须进隔离世界；无法识别时按注入的历史默认 MAIN。
+    world: normalizeWorld(world) || 'MAIN',
     func: async (s) => await eval(s),
     args: [buildPageScript(code)]
   });
@@ -459,7 +523,8 @@ async function readPersistInjections() {
 /// 所以改成「存代码 + 导航时自动重放」，代价是 document_start 的几毫秒窗口。
 async function handleInject(msg) {
   const action = String(msg.action || 'run');
-  const world = msg.world === 'ISOLATED' ? 'ISOLATED' : 'MAIN';
+  // 大小写归一化后再落库，持久化条目里的 world 也必须是规范值。
+  const world = normalizeWorld(msg.world) || 'MAIN';
 
   if (action === 'list') {
     // 只读：不进锁，避免被一次正在进行的写挡住。
@@ -887,8 +952,12 @@ async function handleExtMessage(msg, sender) {
   }
   if (msg.cmd === 'status') return await handleStatus();
   if (msg.cmd === 'setPort') return await handleSetPort(msg);
+  // 用户从 popup / 管理页面点「重新连接」：与改端口、改 token 走同一条 reconnectWS 路径，
+  // 不另写一套重连逻辑（历史上两套路径会导致「配置改了却不生效」）。
+  if (msg.cmd === 'reconnect') return await handleReconnect();
   if (msg.cmd === 'setWsTrustMode') return await handleSetWsTrustMode(msg);
   if (msg.cmd === 'setProfileLabel') return await handleSetProfileLabel(msg);
+  if (msg.cmd === 'resetIdentity') return await handleResetIdentity();
   if (msg.cmd === 'setWsToken') return await handleSetWsToken(msg);
   lastCommandAt = Date.now();
   if (msg.cmd === 'cookies') return await handleCookies(msg, sender);
@@ -1051,6 +1120,14 @@ async function handleSetPort(msg) {
   };
 }
 
+/// 主动重连（popup / 管理页面的「重新连接」）。
+/// 只负责发起：reconnectWS 是异步的，回包时 ws 刚被置空，wsConnected 一定是 false，
+/// 所以这里不回连接态，由调用方轮询 status 判断，避免 UI 拿到误导性的「未连接」。
+async function handleReconnect() {
+  reconnectWS();
+  return { ok: true, data: { requested: true, wsUrl: getWsUrl(), wsPort } };
+}
+
 /// 信任档位（方案 C）：默认 compat 不改任何既有行为；strict 由用户显式开启。
 async function handleSetWsTrustMode(msg) {
   const mode = String(msg.mode || '').trim().toLowerCase();
@@ -1071,7 +1148,7 @@ function normalizeProfileLabel(label) {
   if (!raw) return null;
   if (raw.length > 40) throw new Error('Profile Label 长度不能超过 40 个字符');
   // label 是给人看的名字，不是标识符：只允许 [A-Za-z0-9_.-] 会让中文/带空格的名字
-  // 在 popup 点「保存」时直接抛错（的已确认触发路径），而 daemon 侧对 label
+  // 在 popup 点「保存」时直接抛错（已确认触发路径），而 daemon 侧对 label
   // 没有字符集限制。这里放宽到「任意可打印字符（允许空格）」，只拒绝控制字符和
   // 零宽字符——它们会让两个看起来相同的 label 在比较时不相等，是最难查的一类脏数据。
   if (/[\u0000-\u001f\u007f\u200b-\u200f\u2028\u2029\ufeff]/.test(raw)) {
@@ -1094,6 +1171,28 @@ async function handleSetProfileLabel(msg) {
       profileId,
       profileLabel
     }
+  };
+}
+
+/// 重置浏览器标识：清掉 browserId / profileId 后重载扩展，下次启动会生成新的 UUID。
+///
+/// 正常使用**不需要**它：标识必须跨重载稳定，否则 session_key（browser_id:profile_id:tab）
+/// 会漂移，daemon 侧的 @e 引用、--tab 寻址、默认浏览器绑定全部失联。只有在
+/// 「整份浏览器 profile 被克隆到另一台机器」这类两个实例撞同一个 id 的场景才用它。
+async function handleResetIdentity() {
+  await chrome.storage.local.remove(['browserId', 'profileId']);
+  // 先把回包发出去再重载：chrome.runtime.reload() 会立刻切断消息通道，
+  // 同步调用的话调用方只会看到 "message port closed"。
+  setTimeout(() => {
+    try { chrome.runtime.reload(); } catch (_) {}
+  }, 150);
+  return {
+    ok: true,
+    data: {
+      reset: true,
+      note: '扩展将重载，浏览器标识会重新生成',
+      previous: { browserId, profileId },
+    },
   };
 }
 
@@ -1285,7 +1384,7 @@ function trimConsoleBuffer(session) {
   if (session.logs.length > cap) session.logs.splice(0, session.logs.length - cap);
 }
 
-// 按 tabId 串行化 attach/detach/enable（EXT-）。
+// 按 tabId 串行化 attach/detach/enable。
 // WS 的 onmessage 是 async 且不排队，两条命令并发进入时第二个 attach 会报
 // "Another debugger is already attached"，而恢复路径的 detach+重 attach 会把先建立的
 // Fetch.enable / Network.enable 一起打掉。所有会改 debugger 状态的入口都走这条链。
@@ -1302,6 +1401,14 @@ function normalizeDebugTabId(tabId) {
   return id;
 }
 
+/// 单个 tab 的操作串行锁（attach / Fetch.enable / detach / 捕获事件处理共用）。
+///
+/// **锁序**：持有状态锁（withDebugStateLock）时可以进入 tab 锁；
+/// 持有 tab 锁时**禁止**等待状态锁 —— 即严禁在 withDebugTabLock 内部调用
+/// persistDebugInterceptState() / ensureDebugSessionsRestored() 这类入口。
+/// 反例就是 restoreDebugSessionsLocked：它持状态锁等某个 tab 的锁，若该 tab 同时
+/// 持锁等状态锁，两条 promise 链都没有超时，会永久挂死（该 tab 后续所有 CDP 命令
+/// 与全局状态持久化一起停摆）。需要落盘的入口一律在锁外统一调用。
 function withDebugTabLock(tabId, task) {
   const id = normalizeDebugTabId(tabId);
   const prev = debugOpChains.get(id) || Promise.resolve();
@@ -1357,7 +1464,7 @@ function scheduleDebugDetach(session, reason = 'idle') {
 
   // 主路径用 setTimeout：alarms 的硬下限是 30s（Chrome 120+ 会把更小的值抬到 ≥30s），
   // 只靠它的话「已开始调试此浏览器」横幅必然挂满半分钟。
-  // 【事实修正 P3】MV3 **不保证**「有未执行的 timer 时 SW 不被回收」，短 timer 只是
+  // 【事实修正 】MV3 **不保证**「有未执行的 timer 时 SW 不被回收」，短 timer 只是
   // 尽力而为的最优路径；真正的保底是下面那条 alarm（跨 SW 回收存活）。注释不再承诺
   // 平台没有承诺的存活语义。
   if (session.detachTimer) return; // 已有更早的排期，别再叠加
@@ -1487,8 +1594,9 @@ function ensureDebugAttached(session) {
 }
 
 /// 单个 tab 的 detach 本体：**调用方必须已持有 tab 锁**。
+/// 返回值 true = 需要调用方在**锁外**落盘（见下方 注释）。
 async function detachDebugSessionLocked(session, reason = 'manual') {
-  if (!session) return;
+  if (!session) return false;
   await chrome.alarms.clear(debugDetachAlarmName(session.tabId)).catch(() => null);
   // 有没有需要从快照里清掉的状态，必须在清标志**之前**判断。
   const hadPersistedState = !!(session.network || session.console || (session.intercept && session.intercept.fetchEnabled));
@@ -1522,18 +1630,27 @@ async function detachDebugSessionLocked(session, reason = 'manual') {
   // 只有「本来就有状态」的会话才写：纯 attach 的 detach 不该动别的 tab 的条目。
   // 但断线（ws-close / keepalive-lost）不是「不要这些规则了」，只是连不上 daemon，
   // 此时必须保留条目 —— 旧实现无条件 persist，而内存里的标志刚被清空，
-  // 于是每个 tab 的条目都被逐个删掉，把守卫从旁边绕过去了。
+  // 于是每个 tab 的条目都被逐个删掉，把 的守卫从旁边绕过去了。
   if (hadPersistedState && !keepPersisted) {
     markDebugTabTouched(session.tabId);
-    await persistDebugInterceptState();
-  } else if (hadPersistedState) {
+    // 这里**不**落盘。本函数在 tab 锁内执行，而落盘要走状态锁；restore
+    // 正持状态锁等本 tab 的锁，锁内 await 状态锁就是死锁。由 detachDebugSession
+    // 在锁外补写，返回值只表达「需要写」。
+    return true;
+  }
+  if (hadPersistedState) {
     console.log(`[TMWD-NET] detach(reason=${reason}) 保留 tab ${session.tabId} 的持久化拦截快照（${await countDebugStateEntries()} 个 tab 待恢复）`);
   }
+  return false;
 }
 
-function detachDebugSession(session, reason = 'manual') {
+function detachDebugSession(session, reason = 'manual', options) {
   if (!session) return Promise.resolve();
-  return withDebugTabLock(session.tabId, () => detachDebugSessionLocked(session, reason));
+  const skipPersist = !!(options && options.skipPersist);
+  return withDebugTabLock(session.tabId, () => detachDebugSessionLocked(session, reason))
+    .then(async (needsPersist) => {
+      if (needsPersist && !skipPersist) await persistDebugInterceptState();
+    });
 }
 
 /// detach 之后 Fetch 一定已经不可用，但 rules/stats/log 这些**数据**要留着：
@@ -1555,7 +1672,9 @@ async function detachAllDebugSessions(reason = 'cleanup') {
     session.requests.clear();
     session.requestOrder = [];
     session.logs = [];
-    await detachDebugSession(session, reason);
+    // 批量路径由函数末尾统一落盘一次：逐 tab 写会把 N 次读-改-写放大成 N 份
+    // 配额开销，顺序上也没有额外收益（中间态本来就不该被观察到）。
+    await detachDebugSession(session, reason, { skipPersist: true });
   }
   debugSessions.clear();
   // 只有「daemon 明确要求全部清掉」才抹持久化快照。
@@ -1573,6 +1692,10 @@ async function detachAllDebugSessions(reason = 'cleanup') {
   } else {
     console.log(`[TMWD-NET] 连接断开（reason=${reason}），保留持久化拦截快照等重连后恢复`);
   }
+  // 断线意味着「本 SW 已恢复过」这个结论作废 —— 浏览器侧 CDP 刚被拆掉。
+  // 不置空的话，scheduleFastReconnect（300ms~5s）连回来的那次 onopen 会命中
+  // 已经 settle 的旧 promise → 恢复被永久跳过，规则看起来还在却完全不生效。
+  if (reason === 'ws-close' || reason === 'keepalive-lost') forgetDebugRestoreMemo();
 }
 
 // ---------------------------------------------------------------------------
@@ -1662,6 +1785,10 @@ function markDebugTabTouched(tabId) {
 
 // 状态读-改-写的单飞锁：restore 与所有写入必须串行，
 // 否则「读 → 写」之间插进另一次写入，后写就会覆盖先读的结果。
+//
+// **锁序**：本锁内可以获取 tab 锁（restore 需要逐个 tab 重新 attach）；
+// 反过来不行 —— 持 tab 锁等本锁会与 restore 形成环。因此所有「持 tab 锁的入口」
+// 都必须在锁外调用 persistDebugInterceptState，而不是在锁内顺手落盘。
 let debugStateQueue = Promise.resolve();
 
 function withDebugStateLock(task) {
@@ -1762,14 +1889,23 @@ function ensureDebugSessionsRestored() {
   return debugRestorePromise;
 }
 
-/// 连接建立后的「补恢复」入口（的另一半）。
+/// 连接建立后的「补恢复」入口（另一半）。
 ///
 /// 恢复的消费方只有两处：SW 冷启动求值时的一次 ensureDebugSessionsRestored()，
 /// 和每次 onopen 发完 ext_ready 之后的这里。两者共用同一个永久记忆的 promise，
 /// 所以成功过就**不会**在每次 onopen 重跑（重跑会把「未 attach」的条目当脏数据清掉），
 /// 但失败过的会在下一次 onopen 再试一次。restoreInFlight 只是把「同一次 onopen 的
 /// 并发调用」收敛成一条，避免连发 ext_ready 时重复排队。
+///
+/// 断线（ws-close / keepalive-lost）时浏览器侧 CDP 已被拆掉，这份记忆必须
+/// 显式作废，否则同一 SW 实例内的快速重连永远拿不到第二次恢复机会。
+/// restoreDebugSessionsLocked 本身幂等（只按 touched 增量写、已 attach 的 tab 直接跳过），
+/// 重跑安全。
 let restoreInFlight = null;
+function forgetDebugRestoreMemo() {
+  debugRestorePromise = null;
+  restoreInFlight = null;
+}
 function ensureDebugSessionsRestoredOnReconnect() {
   if (restoreInFlight) return restoreInFlight;
   restoreInFlight = ensureDebugSessionsRestored()
@@ -1894,7 +2030,7 @@ async function restoreDebugSessionsLocked() {
     // 只有「浏览器侧还 attached」的 tab 才值得恢复；否则 Fetch/Network 已随 detach 失效。
     // ws-close / keepalive-lost 会主动 detach（释放浏览器侧 CDP），但快照里的
     // 规则是用户**显式要求持久化**的。重连 / 冷启动时必须重新 attach，否则这些条目
-    // 永远恢复不了，只会被当成脏数据删掉 ——「保留快照」就白做了。
+    // 永远恢复不了，只会被当成脏数据删掉 —— 的「保留快照」就白做了。
     let canRestore = attachedTabs.has(tabId);
     if (!canRestore) {
       try {
@@ -1928,7 +2064,7 @@ async function restoreDebugSessionsLocked() {
       markDebugTabTouched(tabId);
       let restoredAnything = false;
       // network / console 同样是浏览器侧状态：SW 换了一代，事件还会到达，但内存标志没了。
-      // 不重建的话 status 会报 stopped，列表还会因为「无 session」被丢弃（的另一半）。
+      // 不重建的话 status 会报 stopped，列表还会因为「无 session」被丢弃（另一半）。
       if (saved.network) {
         try {
           await chrome.debugger.sendCommand({ tabId }, 'Network.enable', {});
@@ -2219,7 +2355,7 @@ function emptyInterceptStats() {
   return { matched: 0, mocked: 0, aborted: 0, rewritten: 0, continued: 0, failed: 0 };
 }
 
-/// CDP 的 body 一律是 base64。这里按 UTF-8 编码，不能用 btoa(unescape(encodeURIComponent()))。
+/// CDP 的 body 一律是 base64。这里按 编码，不能用 btoa(unescape(encodeURIComponent))。
 function textToBase64(text) {
   const bytes = new TextEncoder().encode(String(text === undefined || text === null ? '' : text));
   let binary = '';
@@ -2251,25 +2387,43 @@ function headersToEntries(headers) {
 }
 
 /// CDP 的 headers 是整体替换，所以必须「基于原头部合并覆盖」后再全量传，否则原有头会丢。
+///
+/// 同名头必须按**多值**保存。旧实现用 `Map<name, entry>` 去重，而 order 里
+/// 仍留着重复的 key → 输出时把「第一条」写了两遍、第二条彻底丢失。最典型的就是
+/// 两条 `Set-Cookie`：改一个 status 就会让其中一个 cookie 消失（甚至把错误的值重复下发）。
+/// 现在 base 的每个同名项逐条保留；只有在规则**显式**给出同名头时才整组替换（覆盖语义），
+/// 且规则自己给多条同名头时按顺序追加，不当成互相覆盖。
 function mergeHeaderEntries(base, ...patches) {
-  const entries = headersToEntries(base);
-  const merged = {
-    order: entries.map(entry => entry.name.toLowerCase()),
-    map: new Map()
+  const order = [];
+  const groups = new Map(); // lowerName -> [{ name, value }]
+  const pushGroup = (key, entry) => {
+    if (!groups.has(key)) {
+      groups.set(key, []);
+      order.push(key);
+    }
+    groups.get(key).push(entry);
   };
-  for (const entry of entries) {
-    const key = entry.name.toLowerCase();
-    if (!merged.map.has(key)) merged.map.set(key, entry);
-  }
+  for (const entry of headersToEntries(base)) pushGroup(entry.name.toLowerCase(), entry);
+  const patched = new Set();
   for (const patch of patches) {
     for (const entry of headersToEntries(patch)) {
       const key = entry.name.toLowerCase();
-      // 同名（大小写不敏感）只保留一次，规则里的值覆盖原值。
-      merged.map.set(key, { name: key, value: entry.value });
-      if (!merged.order.includes(key)) merged.order.push(key);
+      if (!patched.has(key)) {
+        // 规则显式覆盖：整组换成规则给的值（保留规则里的原始大小写）。
+        groups.set(key, [{ name: entry.name, value: entry.value }]);
+        patched.add(key);
+        if (!order.includes(key)) order.push(key);
+      } else {
+        groups.get(key).push({ name: entry.name, value: entry.value });
+      }
     }
   }
-  return merged.order.filter(key => merged.map.has(key)).map(key => merged.map.get(key));
+  const out = [];
+  for (const key of order) {
+    const items = groups.get(key);
+    if (items && items.length) out.push(...items);
+  }
+  return out;
 }
 
 function dropHeaderEntries(entries, names) {
@@ -2287,8 +2441,9 @@ function interceptHasResponseStage(rules) {
 ///
 /// 与 persist（matchesPersistPattern / persist_boot.js）的口径对齐：
 ///   * 无 scheme 的 match（`*/api/*`）→ 前置 `*` 之后 http 与 https 都命中，与 persist 一致；
-///   * 端口：persist 只比 hostname（忽略端口），这里推导时也把 `:端口` 从过滤条件里剥掉，
-///     避免「规则写了端口 → 换个端口就静默不命中」；
+///   * 端口：match 里写了 `host:port` 时**不能**把端口整段删掉 —— `localhost:8080/api`
+///     删成 `localhost/api` 后会推出 `*localhost/api*`，永远不命中带端口的真实 URL，
+///     规则静默失效。这里只把 `:` 换成 `*`，推导结果仍是原 match 的超集；
 ///   * `*` 是唯一的通配符，其余字符按字面量 —— 与 persist 的 glob 语义相同。
 ///
 /// **逐条独立推导**：某条规则推导失败只让它自己退化成 `*`，不会把其它规则一起拖成 `*`。
@@ -2311,11 +2466,11 @@ function deriveUrlPattern(match) {
   if (raw.includes('#')) return fallback;
   // 只保留 URL 里本来就常见的字符，其余一律放弃收窄。
   if (!/^[\w\-.~:/?@!$&'%*+,;=]+$/.test(raw)) return fallback;
-  // 显式写了端口（`host:8080/api`）时把端口从**过滤条件**里去掉：
-  // persist 的三段匹配只比 hostname（天然忽略端口），这里跟着忽略，避免
-  // 「规则写了端口 → CDP 只暂停这一个端口 → 换个端口就静默不命中」。
-  // 只放宽过滤条件，真正的命中判定仍由 interceptRuleMatches 按原文做。
-  const widened = raw.replace(/(^|\/)([A-Za-z0-9._-]+):\d{1,5}(?=\/|$)/, '$1$2');
+  // 显式写了端口（`host:8080/api`）：只把 `:` 换成通配符，**不删除端口**。
+  // 旧实现 `replace(... ':\\d+' ...)` 把 `:8080` 整段吞掉，推出 `*localhost/api*` ——
+  // 带端口的真实 URL 永远不命中。换成 `*` 后 pattern 仍是原 match 的超集：
+  // `*localhost*8080/api*` 既能命中 `http://localhost:8080/api/x`，也不会误命中别的 host。
+  const widened = raw.replace(/(^|\/)([A-Za-z0-9._-]+):(\d{1,5})(?=\/|$)/, '$1$2*$3');
   if (widened.includes('*')) {
     // glob：两侧补通配，保证「子串位置」也能命中（`api/*` 也应命中 https://h/api/x）。
     const head = widened.startsWith('*') ? '' : '*';
@@ -2573,6 +2728,11 @@ async function releasePausedRequest(session, requestId, params) {
   return false;
 }
 
+/// 开关 Fetch 拦截并维护内存状态。**调用方必须已持有 tab 锁**。
+///
+/// 这里**不得**调用 persistDebugInterceptState()：它要走状态锁，而 restore 持状态锁时
+/// 会反过来要本 tab 的锁 —— 两条链互相等待就是永久挂死。落盘统一由调用方
+/// 在 withDebugTabLock 之外完成（见 handleNetIntercept 的 start/rules 分支）。
 async function enableFetchInterception(session, rules) {
   const state = interceptStateOf(session);
   // 只要动过这个 tab 的拦截状态，就必须让读-改-写快照覆盖它。
@@ -2590,14 +2750,12 @@ async function enableFetchInterception(session, rules) {
     state.patterns = [];
     // Fetch 关了就不再算「用途」：如果 network/console 也没开，安排一次延迟 detach，
     // 免得标签页顶部一直挂「正在调试」横条、并挡住其它扩展 attach。
-    await persistDebugInterceptState();
     await detachDebugIfIdle(session);
     return patterns;
   }
   if (state.fetchEnabled && sameFetchPatterns(state.patterns, patterns)) {
     state.patterns = patterns;
     state.responseStage = wantResponseStage;
-    await persistDebugInterceptState();
     return patterns;
   }
   // patterns 不能热更新：阶段/范围变了只能 disable + enable。
@@ -2621,15 +2779,12 @@ async function enableFetchInterception(session, rules) {
     state.patterns = [];
     state.rules = [];
     console.error('[TMWD-FETCH] Fetch.enable 失败，拦截已完全关闭:', e && e.message);
-    await persistDebugInterceptState();
     await detachDebugIfIdle(session);
     throw new Error('fetch-enable-failed: ' + ((e && e.message) || String(e)));
   }
   state.fetchEnabled = true;
   state.responseStage = wantResponseStage;
   state.patterns = patterns;
-  // 落盘：SW 被回收后由扩展自己的 ensureDebugSessionsRestored 靠这份快照重建。
-  await persistDebugInterceptState();
   return patterns;
 }
 
@@ -2728,18 +2883,31 @@ async function handleNetIntercept(msg, sender) {
     // attach + 规则替换 + Fetch.disable/enable 整体串行。
     // 否则两条并发的 netIntercept 会互相 Fetch.disable 掉对方刚 enable 的拦截，
     // 最后「浏览器侧只拦一半，内存里却是后一条的规则」。
-    const patterns = await withDebugTabLock(tabId, async () => {
-      await ensureDebugAttachedLocked(session);
-      // start = 新会话（统计与日志清零）；rules = 只换规则，统计/日志继续累计。
-      if (action === 'start') {
-        state.stats = emptyInterceptStats();
-        state.log = [];
-      }
-      // 排查用开关：打开后放行（pass）也会进日志，默认关闭以保住环形缓冲。
-      if (msg.debugPass !== undefined) state.debugPass = !!msg.debugPass;
-      state.rules = rules;
-      return await enableFetchInterception(session, rules);
-    });
+    let patterns;
+    let lockError = null;
+    try {
+      patterns = await withDebugTabLock(tabId, async () => {
+        await ensureDebugAttachedLocked(session);
+        // start = 新会话（统计与日志清零）；rules = 只换规则，统计/日志继续累计。
+        if (action === 'start') {
+          state.stats = emptyInterceptStats();
+          state.log = [];
+        }
+        // 排查用开关：打开后放行（pass）也会进日志，默认关闭以保住环形缓冲。
+        if (msg.debugPass !== undefined) state.debugPass = !!msg.debugPass;
+        state.rules = rules;
+        return await enableFetchInterception(session, rules);
+      });
+    } catch (e) {
+      lockError = e;
+    }
+    // 落盘必须在 tab 锁**之外**。persistDebugInterceptState 走状态锁，而
+    // restoreDebugSessionsLocked 持状态锁时会调 withDebugTabLock —— 在 tab 锁内 await
+    // 状态锁就与它形成锁序交叉，daemon 重启 + 重下发 netIntercept 的重合窗口里会挂死。
+    // 成功与失败都要写：Fetch.enable 失败时内存状态已被清空，快照必须跟着清，
+    // 否则 SW 重启后会照着过期规则恢复。
+    await persistDebugInterceptState();
+    if (lockError) throw lockError;
     return {
       ok: true,
       action,
@@ -3306,12 +3474,22 @@ const CAPTURE_VISIBLE_MIN_GAP_MS = 550;
 /// 单张 captureVisibleTab（handleCaptureVisible）与整页拼接**共用**这一个
 /// 时间戳，否则「先单张、再整页」连续两次调用会各自认为自己是第一个，
 /// 合起来超过 Chrome 的每秒 2 次硬限流，整页拼接在第 1~2 片就抛 quota 错误。
+/// check-then-set 不是原子的 —— 并发调用会一起读到旧时间戳、算出同一个
+/// waitMs 同时醒来，实际间隔 ≈0ms。改成 promise 链排队：每次调用都排在上一**次
+/// 调用（含 sleep）之后**，串行保证「相邻两次真正发起 capture 的时刻」≥ 550ms。
+/// 链上一步失败不能卡死后续（否则一次 quota 错误会让整页拼接永久停摆）。
 let lastCaptureVisibleAt = 0;
-async function captureVisibleTabThrottled(windowId, options) {
-  const waitMs = lastCaptureVisibleAt + CAPTURE_VISIBLE_MIN_GAP_MS - Date.now();
-  if (waitMs > 0) await new Promise((resolve) => setTimeout(resolve, waitMs));
-  lastCaptureVisibleAt = Date.now();
-  return await chrome.tabs.captureVisibleTab(windowId, options);
+let lastCaptureGate = Promise.resolve();
+
+function captureVisibleTabThrottled(windowId, options) {
+  const run = lastCaptureGate.then(async () => {
+    const waitMs = lastCaptureVisibleAt + CAPTURE_VISIBLE_MIN_GAP_MS - Date.now();
+    if (waitMs > 0) await new Promise((resolve) => setTimeout(resolve, waitMs));
+    lastCaptureVisibleAt = Date.now();
+    return await chrome.tabs.captureVisibleTab(windowId, options);
+  });
+  lastCaptureGate = run.then(() => undefined, () => undefined);
+  return run;
 }
 
 /// 量页面尺寸。返回值非法（导航中、页面冻结）一律抛错，由调用方转成 {ok:false}。
@@ -3955,12 +4133,22 @@ function buildExecScript(code, errorHandler) {
           // 编译期 SyntaxError（语句级 return / 顶层 await）⇒ 一行都没执行，
           // 换函数体通道是安全的。有语句级 return 时按原样当函数体；否则补一个
           // return，不然 await 的结果会被丢掉（返回 undefined）。
+          //
+          // **只有构造期**失败才允许换写法重编。旧实现把「构造 + 调用」写在
+          // 同一个 try 里，用户脚本执行期 throw 也会命中 catch → 整段重跑一遍，
+          // 点击/写入/insertAdjacentHTML 这类副作用直接翻倍。执行期异常必须原样上抛。
           const hasStatementReturn = /^\s*return\b/m.test(jsCode);
+          const primaryBody = hasStatementReturn ? jsCode : _air(jsCode);
+          let runner;
           try {
-            r = await (new AsyncFunction(hasStatementReturn ? jsCode : _air(jsCode)))();
-          } catch (e2) {
-            r = await (new AsyncFunction(_air(jsCode)))();
+            runner = new AsyncFunction(primaryBody);
+          } catch (compileError) {
+            const fallbackBody = _air(jsCode);
+            // 两种写法完全等价时不再重编一份同样的东西（结果只会再抛一次）。
+            if (fallbackBody === primaryBody) throw compileError;
+            runner = new AsyncFunction(fallbackBody);
           }
+          r = await runner();
         } else {
           throw e;
         }
@@ -4184,11 +4372,31 @@ const SELF_BUILD_KEY = 'appliedBuildHash';
 let commandInFlight = 0;
 
 async function computeOwnBuildHash() {
+  // 优先读部署脚本写下的整包指纹（.atb-build.json）：它覆盖 manifest、popup、
+  // options、ui/*.css 等**所有**文件。只哈希 background.js 时，改界面文件浏览器
+  // 永远不会重载，用户看到的就是「改了没生效」（2026-11-05 连续踩了三次）。
+  try {
+    const stampUrl = `${chrome.runtime.getURL('.atb-build.json')}?ts=${Date.now()}`;
+    const stampRes = await fetch(stampUrl, { cache: 'no-store' });
+    if (stampRes.ok) {
+      const stamp = await stampRes.json();
+      if (stamp && typeof stamp.digest === 'string' && stamp.digest) {
+        return {
+          hash: stamp.digest,
+          length: Number(stamp.files) || 0,
+          version: typeof stamp.version === 'string' ? stamp.version : '',
+          builtAt: typeof stamp.builtAt === 'string' ? stamp.builtAt : '',
+        };
+      }
+    }
+  } catch (_) {
+    // 老部署目录没有指纹文件：退回到 background.js 内容哈希，行为与旧版一致。
+  }
   const url = `${chrome.runtime.getURL('background.js')}?ts=${Date.now()}`;
   const res = await fetch(url, { cache: 'no-store' });
   if (!res.ok) return null;
   const text = await res.text();
-  return { hash: await sha256Hex(text), length: text.length };
+  return { hash: await sha256Hex(text), length: text.length, version: '', builtAt: '' };
 }
 
 async function sha256Hex(text) {
@@ -4216,6 +4424,9 @@ async function handleSelfCheck() {
     const fetched = await computeOwnBuildHash();
     out.fetchedHash = fetched?.hash ?? null;
     out.fetchedLength = fetched?.length ?? null;
+    // 指纹文件里带版本与构建时间：能直接看出「跑的是哪一版、什么时候部署的」。
+    out.fetchedVersion = fetched?.version || null;
+    out.fetchedBuiltAt = fetched?.builtAt || null;
     out.changed = !!state[SELF_BUILD_KEY] && state[SELF_BUILD_KEY] !== out.fetchedHash;
   } catch (e) {
     // 自检失败不能伪装成「一切正常」——显式降级并带上原因。
@@ -4471,7 +4682,7 @@ let wsIdleWarned = false;
 /// restart、或上一次空闲退出），扩展最长要等一分钟才重新出现，CLI 侧的表现就是
 /// 「第一条命令特别慢」甚至「没有可用的浏览器标签页」。
 ///
-/// 【事实修正 P3】MV3 **不保证**「有未执行的 setTimeout 时 SW 不被回收」：短 timer 只是
+/// 【事实修正 】MV3 **不保证**「有未执行的 setTimeout 时 SW 不被回收」：短 timer 只是
 /// 尽力而为的快路径，可能随 SW 回收一起丢失；alarms 才是跨回收失效的保底。
 /// 这里用一个 ~20 秒的退避窗口覆盖「daemon 启动那几秒」，丢了也不影响最终重连。
 let fastRetryTimer = null;
@@ -4707,19 +4918,37 @@ async function describeInjectFailure(tabId) {
 // --- 命令幂等去重---
 // daemon 侧的 60s 回放窗口、HTTP 超时后的重试，都会把同一个 id 再下发一次。
 // 扩展侧没有去重时，click / submit / inject 这类副作用会执行两遍。
-// 登记项：running（已开始，拒绝并发的同 id）→ done（回放原结果，不再执行）。
+// 登记项：running（已开始）→ done（回放原结果，不再执行）。
 // 上限 256 / TTL 60s；丢弃迟到响应时**不删**登记，正是为了让重试命中 done。
 const WS_COMMAND_TTL_MS = 60000;
 const WS_COMMAND_LIMIT = 256;
+// 重复命中 running 时挂起等原命令终态（而不是立即回 duplicate_inflight）。
+// 长命令（awaitPromise 可以远超 60s）在 daemon 超时后用同一 id 重试时，
+// 立即拒绝等于把「慢但会成功」变成确定性失败。超时兜底仍回 duplicate_inflight。
+const WS_COMMAND_DUPLICATE_WAIT_MS = 120000;
 const wsCommandLedger = new Map();
 
 function wsCommandSweep(now) {
   for (const [key, entry] of wsCommandLedger) {
-    if (!entry || now - entry.at > WS_COMMAND_TTL_MS) wsCommandLedger.delete(key);
+    if (!entry) {
+      wsCommandLedger.delete(key);
+      continue;
+    }
+    // running 不能按 TTL 清：它还在等自己的终态，清掉会让 daemon 的重试变成
+    // 「重新执行」（副作用翻倍），也会让挂起的等待者永远等不到结果。
+    // 这类条目的数量由 WS_COMMAND_LIMIT 与 wsCommandReleaseIfRunning 共同兜住。
+    if (entry.state === 'running') continue;
+    if (now - entry.at > WS_COMMAND_TTL_MS) wsCommandLedger.delete(key);
   }
   while (wsCommandLedger.size > WS_COMMAND_LIMIT) {
-    const oldest = wsCommandLedger.keys().next().value;
-    if (oldest === undefined) break;
+    let oldest = null;
+    for (const [key, entry] of wsCommandLedger) {
+      if (entry && entry.state === 'running') continue;
+      oldest = key;
+      break;
+    }
+    // 全是 running：宁可超限一次，也不能清掉正在跑的命令（否则重试会重跑副作用）。
+    if (oldest === null) break;
     wsCommandLedger.delete(oldest);
   }
 }
@@ -4730,12 +4959,33 @@ function wsCommandBegin(id) {
   wsCommandSweep(now);
   const prior = wsCommandLedger.get(key);
   if (prior) {
-    // 仍新鲜 → 重复下发。running 回 duplicate_inflight，done 回放原结果。
+    // 仍新鲜 → 重复下发。running 等它结束后回放，done 直接回放。
     prior.at = now;
     return { duplicate: true, prior };
   }
-  wsCommandLedger.set(key, { state: 'running', at: now, payload: null });
+  wsCommandLedger.set(key, { state: 'running', at: now, payload: null, waiters: [] });
   return { duplicate: false };
+}
+
+/// 挂起等待某条命令的终态。返回 null = 等不到（超时 / 命令没有回包被释放），
+/// 调用方应回 duplicate_inflight。超时兜底是必须的：原命令可能因为 SW 回收永远不回包。
+function wsCommandWaitForResult(id, timeoutMs) {
+  const key = String(id);
+  const entry = wsCommandLedger.get(key);
+  if (!entry) return Promise.resolve(null);
+  if (entry.state !== 'running') return Promise.resolve(entry.payload || null);
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (payload) => {
+      if (settled) return;
+      settled = true;
+      try { clearTimeout(timer); } catch (_) {}
+      resolve(payload || null);
+    };
+    const timer = setTimeout(() => finish(null), Math.max(1000, Number(timeoutMs) || WS_COMMAND_DUPLICATE_WAIT_MS));
+    if (!Array.isArray(entry.waiters)) entry.waiters = [];
+    entry.waiters.push(finish);
+  });
 }
 
 /// 登记并发送终态响应（ack 不算终态）。发送失败也照样登记：
@@ -4751,16 +5001,28 @@ function sendWsCommandResponse(socket, id, payload) {
   } else {
     wsCommandLedger.set(key, { state: 'done', payload, at: Date.now() });
   }
+  // 先唤醒重复请求的等待者，再清理过期条目：等待者拿的是同一个 payload 引用，
+  // 顺序反了（sweep 先删）也不会丢，但语义上「结果已就绪」应先于「记账清理」。
+  if (entry && Array.isArray(entry.waiters) && entry.waiters.length) {
+    for (const finish of entry.waiters.splice(0)) {
+      try { finish(payload); } catch (_) {}
+    }
+  }
   wsCommandSweep(Date.now());
   socketSend(socket, payload, payload.type === 'result' ? 'result' : 'error');
 }
 
 /// 只清理「还在 running 且从未产生终态响应」的登记（命令根本没执行成功），
-/// 让 daemon 的重试可以真正重跑。
+/// 让 daemon 的重试可以真正重跑。挂起的等待者一并释放（它们会回 duplicate_inflight）。
 function wsCommandReleaseIfRunning(id) {
   const key = String(id);
   const entry = wsCommandLedger.get(key);
-  if (entry && entry.state === 'running') wsCommandLedger.delete(key);
+  if (entry && entry.state === 'running') {
+    wsCommandLedger.delete(key);
+    if (Array.isArray(entry.waiters)) for (const finish of entry.waiters.splice(0)) {
+      try { finish(null); } catch (_) {}
+    }
+  }
 }
 
 // 正在执行的 exec 命令 → tabId。取消帧（id 带 #cancel 后缀）按 execId 找到
@@ -4768,7 +5030,7 @@ function wsCommandReleaseIfRunning(id) {
 // Runtime.evaluate 立刻失败），不必等到 daemon 侧超时后干等。
 const wsRunningExecs = new Map();
 
-//  （报告方案 C）：strict 档位下「无 token 连接」只放行只读命令。
+// （方案 C）：strict 档位下「无 token 连接」只放行只读命令。
 // `cancel` 不在其中：它会让 debugger attach 提前释放（可被用来打断别人正在跑的诊断），
 // strict 档位下必须和 exec 同等信任级别。
 const WS_READONLY_COMMANDS = new Set([
@@ -4820,7 +5082,8 @@ async function handleWsExec(data, socket = ws) {
     try {
       const result = await chrome.scripting.executeScript({
         target: buildScriptTarget(tabId, data),
-        world: data.world === 'ISOLATED' ? 'ISOLATED' : 'MAIN',
+        // 同 runUserCodeInTab —— 小写 isolated 不能落 MAIN；exec 默认仍是 MAIN。
+        world: normalizeWorld(data.world) || 'MAIN',
         func: async (s) => await eval(s),
         args: [buildPageScript(codeText)]
       });
@@ -4921,6 +5184,168 @@ async function handleCancelCommand(msg) {
   return { id: msg.id, ok: true, cancelled: true, tabId, execId: execId || null, reason: msg.reason || null };
 }
 
+// ---------------------------------------------------------------------------
+// 握手前的对端鉴权（契约 §3.1）
+//
+// daemon 在 upgrade 成功后立刻下发 {"type":"ws_hello",v,nonce,proof,auth_required}，
+// proof = HMAC-SHA256(key=wsToken, msg=nonce + "|" + extension_id) 的小写 hex。
+// 扩展只有在算出同一 proof 之后才发 ext_ready —— 否则「谁绑上了端口谁就是 daemon」，
+// 本机任意进程都能拿全量标签并下发 exec（完整攻击链）。
+//
+// wsToken 为空时保持历史行为：onopen 立即发 ext_ready，ws_hello 直接忽略（老 daemon
+// 不发这一帧，也不能因此把兼容链路卡死）。
+// ---------------------------------------------------------------------------
+const WS_AUTH_WAIT_MS = 5000;
+
+/// 当前这次 onopen 期间累积的非致命告警（心跳/保活等），随 ext_ready 一起上报。
+/// 用模块级变量而不是闭包实参：sendExtReady 也可能由 ws_hello 校验通过后异步触发。
+let wsOpenWarnings = [];
+
+/// 正在等 ws_hello 的那条 socket。只认当前这条：换 socket 后迟到的 hello 必须作废。
+let wsAuthPending = null;
+
+function clearDaemonAuth() {
+  if (wsAuthPending && wsAuthPending.timer) {
+    try { clearTimeout(wsAuthPending.timer); } catch (_) {}
+  }
+  wsAuthPending = null;
+}
+
+function beginDaemonAuth(socket) {
+  clearDaemonAuth();
+  // 定时器用 setTimeout 而不是 alarm：5s 的窗口 alarm 根本表达不了（下限 30s）。
+  // SW 在这 5s 内被回收的极端情况下 onclose 不会触发，此时由 probe/keepalive 兜底重连。
+  const timer = setTimeout(() => {
+    if (!wsAuthPending || wsAuthPending.socket !== socket) return;
+    failDaemonAuth(socket, 'daemon_auth_timeout',
+      `等待 daemon 握手证明超时（${WS_AUTH_WAIT_MS}ms）：对端可能不是真 daemon，或 daemon 版本不支持双向鉴权`)
+      .catch((e) => console.warn('[TMWD-WS] 鉴权超时处理失败:', (e && e.message) || e));
+  }, WS_AUTH_WAIT_MS);
+  wsAuthPending = { socket, timer };
+}
+
+async function failDaemonAuth(socket, kind, message) {
+  clearDaemonAuth();
+  try { await recordWsConnectError(kind, message); } catch (_) {}
+  // discardSocket 会把 onclose 一起摘掉（避免旧 socket 迟到事件干扰新连接），
+  // 所以重连排期必须在这里自己补上，否则鉴权失败就等于永久断连。
+  if (ws === socket) ws = null;
+  discardSocket(socket, 'daemon-auth-failed');
+  // 摘掉 onclose 之后它不会再跑，心跳 alarm 必须在这里清，否则每分钟都会空转一次唤醒。
+  try { await clearWsHeartbeatAlarm(); } catch (_) {}
+  try { scheduleProbe(); } catch (e) { console.warn('[TMWD-WS] scheduleProbe 失败:', e && e.message); }
+  try { scheduleFastReconnect(); } catch (e) { console.warn('[TMWD-WS] scheduleFastReconnect 失败:', e && e.message); }
+}
+
+/// HMAC-SHA256 → 小写 hex。WebCrypto 在扩展页面（含 SW）恒定可用；
+/// 不用扩展 API（chrome.runtime.id 是扩展 ID，正好作为消息的一部分）。
+async function hmacSha256Hex(key, message) {
+  const subtle = globalThis.crypto && globalThis.crypto.subtle;
+  if (!subtle) throw new Error('WebCrypto subtle 不可用，无法校验 daemon 握手证明');
+  const enc = new TextEncoder();
+  const cryptoKey = await subtle.importKey('raw', enc.encode(String(key)), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const signature = await subtle.sign('HMAC', cryptoKey, enc.encode(String(message)));
+  const bytes = new Uint8Array(signature);
+  let hex = '';
+  for (const byte of bytes) hex += byte.toString(16).padStart(2, '0');
+  return hex;
+}
+
+/// 恒定时间比较：不 early-return，避免按「前几位对上了」的时序差反推 proof。
+/// 长度不同直接判否（长度本身不是秘密）。
+function constantTimeEqualHex(left, right) {
+  const a = String(left || '').toLowerCase();
+  const b = String(right || '').toLowerCase();
+  if (!a || a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i += 1) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+/// 处理 ws_hello：只有「本地有 token 且确实在等这一帧」时才校验。
+async function handleDaemonAuthHello(socket, data) {
+  const pending = wsAuthPending;
+  if (!pending || pending.socket !== socket) return;
+  // 等待期间用户清空了 token：此时没有可验证的密钥，回到无 token 的兼容路径。
+  if (!wsToken) {
+    clearDaemonAuth();
+    await sendExtReady(socket);
+    return;
+  }
+  // 本地有 token 但对端声明不需要鉴权 → 对端不认识我们的密钥（旧版或被冒充），按失败处理。
+  if (data.auth_required === false) {
+    await failDaemonAuth(socket, 'daemon_auth_failed',
+      '本地已配置 token，但对端声明 auth_required=false：不是预期的 daemon（可能端口被其它进程占用）');
+    return;
+  }
+  const nonce = String(data.nonce || '');
+  const proof = String(data.proof || '');
+  if (!nonce || !proof) {
+    await failDaemonAuth(socket, 'daemon_auth_failed', 'ws_hello 缺少 nonce 或 proof');
+    return;
+  }
+  let expected = '';
+  try {
+    expected = await hmacSha256Hex(wsToken, `${nonce}|${chrome.runtime.id}`);
+  } catch (e) {
+    await failDaemonAuth(socket, 'daemon_auth_failed', '计算握手证明失败：' + ((e && e.message) || e));
+    return;
+  }
+  if (ws !== socket) return; // 校验期间已换代：这条 socket 的结论不再有人关心
+  if (!constantTimeEqualHex(expected, proof)) {
+    await failDaemonAuth(socket, 'daemon_auth_failed',
+      'daemon 握手证明不匹配：对端不持有当前 wsToken（端口可能被其它进程占用）');
+    return;
+  }
+  clearDaemonAuth();
+  await sendExtReady(socket);
+}
+
+/// 发送 ext_ready 及其后续补发/恢复。抽成独立函数是必须的：鉴权模式下这条路径
+/// 由 ws_hello 触发，与「无 token 时 onopen 直接发」共用同一份实现，避免两处分叉。
+async function sendExtReady(socket) {
+  if (ws !== socket) return;
+  // daemon 在 accept 之后就在等 ext_ready：这里任何一步抛错都不能让它永不发出，
+  // 否则 daemon 侧所有命令超时、扩展侧 popup 还显示「已连接」，故障极难定位。
+  const warnings = wsOpenWarnings;
+  wsOpenWarnings = [];
+  let tabs = [];
+  let groupTitles = null;
+  let fileSchemeAccess = false;
+  try {
+    try { await clearWsConnectError(); } catch (e) { warnings.push('clearConnectError: ' + ((e && e.message) || e)); }
+    try { await ensureBrowserMeta(); } catch (e) { warnings.push('browserMeta: ' + ((e && e.message) || e)); }
+    try { await ensureClientIdentity(); } catch (e) { warnings.push('clientIdentity: ' + ((e && e.message) || e)); }
+    try { tabs = await queryScriptableTabs(); } catch (e) { warnings.push('queryTabs: ' + ((e && e.message) || e)); }
+    // 分组标题要和 tabs_update 用同一套字段：以前这里漏了声明，ext_ready 直接抛
+    // ReferenceError，副作用是 daemon 拿不到首批标签（连接显示已建、标签数为 0）。
+    try { groupTitles = await queryTabGroupTitles(); } catch (e) { warnings.push('tabGroups: ' + ((e && e.message) || e)); }
+    try { fileSchemeAccess = await isAllowedFileSchemeAccess(); } catch (e) { warnings.push('fileSchemeAccess: ' + ((e && e.message) || e)); }
+    try { await ensureRestartSeq(); } catch (e) { warnings.push('restartSeq: ' + ((e && e.message) || e)); }
+    tabs = filterReportableTabs(tabs);
+  } finally {
+    // finally 里无论如何都发一次 ext_ready；拿不到的信息用默认值/空数组。
+    socketSend(socket, withClientIdentity({
+      type: 'ext_ready',
+      protocol: EXTENSION_PROTOCOL,
+      extension_version: extensionVersion,
+      file_scheme_access: fileSchemeAccess,
+      tabs: tabs.map(t => ({ id: t.id, window_id: t.windowId, url: t.url, title: t.title, active: t.active, group_title: groupTitles ? tabGroupTitle(groupTitles, t) : null })),
+      restartSeq: restartSeq || 0,
+      warnings
+    }));
+    console.log('[TMWD-WS] Sent ext_ready with', tabs.length, 'tabs',
+      warnings.length ? ('warnings: ' + warnings.join(' | ')) : '');
+  }
+  // ext_ready 必须先发（daemon 靠它建会话表），再按序补发断线期间积累的消息；
+  // 队列里可能有断线时的旧 tab 快照，所以最后再排一次 tabs_update 保证以最新状态收尾。
+  flushWsSendQueue(socket);
+  // 断线时快照被保留（detach 走 keepPersisted），这里补一次恢复，
+  // 兜住「冷启动时 debugger/daemon 还没就绪，首次 restore 失败」的情况。
+  ensureDebugSessionsRestoredOnReconnect();
+  scheduleTabsUpdate();
+}
+
 /// 建连的单飞：connectWS 内部有多个 await（读端口 / 读 token / isServerAlive），
 /// 而调用点有五处（模块求值、onStartup、onInstalled、probe、fastRetry）。
 /// 旧写法只在 await 之后才检查 `ws && readyState <= 1`，于是并发两次调用会各自
@@ -4972,7 +5397,7 @@ async function connectWSInner() {
   }
   if (ws && ws.readyState <= 1) return; // CONNECTING or OPEN
   // 记录「真正开始尝试建连」的时刻：scheduleProbe 用它避免刚试过又立刻排一轮，
-  // keepalive 用它判断一次握手是否已经等太久（的 CONNECTING 分支）。
+  // keepalive 用它判断一次握手是否已经等太久（CONNECTING 分支）。
   lastConnectAttemptAt = Date.now();
   if (!(await isServerAlive())) {
     console.warn('[TMWD-WS] Server not ready, retrying later:', maskWsUrl(getWsConnectUrl()));
@@ -5012,46 +5437,20 @@ async function connectWSInner() {
     // lastPongAt 会是上一代连接留下的旧值（或 0），静默判定会立刻误触发。
     if (ws === socket) { lastPongAt = Date.now(); wsIdleWarned = false; }
     cancelFastReconnect();
-    // daemon 在 accept 之后就在等 ext_ready：这里任何一步抛错都不能让它永不发出，
-    // 否则 daemon 侧所有命令超时、扩展侧 popup 还显示「已连接」，故障极难定位。
-    const warnings = [];
-    let tabs = [];
-    let groupTitles = null;
-    let fileSchemeAccess = false;
-    try {
-      try { await clearWsConnectError(); } catch (e) { warnings.push('clearConnectError: ' + ((e && e.message) || e)); }
-      try { scheduleKeepalive(); } catch (e) { warnings.push('scheduleKeepalive: ' + ((e && e.message) || e)); }
-      try { startWsHeartbeat(socket); } catch (e) { warnings.push('wsHeartbeat: ' + ((e && e.message) || e)); }
-      try { ensureWsHeartbeatAlarm(); } catch (e) { warnings.push('wsHeartbeatAlarm: ' + ((e && e.message) || e)); }
-      try { await ensureClientIdentity(); } catch (e) { warnings.push('clientIdentity: ' + ((e && e.message) || e)); }
-      try { tabs = await queryScriptableTabs(); } catch (e) { warnings.push('queryTabs: ' + ((e && e.message) || e)); }
-      // 分组标题要和 tabs_update 用同一套字段：以前这里漏了声明，ext_ready 直接抛
-      // ReferenceError，副作用是 daemon 拿不到首批标签（连接显示已建、标签数为 0）。
-      try { groupTitles = await queryTabGroupTitles(); } catch (e) { warnings.push('tabGroups: ' + ((e && e.message) || e)); }
-      try { fileSchemeAccess = await isAllowedFileSchemeAccess(); } catch (e) { warnings.push('fileSchemeAccess: ' + ((e && e.message) || e)); }
-      try { await ensureRestartSeq(); } catch (e) { warnings.push('restartSeq: ' + ((e && e.message) || e)); }
-      tabs = filterReportableTabs(tabs);
-    } finally {
-      // finally 里无论如何都发一次 ext_ready；拿不到的信息用默认值/空数组。
-      socketSend(socket, withClientIdentity({
-        type: 'ext_ready',
-        protocol: EXTENSION_PROTOCOL,
-        extension_version: extensionVersion,
-        file_scheme_access: fileSchemeAccess,
-        tabs: tabs.map(t => ({ id: t.id, window_id: t.windowId, url: t.url, title: t.title, active: t.active, group_title: groupTitles ? tabGroupTitle(groupTitles, t) : null })),
-        restartSeq: restartSeq || 0,
-        warnings
-      }));
-      console.log('[TMWD-WS] Sent ext_ready with', tabs.length, 'tabs',
-        warnings.length ? ('warnings: ' + warnings.join(' | ')) : '');
+    // 心跳 / 保活 / alarm 与鉴权无关，必须在 onopen 就排期：等 ws_hello 的那几秒里
+    // 若对端是半开连接，这是唯一能发现它的机制。失败只记进 ext_ready 的 warnings。
+    wsOpenWarnings = [];
+    try { scheduleKeepalive(); } catch (e) { wsOpenWarnings.push('scheduleKeepalive: ' + ((e && e.message) || e)); }
+    try { startWsHeartbeat(socket); } catch (e) { wsOpenWarnings.push('wsHeartbeat: ' + ((e && e.message) || e)); }
+    try { ensureWsHeartbeatAlarm(); } catch (e) { wsOpenWarnings.push('wsHeartbeatAlarm: ' + ((e && e.message) || e)); }
+    // 契约 §3.1：本地配了 token 时**不得**立即发 ext_ready。任何本机进程都能在
+    // daemon 未监听的窗口绑定 127.0.0.1:端口；先验 daemon 是否真持有同一 token，
+    // 否则对方能直接拿到全量标签并下发 exec（本地提权到完全接管浏览器）。
+    if (wsToken) {
+      beginDaemonAuth(socket);
+      return;
     }
-    // ext_ready 必须先发（daemon 靠它建会话表），再按序补发断线期间积累的消息；
-    // 队列里可能有断线时的旧 tab 快照，所以最后再排一次 tabs_update 保证以最新状态收尾。
-    flushWsSendQueue(socket);
-    // 断线时快照被保留（detach 走 keepPersisted），这里补一次恢复，
-    // 兜住「冷启动时 debugger/daemon 还没就绪，首次 restore 失败」的情况。
-    ensureDebugSessionsRestoredOnReconnect();
-    scheduleTabsUpdate();
+    await sendExtReady(socket);
   });
   socket.onmessage = guardSocketHandler('ws-onmessage', socket, async (event) => {
     let data;
@@ -5065,7 +5464,13 @@ async function connectWSInner() {
     // 任何入站帧都刷新「对端活着」的时间戳；只认当前 socket，
     // 过期 socket 的迟到消息不能给新连接续命（guardSocketHandler 已挡一层）。
     if (ws === socket) { lastPongAt = Date.now(); wsIdleWarned = false; }
-    // 应用层心跳的回应（{type:'pong'}，无 id）。 ：这是唯一的 RTT 证据，
+    // 契约 §3.1：ws_hello 是握手帧，没有 id，必须在「无 id 直接丢」之前拦下来。
+    // 只有正在等它的 socket 才消费；无 token 的连接按历史行为忽略这一帧。
+    if (data.type === 'ws_hello') {
+      await handleDaemonAuthHello(socket, data);
+      return;
+    }
+    // 应用层心跳的回应（{type:'pong'}，无 id）。这是唯一的 RTT 证据，
     // 旧实现把「任何入站消息」当 pong 刷新，链路半开时永远判不出来。
     if (data.type === 'pong') {
       if (lastPingAt) lastPongRttMs = Date.now() - lastPingAt;
@@ -5086,13 +5491,21 @@ async function connectWSInner() {
     if (ledger.duplicate) {
       const prior = ledger.prior;
       if (prior.state === 'running') {
-        // 只回一条「正在执行」，**不改登记状态**：原命令仍是 running，
-        // 它稍后产生的真实结果才是这条 id 的终态。
-        socketSend(socket, {
-          type: 'error',
-          id: data.id,
-          error: { name: 'DuplicateCommand', message: '命令正在执行（duplicate_inflight）', code: 'duplicate_inflight' }
-        }, 'error');
+        // 不立即回 duplicate_inflight —— 长命令可能还要几十秒才结束，
+        // 直接拒绝会把「慢但会成功」变成确定性失败。挂起等原命令的终态再回放同一条结果；
+        // 只有等不到（超时 / 原命令没回包被释放）才退化为 duplicate_inflight。
+        // 注意这里**不改登记状态**：原命令仍是 running，它稍后产生的真实结果才是终态。
+        const payload = await wsCommandWaitForResult(data.id, WS_COMMAND_DUPLICATE_WAIT_MS);
+        if (payload) {
+          console.log('[TMWD-WS] 重复命令等到了原结果，回放:', data.id);
+          socketSend(socket, payload, payload.type === 'result' ? 'result' : 'error');
+        } else {
+          socketSend(socket, {
+            type: 'error',
+            id: data.id,
+            error: { name: 'DuplicateCommand', message: '命令正在执行（duplicate_inflight）', code: 'duplicate_inflight' }
+          }, 'error');
+        }
       } else {
         // 已完成的命令：原样回放上次的结果，不再执行副作用。
         console.log('[TMWD-WS] 命中已完成的命令 id，回放结果:', data.id);
@@ -5108,7 +5521,7 @@ async function connectWSInner() {
       if (typeof code === 'string') {
         try { const p = JSON.parse(code); if (p && typeof p === 'object') code = p; } catch (_) {}
       }
-      // / 报告方案 C：strict 档位下，无 token 的连接视为「对端身份未确认」，
+      // 方案 C：strict 档位下，无 token 的连接视为「对端身份未确认」，
       // 只放行只读命令。默认 compat 不做任何拦截（既有部署零变化）。
       const cmdName = (typeof code === 'object' && code && code.cmd) ? String(code.cmd) : (typeof code === 'string' ? 'exec' : '');
       if (!wsTrustAllowsCommand(cmdName)) {
@@ -5184,6 +5597,10 @@ async function connectWSInner() {
 async function onSocketClosed(socket, event) {
   console.log('[TMWD-WS] Disconnected');
   ws = null;
+  // 这条 socket 已经没了：等 ws_hello 的定时器必须一起撤掉，否则 5s 后会去
+  // 对一条已关闭的 socket 做鉴权失败处理（重复排一次 probe）。
+  clearDaemonAuth();
+  forgetDebugRestoreMemo();
   // 连接没了，常驻心跳 alarm 必须停掉（否则每次唤醒都是空转）。
   try {
     await clearWsHeartbeatAlarm();
@@ -5226,6 +5643,8 @@ function reconnectWS() {
   // 旧实现只置空 onclose，旧 socket 残留的 onmessage 仍会把迟到帧当新命令执行，
   // 与 onclose 里已有的 `ws !== socket` 守卫形成不对称。
   ws = null;
+  // 换代时旧 socket 的 ws_hello 定时器同样作废，否则它会误判新连接鉴权失败。
+  clearDaemonAuth();
   if (previous) discardSocket(previous, 'reconnect');
   // 主动换代时把心跳 / 保活 / probe 的排期一起作废，
   // 旧 socket 的 timer 与 alarm 不该在新连接上继续空转。
@@ -5317,7 +5736,7 @@ swGlobal?.addEventListener?.('unhandledrejection', (event) => {
 // SW 每次求值都 +1：随 ext_ready 上报，仅供 daemon 做「换代检测」（见上方 RESTART_SEQ 注释）。
 ensureRestartSeq().catch(swallow('restartSeq'));
 // 冷启动恢复：debugSessions 是内存态，但浏览器侧的 Fetch 拦截 / Network / Runtime 采集
-// 仍然生效。恢复由扩展自己完成（单飞 promise，requestPaused 也会 await 它），
+// 仍然生效。恢复由扩展自己完成（单飞 promise，requestPaused 也会 await 它，见），
 // 必须在 connectWS 之外独立跑，且失败不影响后续启动流程。
 // alarm 唤醒也会重新求值本模块，这里用「本浏览器会话已恢复过」标记避免反复 attach。
 ensureDebugSessionsRestoredOnBoot().catch(swallow('restoreDebugSessions'));
@@ -5415,12 +5834,16 @@ chrome.tabs?.onRemoved?.addListener?.((tabId) => {
   // 否则 debugSessions 会为每个关闭过的标签留一份 requests/logs，越积越大。
   chrome.alarms?.clear?.(debugDetachAlarmName(tabId));
   debugSessions.delete(tabId);
-  // 同步删掉持久化条目：tab 已经不在了，restore 只会白试一次（的增量写入口）。
+  // 同步删掉持久化条目：tab 已经不在了，restore 只会白试一次（增量写入口）。
   markDebugTabTouched(tabId);
   persistDebugInterceptState().catch(() => null);
   scheduleTabsUpdate();
 });
 chrome.tabs?.onCreated?.addListener?.(() => scheduleTabsUpdate());
+// 切换标签也必须刷新。`tabs[].active` 只由 daemon 侧的快照提供，缺这条监听时
+// 用户切到别的标签后 daemon 仍认为旧标签是 active，`atb --tab current` 会打到上一个标签。
+// sendTabsUpdate 每次都是全量快照（含 active 字段），所以不存在「增量不覆盖」的问题。
+chrome.tabs?.onActivated?.addListener?.(() => scheduleTabsUpdate());
 
 // 启动自检：可选 API 缺失时明确报出来，避免「popup 只显示未连接、毫无线索」。
 warnMissingApis();

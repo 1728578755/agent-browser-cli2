@@ -185,7 +185,7 @@ if (downloadWaitBody) {
 
 const exitCalls = [...source.matchAll(/std::process::exit\s*\(/g)].map((m) => m.index);
 // 旧断言写的是 `<= 1`，用例名却说「有且仅有一处」——一处都没有时也能 PASS，
-// 整个守卫等于空转（v6 P3）。现在拆成两条：
+// 整个守卫等于空转（v6）。现在拆成两条：
 //   1. 至多一处；2. 一处都没有时，main 必须用 ExitCode 当唯一出口。
 // 入口改成 `fn main() -> ExitCode` 后允许 0 处，但不能再出现「退出码散落在
 // 各命令实现里」的回退，所以 0 处必须能证明出口收敛在 main。
@@ -210,21 +210,27 @@ for (const at of exitCalls) {
 
 // ---- 6. EXIT0 兼容开关必须保留 ---------------------------------------
 
-// 命令改名为 atb 后，开关改成 config::env_compat("EXIT0")：先读 ATB_EXIT0，
-// 再回退旧名 AGENT_BROWSER_CLI_EXIT0。这里同时校验「调用点」与「旧名回退」，
-// 否则改名会把已经写进用户脚本的兼容开关静默废掉（会复发）。
+// 命令改名为 atb 后，开关先读 ATB_EXIT0、再回退旧名 AGENT_BROWSER_CLI_EXIT0；
+// 只认 1/true。2026-11-06 收拢轮把「读取 + 解析」移进 src/settings.rs
+// （exit0_enabled，经 read_env 统一处理旧前缀），cli/mod.rs 只留调用点
+// exit0_compat() -> settings::exit0_enabled()。这里分层锁住四件事：
+// 调用点形状、委托关系、解析语义、旧名回退——少任何一层，（失败却
+// exit 0）或「旧名静默失效」都会复发。
 //
-// 两个正则必须落在**同一个语义单元**里。旧写法在整个 cli 源码上分别
+// 正则必须落在**同一个语义单元**里。旧写法在整个 cli 源码上分别
 // grep，`code != 0 && exit0_compat()` 和 `matches!(..., "1" | "true")` 来自两个
 // 不同函数也能同时命中——只要任何地方出现过一次就绿，等于没锁住「同一开关」。
 const CONFIG_RS = join(HERE, '..', 'src', 'config.rs');
+const SETTINGS_RS = join(SRC_DIR, 'settings.rs');
 const configSource = readFileSync(CONFIG_RS, 'utf8');
-check('保留 EXIT0 兼容开关（调用点）', /env_compat\("EXIT0"\)/.test(source));
+const settingsSource = readFileSync(SETTINGS_RS, 'utf8');
 
 const exitCodeBody = fnBody(source, 'exit_code');
 const exit0Body = fnBody(source, 'exit0_compat');
+const exit0EnabledBody = fnBody(settingsSource, 'exit0_enabled');
 check('找到 exit_code 实现', !!exitCodeBody);
 check('找到 exit0_compat 实现', !!exit0Body);
+check('找到 settings::exit0_enabled 实现', !!exit0EnabledBody);
 if (exitCodeBody && exit0Body) {
   check(
     'EXIT0 只在 code != 0 时把退出码改成 0（判断在 exit_code 内）',
@@ -232,9 +238,21 @@ if (exitCodeBody && exit0Body) {
     exitCodeBody.slice(0, 200),
   );
   check(
-    'EXIT0 只认 1/true（解析在 exit0_compat 内）',
-    /matches!\(\s*value\.to_string_lossy\(\)\.trim\(\),\s*"1"\s*\|\s*"true"\s*\)/.test(exit0Body),
+    'exit0_compat 委托给 settings::exit0_enabled（收拢后解析只在 settings.rs）',
+    /crate::settings::exit0_enabled\s*\(\s*\)/.test(exit0Body),
     exit0Body.slice(0, 200),
+  );
+}
+if (exit0EnabledBody) {
+  check(
+    'EXIT0 只认 1/true（解析在 exit0_enabled 内）',
+    /matches!\(\s*value\.trim\(\),\s*"1"\s*\|\s*"true"\s*\)/.test(exit0EnabledBody),
+    exit0EnabledBody.slice(0, 200),
+  );
+  check(
+    'EXIT0 读取走 read_env（旧前缀 AGENT_BROWSER_CLI_ 仍生效）',
+    /read_env\("ATB_EXIT0"\)/.test(exit0EnabledBody),
+    exit0EnabledBody.slice(0, 200),
   );
 }
 check(

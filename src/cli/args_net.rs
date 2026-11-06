@@ -279,8 +279,16 @@ pub(crate) struct InjectArgs {
     /// 列出已持久化的注入
     #[arg(long)]
     pub(crate) list: bool,
-    /// 执行环境 main / isolated
-    #[arg(long, default_value = "main")]
+    /// 执行环境 main / isolated（大小写不敏感）
+    ///
+    /// 与 `exec --world` 同口径：自由字符串会被扩展静默落成 MAIN，用户以为切到了
+    /// isolated（同类漏网）。
+    #[arg(
+        long,
+        default_value = "main",
+        value_parser = ["main", "isolated"],
+        ignore_case = true
+    )]
     pub(crate) world: String,
     /// 只在匹配的 URL 上重放（可多次），默认 <all_urls>
     #[arg(long = "match")]
@@ -472,7 +480,7 @@ pub(crate) struct NetHookArgs {
     ///
     /// `Option<bool>` 而不是 `bool`：不带这个 flag 时**不下发**该字段，服务端才会沿用
     /// 已持久化的值。旧写法默认 false 且每次下发，第二次 `net hook --persist` 会把
-    /// 之前存的 captureBodies 静默压回 false（B-17 的 CLI 侧另一半）。
+    /// 之前存的 captureBodies 静默压回 false（CLI 侧另一半）。
     #[arg(long = "capture-bodies", num_args = 0..=1, default_missing_value = "true")]
     pub(crate) capture_bodies: Option<bool>,
     /// 持久化：页面导航后自动重装 hook（可配合 --match 限定 URL）

@@ -227,6 +227,19 @@ pub(crate) fn is_extension_json(script: &str) -> bool {
         .is_some_and(|cmd| INTERNAL_CMD_WHITELIST.contains(&cmd))
 }
 
+/// 给内部扩展控制命令打上标记（构造点统一走这里）。
+///
+/// 仓库内的控制帧（`cdp.rs` / `open.rs` / `lifecycle.rs` 等）直接经
+/// `execute_raw_js*` 下发、不经过 `exec_value`，无需改；凡是可能经过
+/// `/exec`（`exec_value` → `execute_page_js*`）的调用必须用本函数构造。
+#[allow(dead_code)]
+pub(crate) fn internal_extension_cmd(mut command: Value) -> String {
+    if let Value::Object(map) = &mut command {
+        map.insert(INTERNAL_CMD_MARKER.to_string(), json!(true));
+    }
+    command.to_string()
+}
+
 /// 把用户脚本包成语义确定的 async IIFE。
 ///
 /// 目的：不依赖扩展侧 `_air`（自动补 `return`）的启发式。

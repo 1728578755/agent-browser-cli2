@@ -15,7 +15,6 @@ atb find --text '订单号' --limit 10
 
 注意：
 
-- 登录态来自用户现有 Profile 与 Cookie；atb 不代替用户登录，也不应持有账号密码。
 - `read` 默认带表单结构和计数；只要正文时加 `--no-forms` 省 token。
 - 页面很长时先 `scan --text-only` 或 `read --selector`，不要整页 dump。
 - 不要用 `cookies --clear` 清理真实账号的登录态，除非用户明确要求。
@@ -136,7 +135,7 @@ atb challenge focus   # 只有图片/短信等必须人做的验证
 - `open` 默认 `--challenge auto`：命中后先主动求解（定位组件、带轨迹点击），再等 token/跳转；不是只等待。`challenge solve` 手动跑同一路径，`challenge auto` 只求解一次，`challenge wait` 才是纯等待。
 - 自动求解失败先看 `challenge.auto_solve.reason`：`no-widget-frame` 表示组件没渲染；`click-no-effect` 表示点了没反应；`verifying_not_completed` 表示停在「正在验证」；`widget-removed-no-nav` 表示组件消失但没跳转。
 - 兜底顺序是 `widget` 取坐标 → `click --at` 自己点 → `status` 复查；只有图片点选、短信/邮箱验证这类需要人判读的场景才 `focus`。
-- 不要循环狂点：连续失败会浪费预算，也会让站点更警惕。不保证通过，也不破解访问控制。
+- 不要循环狂点：连续失败会浪费预算，也会让站点更警惕。
 
 ## 8. 下载文件
 
@@ -149,7 +148,7 @@ atb download-wait --id <downloadId> --timeout 120
 
 注意：
 
-- `--dir` 是 Chrome 默认下载目录下的子目录，不是任意绝对路径；含 `..` 段会被拒绝。
+- `--dir` 相对路径按当前工作目录解析，也可传绝对路径；含 `..` 段会被拒绝。
 - `--filename` 会被净化：取 basename、去掉路径分隔符 / `..` / Windows 保留名 / 尾部点空格，超长截断但保留扩展名；回包 `filename_sanitized{requested,applied,changed,warnings}` 里能看到实际下发的名字。
 - `download-wait` 省略 `--id` 时自动认领本 agent 最近一条下载；设 `ATB_DOWNLOAD_AUTO_CLAIM=false` 后必须显式给 `--id`，否则返回 `download_id_required`。
 - 下载由浏览器执行；磁盘满、权限不足或站点要求二次确认时会停在 `interrupted`。超时可用 `ATB_DOWNLOAD_CANCEL_ON_TIMEOUT=1` 让 daemon 主动取消。

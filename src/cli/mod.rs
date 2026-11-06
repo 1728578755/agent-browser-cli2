@@ -291,7 +291,5 @@ pub fn exit_code() -> i32 {
 }
 
 fn exit0_compat() -> bool {
-    config::env_compat("EXIT0")
-        .map(|value| matches!(value.to_string_lossy().trim(), "1" | "true"))
-        .unwrap_or(false)
+    crate::settings::exit0_enabled()
 }

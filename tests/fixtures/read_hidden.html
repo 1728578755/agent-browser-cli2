@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <title>Read Hidden 测试页</title>
+  <meta name="description" content="read --include-hidden 测试">
+  <style>.css-hidden { display: none; }</style>
+</head>
+<body>
+  <h1>可见标题</h1>
+  <p id="visible">可见段落内容。</p>
+  <div style="display:none">inline-hidden-text</div>
+  <div hidden>attribute-hidden-text</div>
+  <div aria-hidden="true">aria-hidden-text</div>
+  <div class="css-hidden">css-class-hidden-text</div>
+  <script>var scriptOnly = 'script-text';</script>
+  <button id="go" onclick="location.href='read_hidden_2.html'">下一步</button>
+</body>
+</html>

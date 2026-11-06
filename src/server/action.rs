@@ -158,7 +158,7 @@ pub(crate) fn json_result(result: Result<Value>) -> Value {
 /// 用于「请求被处理了」不等于「业务成功」的命令：外层 `ok` 跟随内层的业务结论。
 ///
 /// 以前 challenge / downloads wait 的超时走 `json_result(Ok(...))`，外层固定 `ok: true`，
-/// HTTP 直调方看到 `ok:true` 会以为等待成功（B-02）。
+/// HTTP 直调方看到 `ok:true` 会以为等待成功。
 /// `result` 内部结构与字段名一律不动：CLI 依赖 `/result/passed`、`/result/cleared`、
 /// `/result/ok`；只把外层 `ok` 修正为真实结论。
 pub(crate) fn json_result_with_inner_ok(result: Result<Value>) -> Value {
@@ -442,7 +442,9 @@ pub(crate) async fn inject_value(state: &AppState, req: InjectRequest) -> Result
 /// links / budget_ms 等一堆与 iframe 枚举无关的字段），语义误导且校验不到。
 /// 字段名与 `ReadRequest` 一致，线协议（CLI 发的 JSON）保持不变。
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct FramesRequest {
+    #[serde(alias = "switchTabId")]
     pub(crate) switch_tab_id: Option<String>,
     pub(crate) browser: Option<String>,
     pub(crate) profile: Option<String>,
@@ -527,7 +529,7 @@ pub(crate) async fn dom_set_files(
         .await?;
     } else if let Some(selector) = object_id.strip_prefix("__selector:") {
         // 用 nodeId 而不是 objectId：部分 Chrome 版本会「接受 objectId 但什么都不做」，
-        // 命令返回成功、文件却没挂上（的另一个真实触发面）。
+        // 命令返回成功、文件却没挂上（另一个真实触发面）。
         // getDocument → querySelector → setFileInputFiles 是文档化的标准链路。
         batch_cdp_call(
             state,
@@ -1001,7 +1003,7 @@ pub(crate) fn ensure_page_action_ok(operation: &Value) -> Result<()> {
 /// 对不可聚焦元素（`<div>` / `<span>` / 没有 tabindex 的容器，或 `focus` 被页面
 /// `preventDefault`）调用 `el.focus()` 是 no-op：页面脚本照样回 `ok:true`，但
 /// `active:false`。daemon 放行后 `dispatch_keys` 会把按键发给**当前实际聚焦的元素**
-/// （通常是 body），命令却报 `success` + `dispatched:N` —— 按键全废且完全静默（C-01）。
+/// （通常是 body），命令却报 `success` + `dispatched:N` —— 按键全废且完全静默。
 ///
 /// 缺 `active` 字段（旧扩展）时按「无法证明失败」放行，保持向后兼容。
 pub(crate) fn ensure_focus_landed(operation: &Value, target: &str) -> Result<()> {
@@ -1240,7 +1242,7 @@ pub(crate) async fn run_send_keys_action(
                     run_page_action(state, tab_id, "focus", json!(selector), json!({}), timeout)
                         .await?;
                 // 页面动作可能以 ok:false 返回而不是 Err；而且「元素找到了、但没聚焦
-                // 成功」（`active:false`）也必须拦——否则按键会静默打进 body（C-01）。
+                // 成功」（`active:false`）也必须拦——否则按键会静默打进 body。
                 ensure_focus_landed(&focused, &selector).map_err(|err| {
                     anyhow!("无法把焦点移到目标元素（{selector}），按键未发送：{err}")
                 })?;
@@ -1298,7 +1300,7 @@ pub(crate) async fn finish_operation(
     if let Some(wait_js) = options.wait_js.as_deref() {
         // --wait-js 必须和动作落在同一个 frame：`frame_id` 就在 options 里，旧实现丢掉它，
         // 条件在主框架求值 —— 子 frame 里的动作要么假命中（主框架恰好满足）、
-        // 要么永远等不到而误报超时（P3）。
+        // 要么永远等不到而误报超时。
         let wait_target = ExecTargetOptions {
             frame_id: options.frame_id,
             ..Default::default()

@@ -3,8 +3,21 @@
 //
 // 命名约定：本文件的辅助函数一律带 `__abcAct` 前缀（`__abcActVisible` 等）。
 // 与 page_find.js 的同名逻辑**不能共用同一个全局名**：两份脚本都注入同一个
-// world，后注入者会静默覆盖先注入者，于是「只改了其中一份」就变成行为漂移
-// 。语义相同也要各留一份、各叫各的名字。
+// world，后注入者会静默覆盖先注入者，于是「只改了其中一份」就变成行为漂移。
+// 语义相同也要各留一份、各叫各的名字。
+//
+// ---- 入口挂载----
+// 扩展侧每次调用前都重新注入本文件（background.js 的 handlePageOp），同一 world
+// 里会执行多次。classic script 顶层的 const/let 会进入该 world 的全局词法环境并
+// 跨脚本持久：第二次注入就是「Identifier __ABC_TEXT_INNER_LIMIT has already been
+// declared」早期错误 → 页面内的 click / fill 第一次可用、第二次起整个 pageOp
+// reject，直到页面导航。`let __abcActNodeCount` 同理（它还带状态，更不能跨脚本）。
+//
+// 所以整个文件包在 IIFE 里（与 page_net.js 同一套），入口用 defineProperty 挂：
+// 不可枚举（Object.keys(window) / for...in 看不到）+ 可配置（stealth scrub 的
+// delete 能成功；顶层 function 声明在 classic script 里是不可删的全局绑定）。
+// 名字不变：扩展侧读 `window.__abcAct`，daemon 侧是裸标识符。
+;(function () {
 function __abcActVisible(el) {
   if (!el || el.nodeType !== 1) return false;
   const rect = el.getBoundingClientRect();
@@ -323,10 +336,13 @@ function __abcAct(op, target, params) {
       // append 的基准必须是**写入前**的当前值：
       // 旧实现先按默认 clear 清空再读 el.value，于是 `append:true` 实际拿到空串，
       // 行为退化成覆盖，调用方以为追加成功（回包 applied:true），输入框却被清空。
-      const base = String(el.value == null ? '' : el.value);
+      // 这里曾经也叫 `base`，把外层的结果对象遮蔽成字符串，后面
+      // `Object.assign(base, ...)` 只是在 String 包装对象上挂属性，序列化后
+      // `ok/applied` 全丢 —— fill 明明写成功了，调用方却收到「没有返回结论」。
+      const before = String(el.value == null ? '' : el.value);
       if (params.clear !== false) __abcSetNativeValue(el, '');
-      // 语义：append=true 时「base + value」；否则就是 value（clear 与否都不拼接）。
-      const want = params.append ? base + value : value;
+      // 语义：append=true 时「before + value」；否则就是 value（clear 与否都不拼接）。
+      const want = params.append ? before + value : value;
       __abcSetNativeValue(el, want);
       __abcDispatch(el, 'input', {});
       __abcDispatch(el, 'change', {});
@@ -367,3 +383,22 @@ function __abcAct(op, target, params) {
 
   return Object.assign(base, { ok: false, error: 'unsupported op: ' + op });
 }
+
+// 实现标记（与 page_net / page_challenge 同一套）：给将来放开 world 留护栏。
+try {
+  Object.defineProperty(__abcAct, '__abcOwn', {
+    value: true, enumerable: false, configurable: true
+  });
+} catch (_) {}
+
+try {
+  Object.defineProperty(window, '__abcAct', {
+    value: __abcAct,
+    writable: true,
+    enumerable: false,
+    configurable: true
+  });
+} catch (_) {
+  try { window.__abcAct = __abcAct; } catch (_) {}
+}
+})();

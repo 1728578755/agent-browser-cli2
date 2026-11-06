@@ -1,5 +1,6 @@
 mod cli;
 mod config;
+mod hmac;
 mod html;
 mod launch;
 mod open_target;

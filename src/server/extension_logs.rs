@@ -4,7 +4,7 @@ use super::*;
 ///
 /// 只有「调用方没有自己的超时语义」的简单控制命令（cookies / frames /
 /// network 启停）才用它兜底；pageOp 等长命令一律传调用方的 timeout，
-/// 否则 `snapshot --timeout 300` 落到 CSP 回退通道上会被硬编码的 30s 截断（C-13）。
+/// 否则 `snapshot --timeout 300` 落到 CSP 回退通道上会被硬编码的 30s 截断。
 pub(crate) const DEFAULT_EXTENSION_CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// payload 形状摘要：用于「扩展回了非对象」时的报错。
@@ -123,17 +123,12 @@ fn clamp_debug_list_limit(requested: usize) -> (usize, Option<Value>) {
     (applied, note)
 }
 
-/// 捕获缓冲的条目上限：让扩展侧有一个确定的内存上界。
-fn capture_max_entries(env: &str) -> usize {
-    crate::settings::env_usize_clamped(env, 5000, 100, 100_000)
-}
-
 pub(crate) async fn network_start(
     State(state): State<AppState>,
     Json(req): Json<TabRequest>,
 ) -> Json<Value> {
     touch(&state).await;
-    let max_entries = capture_max_entries("ATB_NET_MAX_ENTRIES");
+    let max_entries = crate::settings::net_max_entries();
     let result = async {
         let tab_id = select_tab(
             &state,
@@ -284,7 +279,7 @@ pub(crate) async fn console_start(
     Json(req): Json<TabRequest>,
 ) -> Json<Value> {
     touch(&state).await;
-    let max_entries = capture_max_entries("ATB_CONSOLE_MAX_ENTRIES");
+    let max_entries = crate::settings::console_max_entries();
     let result = async {
         let tab_id = select_tab(
             &state,

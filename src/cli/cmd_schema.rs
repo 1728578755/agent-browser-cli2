@@ -73,8 +73,132 @@ struct CmdSchema {
     name: &'static str,
     description: &'static str,
     args: Value,
-    error_codes: &'static [&'static str],
+    /// `Vec` 而不是静态切片：落扩展的页面命令要在 push 时自动补上 WS 通道类的码。
+    error_codes: Vec<&'static str>,
 }
+
+/// 错误码 → 「下一步怎么办」（`atb schema` 的顶层 `error_code_hints`，纯新增字段）。
+///
+/// 逐命令的 `error_codes` 只回答「这条命令可能发哪些码」；Agent 真正难的是
+/// 「这个码要不要重试 / 改哪里」。`retryable=false` 表示原样重跑没有意义
+/// （要么改参数，要么先清环境）。
+const ERROR_CODE_HINTS: &[(&str, &str, bool)] = &[
+    (
+        "ws_backpressure",
+        "daemon 到扩展的下行队列已满（扩展没跟上），动作没有下发：等 1~2 秒后重试同一条命令",
+        true,
+    ),
+    (
+        "ws_disconnected",
+        "扩展连接已断开（浏览器关闭 / 扩展重载 / 插件端口变了）：先 atb status 确认连接，再重试",
+        true,
+    ),
+    (
+        "task_panicked",
+        // 与 server 侧 `multi.rs::hint_for_error` 同一句：同一个码在两处给不同口径会让人怀疑是不是两回事。
+        "这是 atb 的 bug（任务 panic）：附上 daemon 日志反馈；先用 tabs 复核目标状态，不要立刻整批重试",
+        true,
+    ),
+    (
+        "wait_js_failed",
+        "wait --js 的条件在超时前没有成立（页面通道超时或 CDP 回退也超时）：先确认表达式本身，或加 --timeout / 改用 wait --selector",
+        true,
+    ),
+    (
+        "wait_js_eval_blocked",
+        // 常规路径 daemon 会自动改走 CDP；能看到这个码说明连 CDP 都定位不到会话。
+        "页面 CSP 禁止 eval，且当前没有可定位的会话可改走 CDP：先 atb tabs 确认连接，或改用 wait --selector / snapshot 判断",
+        false,
+    ),
+    (
+        "net_rule_too_large",
+        // 单条 body 超字节上限：本次未下发、规则未写入；原样重试永远不会成功。
+        "单条 mock/route 的 body 超过上限（ATB_NET_RULE_MAX_BYTES，默认 2MiB，1KiB..16MiB）：裁剪 body 或调高该变量；本次规则未写入",
+        false,
+    ),
+    (
+        "too_many_rules",
+        "该 profile 的 net 规则数超过上限：先 atb net routes 看清清单，再用 net unroute / net reset 清理",
+        false,
+    ),
+    (
+        "no_tabs",
+        "浏览器里没有可用网页标签页：先 open 一个页面，或用 tabs 确认扩展已连接",
+        true,
+    ),
+    (
+        "target_not_found",
+        "目标标签页/会话不存在或已关闭：用 tabs --ids 重新选，再传 --tab <tab_id>",
+        false,
+    ),
+    (
+        "outcome_unknown",
+        "POST 已发出但响应丢失，动作可能已执行：不要盲目重试，先复查页面状态或带同一个 --idempotency-key 重放",
+        false,
+    ),
+    (
+        "job_wait_timeout",
+        "job 在 --timeout 内没结束（不代表失败）：用 atb job get <id> 继续查，或加大 --timeout",
+        true,
+    ),
+    (
+        "invalid_api_token",
+        "18767 上有一个不认当前 token 的 daemon：结束占用该端口的进程后重启（atb restart --force）",
+        false,
+    ),
+    (
+        "daemon_not_running",
+        "daemon 没在跑：执行任意页面命令会自动拉起，或 atb restart",
+        true,
+    ),
+    (
+        "extension_not_connected",
+        "扩展没连上：确认浏览器已开、扩展已启用，且插件端口与 CLI 配置一致",
+        true,
+    ),
+    (
+        "challenge_timeout",
+        "挑战页在 --timeout 内没有放行：加 --timeout，或人工处理后用 challenge status 复查",
+        true,
+    ),
+    (
+        "file_not_found",
+        "本地文件不存在：路径按当前 shell 的 cwd 解析，给绝对路径最稳",
+        false,
+    ),
+    (
+        "output_exists",
+        "输出文件已存在：换一个 --out，或设 ATB_IO_OVERWRITE=backup/force",
+        false,
+    ),
+];
+
+/// 会把操作下发到扩展页面的命令：都可能收到 WS 下行通道的两类失败
+/// （背压 / 断连）。集中在这里补，避免每加一条页面命令都漏。
+const PAGE_OP_COMMANDS: &[&str] = &[
+    "click",
+    "mouse-click",
+    "fill",
+    "send-keys",
+    "screenshot",
+    "save-pdf",
+    "scan",
+    "exec",
+    "cookies",
+    "upload",
+    "snapshot",
+    "read",
+    "find",
+    "inject",
+    "frames",
+    "wait",
+    "hover",
+    "select",
+    "check",
+    "scroll",
+    "back",
+    "reload",
+];
 
 /// 常用错误码集中在此，保持与 daemon / CLI 预检实际返回的一致口径
 /// （对照 `exit.rs::is_usage_error_code` 与 daemon 各端点的 error_code 字段）。
@@ -88,11 +212,19 @@ fn schema_entries() -> Vec<CmdSchema> {
         if args.as_object().is_none() {
             args = json!({});
         }
+        let mut codes = error_codes.to_vec();
+        if PAGE_OP_COMMANDS.contains(&name) {
+            for code in ["ws_backpressure", "ws_disconnected"] {
+                if !codes.contains(&code) {
+                    codes.push(code);
+                }
+            }
+        }
         list.push(CmdSchema {
             name,
             description,
             args,
-            error_codes,
+            error_codes: codes,
         });
     };
 
@@ -186,7 +318,7 @@ fn schema_entries() -> Vec<CmdSchema> {
                 "--include-hidden": flag(),
                 "--budget-ms": opt("number"),
                 "--max-nodes": opt("number"),
-                // X-15：daemon 侧 `ReadRequest.inner_text_limit`（DOM 节点数阈值，非字符数）。
+                // daemon 侧 `ReadRequest.inner_text_limit`（DOM 节点数阈值，非字符数）。
                 // 不传或传 0 → 页面用默认 30000；正整数由 daemon clamp 到 1000..=500000。
                 // 字符量看 --max-chars（daemon clamp 1000..=400000）；本项越小越偏向
                 // 近似可见文本（visible-approx：更快但可能少内容），是精度/速度旋钮。
@@ -225,7 +357,7 @@ fn schema_entries() -> Vec<CmdSchema> {
                 "--js": flag(),
                 "--interactive-only": flag(),
                 "--max-nodes": with_default("number", json!(0)),
-                // X-15：保留无障碍树里的 generic 容器节点（默认跳过）。
+                // 保留无障碍树里的 generic 容器节点（默认跳过）。
                 "--no-skip-generic": flag(),
             }),
             page_args(30.0),
@@ -254,7 +386,9 @@ fn schema_entries() -> Vec<CmdSchema> {
                 "<script>": with_default("string", json!("")),
                 "--file": opt("path"),
                 "--max-bytes": opt("number"),
-                "--world": with_default("string", json!("main")),
+                // clap 侧只接受 main/isolated（大小写不敏感），表里必须
+                // 同步 enum，否则 `atb schema` 会告诉 Agent「任意字符串都行」。
+                "--world": with_enum("string", "main", &["main", "isolated"]),
                 "--frame": opt("int"),
                 "--all-frames": flag(),
             }),
@@ -271,6 +405,8 @@ fn schema_entries() -> Vec<CmdSchema> {
             "unsupported_combination",
             // 组合 wait 失败与受限页面必须能被调用方按码归类。
             "wait_js_failed",
+            // CONTRACT §3.2：页面禁 eval 时 daemon 回退 CDP，走到这里说明回退也失败。
+            "wait_js_eval_blocked",
             "page_protected",
         ],
     );
@@ -368,7 +504,8 @@ fn schema_entries() -> Vec<CmdSchema> {
                 "--persist": opt("string"),
                 "--remove": opt("string"),
                 "--list": flag(),
-                "--world": with_default("string", json!("main")),
+                // 同 exec：inject 也下发到扩展的 world，自由字符串会静默落成 MAIN。
+                "--world": with_enum("string", "main", &["main", "isolated"]),
                 "--match": variadic("string", false),
                 "--frame": opt("int"),
                 "--all-frames": flag(),
@@ -425,7 +562,16 @@ fn schema_entries() -> Vec<CmdSchema> {
             }),
             page_args(10.0),
         ),
-        &["no_tabs", "target_not_found", "wait_timeout"],
+        &[
+            "no_tabs",
+            "target_not_found",
+            "wait_timeout",
+            // wait --js 条件未成立（页面通道轮询到超时 / CDP 回退也超时）：netpage 已把
+            // 内层码上提到顶层，调用方可以直接按码分支，不用解析中文。
+            "wait_js_failed",
+            // 只有「CSP 禁 eval 且没有可定位会话可回退 CDP」时才可见（契约 §3.2）。
+            "wait_js_eval_blocked",
+        ],
     );
     push(
         "challenge",
@@ -461,6 +607,8 @@ fn schema_entries() -> Vec<CmdSchema> {
             // 探测不可用与整条点击链超时。
             "challenge_probe_failed",
             "challenge_click_timeout",
+            // CLI 侧把「超时未达成」改写成这个码（wait/solve 的终态判据）。
+            "challenge_timeout",
         ],
     );
     push(
@@ -540,7 +688,8 @@ fn schema_entries() -> Vec<CmdSchema> {
             "--all-agents": flag(),
             "--dry-run": flag(),
         }),
-        &[],
+        // 清理任务 panic 不再算 timeout，回包必须有稳定码与 hint。
+        &["task_panicked"],
     );
     push(
         "back",
@@ -595,7 +744,7 @@ fn schema_entries() -> Vec<CmdSchema> {
     );
     push(
         "save-pdf",
-        // `--max-height` 现在在常规 CDP 打印路径也生效（超出截断并回
+        // + `--max-height` 现在在常规 CDP 打印路径也生效（超出截断并回
         // truncated:true），不再只是图片型回落时的旋钮。
         "把当前页面另存为 PDF（--max-height 限制输出高度，CDP 主路径与图片型回落均生效）",
         merge_args(
@@ -692,7 +841,7 @@ fn schema_entries() -> Vec<CmdSchema> {
                 "unroute": { "<pattern>": required("string") },
                 "reset": {}
             },
-            // X-15：只对 net fetch 生效的两个页面侧开关（其余子命令忽略）。
+            // 只对 net fetch 生效的两个页面侧开关（其余子命令忽略）。
             "--credentials": with_enum("string", "include", &["include", "omit", "same-origin"]),
             "--no-parse-json": flag(),
             // 由反射测试补齐：net 是**扁平表项 + 子命令**，下面这些 flag 分散在
@@ -730,7 +879,15 @@ fn schema_entries() -> Vec<CmdSchema> {
             "--frame": opt("int"),
             "--timeout": with_default("number", json!(30.0)),
         }),
-        &["no_tabs", "target_not_found", "invalid_argument"],
+        &[
+            "no_tabs",
+            "target_not_found",
+            "invalid_argument",
+            // 每 profile 规则条数上限（page 引擎与 CDP 引擎同源校验）。
+            "too_many_rules",
+            // 单条 body 超字节上限（与条数满同族，但语义不同：改 payload 而不是清规则）。
+            "net_rule_too_large",
+        ],
     );
     push(
         "downloads",
@@ -804,7 +961,13 @@ fn schema_entries() -> Vec<CmdSchema> {
             "--limit": opt("number"),
             "--interval": opt("number"),
         }),
-        &["job_not_found", "wait_timeout", "invalid_argument"],
+        // 后台任务 panic 是 bug，不是超时；job get/wait 会看到该状态。
+        &[
+            "job_not_found",
+            "wait_timeout",
+            "invalid_argument",
+            "task_panicked",
+        ],
     );
     push(
         "run",
@@ -860,7 +1023,22 @@ fn schema_entries() -> Vec<CmdSchema> {
     );
 
     // ---- daemon / 诊断 ----
-    push("status", "健康状态（退出码即结论）", json!({}), &[]);
+    push(
+        "status",
+        "健康状态（退出码即结论）",
+        json!({}),
+        // summary 直接当 error_code：这里列的是「一眼能分支」的那几种。
+        &[
+            "daemon_not_running",
+            "daemon_token_mismatch",
+            "health_timeout",
+            "health_failed",
+            "extension_port_bind_failed",
+            "port_mismatch",
+            "extension_not_connected",
+            "no_active_tabs",
+        ],
+    );
     push(
         "logs",
         "查看 daemon 日志尾部",
@@ -878,7 +1056,13 @@ fn schema_entries() -> Vec<CmdSchema> {
         "capabilities",
         "一次探测 daemon/扩展版本与能力门禁",
         json!({}),
-        &["daemon_not_running", "daemon_token_mismatch"],
+        &[
+            "daemon_not_running",
+            "daemon_token_mismatch",
+            // 扩展版本低于 CLI 期望 / 扩展没连上：两者结论不同，码也要分开。
+            "extension_outdated",
+            "extension_not_connected",
+        ],
     );
     push(
         "doctor",
@@ -887,7 +1071,7 @@ fn schema_entries() -> Vec<CmdSchema> {
             "--fix": flag(),
             "--force": flag(),
         }),
-        &[],
+        &["doctor_checks_failed"],
     );
     push(
         "install-skill",
@@ -974,10 +1158,19 @@ pub(crate) fn cmd_schema(args: SchemaArgs, is_async: bool) -> Result<()> {
         );
     }
     let count = commands.len();
+    // 顶层错误码目录（纯新增字段）：逐命令的 error_codes 只有码名，这里是「怎么办」。
+    let mut hints = serde_json::Map::new();
+    for &(code, hint, retryable) in ERROR_CODE_HINTS {
+        hints.insert(
+            code.to_string(),
+            json!({ "hint": hint, "retryable": retryable }),
+        );
+    }
     print_json(json!({
         "ok": true,
         "command_count": count,
         "commands": commands,
+        "error_code_hints": hints,
     }));
     Ok(())
 }
@@ -1222,6 +1415,7 @@ mod schema_reflection_tests {
         ("reload", "invalid_timeout"),
         ("capabilities", "daemon_not_running"),
         ("tabs", "no_tabs"),
+        ("cleanup", "task_panicked"),
         ("job", "job_not_found"),
         ("trust-extension", "invalid_argument"),
     ];
@@ -1423,5 +1617,117 @@ mod schema_reflection_tests {
             problems.len(),
             problems.join("\n")
         );
+    }
+
+    /// 本轮新增的错误码必须「某条命令会发」+「顶层目录里有可执行的下一步」。
+    ///
+    /// 只加码不加 hint，Agent 拿到 `ok:false` 仍然只能猜；只加 hint 不加码，
+    /// 逐命令的清单就查不到出处。
+    #[test]
+    fn error_code_hints_cover_new_codes() {
+        let entries = schema_entries();
+        let catalogue: BTreeMap<&str, (&str, bool)> = ERROR_CODE_HINTS
+            .iter()
+            .map(|&(code, hint, retryable)| (code, (hint, retryable)))
+            .collect();
+
+        // (code, retryable, 必须声明它的命令)
+        let expected: &[(&str, bool, &[&str])] = &[
+            (
+                "ws_backpressure",
+                true,
+                &["click", "exec", "wait", "snapshot"],
+            ),
+            ("ws_disconnected", true, &["click", "read", "find"]),
+            ("task_panicked", true, &["cleanup", "job"]),
+            ("wait_js_failed", true, &["exec", "wait"]),
+            ("wait_js_eval_blocked", false, &["exec", "wait"]),
+            ("too_many_rules", false, &["net"]),
+            ("net_rule_too_large", false, &["net"]),
+        ];
+        for &(code, retryable, commands) in expected {
+            let (hint, flag) = catalogue
+                .get(code)
+                .unwrap_or_else(|| panic!("error_code_hints 缺少 {code}"));
+            assert_eq!(*flag, retryable, "{code} 的 retryable 口径不对");
+            assert!(!hint.trim().is_empty(), "{code} 的 hint 不能为空");
+            for command in commands {
+                let entry = entries
+                    .iter()
+                    .find(|entry| entry.name == *command)
+                    .unwrap_or_else(|| panic!("schema 缺少命令 {command}"));
+                assert!(
+                    entry.error_codes.contains(&code),
+                    "`{command}` 的 error_codes 缺少 {code}"
+                );
+            }
+        }
+
+        // 页面命令一律带上 WS 下行通道的两类失败码（push 里自动补全，新增命令不会漏）。
+        for name in [
+            "click",
+            "mouse-click",
+            "fill",
+            "send-keys",
+            "screenshot",
+            "save-pdf",
+            "scan",
+            "exec",
+            "cookies",
+            "upload",
+            "snapshot",
+            "read",
+            "find",
+            "inject",
+            "frames",
+            "wait",
+            "hover",
+            "select",
+            "check",
+            "scroll",
+            "back",
+            "reload",
+        ] {
+            let entry = entries
+                .iter()
+                .find(|entry| entry.name == name)
+                .unwrap_or_else(|| panic!("schema 缺少命令 {name}"));
+            for code in ["ws_backpressure", "ws_disconnected"] {
+                assert!(entry.error_codes.contains(&code), "`{name}` 缺少 {code}");
+            }
+        }
+
+        // 目录自洽：没有重复码、每条 hint 都非空。
+        let mut seen = BTreeMap::new();
+        for &(code, hint, _) in ERROR_CODE_HINTS {
+            assert!(!hint.trim().is_empty(), "{code} 的 hint 不能为空");
+            assert!(
+                seen.insert(code, ()).is_none(),
+                "error_code_hints 里 {code} 重复"
+            );
+        }
+    }
+
+    /// `--world` 只接受 main / isolated（大小写不敏感），非法值解析期 exit 2。
+    ///
+    /// exec 与 inject 都走扩展的 world 选择：自由字符串会被静默落成 MAIN，
+    /// 用户以为切到了 isolated（不受页面 CSP 影响）其实没有。
+    #[test]
+    fn world_flag_rejects_unknown_values() {
+        use clap::Parser;
+        for command in ["exec", "inject"] {
+            for bad in ["foo", "isolate", "MAIN ", "main,isolated"] {
+                assert!(
+                    Cli::try_parse_from(["atb", command, "return 1", "--world", bad]).is_err(),
+                    "`{command} --world {bad}` 应该被拒绝"
+                );
+            }
+            for good in ["main", "isolated", "ISOLATED", "Main"] {
+                assert!(
+                    Cli::try_parse_from(["atb", command, "return 1", "--world", good]).is_ok(),
+                    "`{command} --world {good}` 应该被接受"
+                );
+            }
+        }
     }
 }

@@ -91,30 +91,89 @@ pub(crate) fn fold_tree_inner(nodes: Vec<Value>, budget: &mut usize, depth: usiz
 ///
 /// 预览取的是**值本身**的内容，而不是序列化后的文本：旧实现直接截序列化文本的前 N 个
 /// 字符，开头那个 `"` 与内部的 `\"` 转义都算进预算，`max_chars=1` 时 preview 就是 `"`，
-/// 等于什么都没有（P3）。
+/// 等于什么都没有。
 pub(crate) fn truncate_json_value_chars(result: &mut Value, max_chars: usize) -> bool {
-    let Some(slot) = result.get_mut("js_return") else {
-        return false;
-    };
-    // 字符串取原值（不含外层引号），其它类型取紧凑 JSON 文本。
-    let text = match &*slot {
-        Value::String(value) => value.clone(),
-        other => other.to_string(),
-    };
-    // UTF-8 里字节数恒 >= 字符数：字节数都没超就必然没超，先做 O(1) 快速放行，
-    // 避免为了判断一次截断而遍历整个字符串两遍。
-    if text.len() <= max_chars {
+    match result.get_mut("js_return") {
+        Some(slot) => truncate_json_slot_chars(slot, max_chars),
+        None => false,
+    }
+}
+
+/// 有上限的「字符计数器 + 前缀收集器」。
+///
+/// 序列化直接写进这个 sink：边写边数字符、只在预算内保留前缀，峰值内存是
+/// **预览大小**而不是回包大小。旧实现先 `to_string()` 一份完整文本再判长，
+/// 峰值 ≈ 2×回包，一个 100MB 的 `js_return` 会瞬间吃掉 200MB。
+struct CharBudgetWriter {
+    preview: String,
+    chars: usize,
+    max_chars: usize,
+}
+
+impl CharBudgetWriter {
+    fn new(max_chars: usize) -> Self {
+        Self {
+            preview: String::new(),
+            chars: 0,
+            max_chars,
+        }
+    }
+}
+
+impl std::io::Write for CharBudgetWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // serde_json 的所有写入都是完整 片段（转义按字符边界切分），
+        // 直接按 chars 迭代即可；真遇到非法片段就按字节退化成保守计数。
+        match std::str::from_utf8(buf) {
+            Ok(text) => {
+                for ch in text.chars() {
+                    if self.chars < self.max_chars {
+                        self.preview.push(ch);
+                    }
+                    self.chars += 1;
+                }
+            }
+            Err(_) => self.chars += buf.len(),
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// 对任意 JSON 槽位施加字符预算（`js_return` 本身、`js_return.wait.value` 等）。
+pub(crate) fn truncate_json_slot_chars(slot: &mut Value, max_chars: usize) -> bool {
+    if max_chars == 0 {
         return false;
     }
-    let total = text.chars().count();
-    if total <= max_chars {
+    // 字符串不需要序列化：字节数恒 >= 字符数，先 O(1) 放行。
+    if let Value::String(text) = slot {
+        if text.len() <= max_chars {
+            return false;
+        }
+        let total = text.chars().count();
+        if total <= max_chars {
+            return false;
+        }
+        let preview: String = text.chars().take(max_chars).collect();
+        *slot = json!({
+            "__truncated": true,
+            "total_chars": total,
+            "preview": preview,
+        });
+        return true;
+    }
+    let mut writer = CharBudgetWriter::new(max_chars);
+    let complete = serde_json::to_writer(&mut writer, slot).is_ok();
+    if complete && writer.chars <= max_chars {
         return false;
     }
-    let preview: String = text.chars().take(max_chars).collect();
     *slot = json!({
         "__truncated": true,
-        "total_chars": total,
-        "preview": preview,
+        "total_chars": writer.chars,
+        "preview": writer.preview,
     });
     true
 }
@@ -123,7 +182,7 @@ pub(crate) fn truncate_json_value_chars(result: &mut Value, max_chars: usize) ->
 ///
 /// snapshot 的 `returned` 必须和「实际交给调用方的 @e 数量」同口径：
 /// CDP 路径以前统计的是快照缓存里的 refs（截断前），JS 路径统计的是树节点数，
-/// 两条路在同一份数据上会给出不同的数（P3）。
+/// 两条路在同一份数据上会给出不同的数。
 pub(crate) fn count_tree_refs(nodes: &[Value]) -> usize {
     count_tree_refs_at(nodes, 0)
 }
@@ -161,7 +220,7 @@ pub(crate) fn page_payload(mut result: Value, key: &str) -> Value {
 mod regression_tests {
     use super::*;
 
-    /// P3：preview 截的是「值本身」，不能再把外层引号与转义算进预算。
+    /// preview 截的是「值本身」，不能再把外层引号与转义算进预算。
     #[test]
     fn truncation_preview_keeps_real_text() {
         let mut value = json!({ "js_return": "hello" });
@@ -178,5 +237,45 @@ mod regression_tests {
         let mut chinese = json!({ "js_return": "汉字内容" });
         assert!(truncate_json_value_chars(&mut chinese, 2));
         assert_eq!(chinese["js_return"]["preview"], json!("汉字"));
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    /// 非字符串值也按字符预算截断，且 `preview` 是紧凑 JSON 文本的前 N 个字符。
+    #[test]
+    fn truncates_object_without_full_serialization() {
+        let mut value = json!({ "js_return": { "items": [1, 2, 3], "note": "abcdef" } });
+        // 紧凑序列化是 `{"items":[1,2,3],"note":"abcdef"}`，共 33 个字符。
+        assert!(truncate_json_value_chars(&mut value, 10));
+        assert_eq!(value["js_return"]["total_chars"], json!(33));
+        assert_eq!(value["js_return"]["preview"], json!("{\"items\":["));
+    }
+
+    /// 预算内原样返回；`0` 明确表示不限（与 `--max-bytes 0` 同义）。
+    #[test]
+    fn leaves_small_values_and_zero_budget_alone() {
+        let mut value = json!({ "js_return": [1, 2, 3] });
+        assert!(!truncate_json_value_chars(&mut value, 64));
+        assert_eq!(value["js_return"], json!([1, 2, 3]));
+
+        let mut huge = json!({ "js_return": "x".repeat(10_000) });
+        assert!(!truncate_json_value_chars(&mut huge, 0));
+        assert_eq!(huge["js_return"].as_str().map(str::len), Some(10_000));
+    }
+
+    /// `js_return.wait.value` 这类嵌套槽位用同一个预算（exec --wait-js 的合并值）。
+    #[test]
+    fn truncates_nested_wait_value_slot() {
+        let mut value = json!({ "js_return": { "result": 1, "wait": { "value": "abcdef" } } });
+        let slot = value
+            .get_mut("js_return")
+            .and_then(|item| item.get_mut("wait"))
+            .and_then(|item| item.get_mut("value"))
+            .expect("wait.value 存在");
+        assert!(truncate_json_slot_chars(slot, 3));
+        assert_eq!(value["js_return"]["wait"]["value"]["preview"], json!("abc"));
     }
 }

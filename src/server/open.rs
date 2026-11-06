@@ -1,30 +1,8 @@
 use super::*;
 
-/// `/open` 请求体的扩展包装：`OpenRequest` 是共享 DTO（dto.rs），本轮新增
-/// `wait_for` / `warm` 两个字段时不动共享结构，用 serde(flatten) 包一层读取；
-/// 旧字段全部原样透传，旧调用方（不传新字段）解析行为与旧版完全一致。
-#[derive(Debug, Deserialize)]
-pub(crate) struct OpenRequestExt {
-    #[serde(flatten)]
-    pub(crate) inner: OpenRequest,
-    /// 打开后继续等待的页面条件：dom-quiet | selector:<CSS> | text:<文本>。
-    /// `networkidle` 仍接受，但实现是**近似**的「resource 计数 + DOM 稳定」采样，
-    /// 不是 CDP 在途请求计数。
-    #[serde(default)]
-    pub(crate) wait_for: Option<String>,
-    /// 打开前先 ping 一次扩展，唤醒 service worker。
-    #[serde(default)]
-    pub(crate) warm: bool,
-    /// `--wait-for` 的等待预算（秒）。CLI 已按它扩了 HTTP 预算，
-    /// 服务端必须用**同一个**字段，否则「服务端还在等、CLI 先断开」的旧问题依旧。
-    /// 缺省时回落到 `readiness_timeout`（旧口径）。
-    #[serde(default)]
-    pub(crate) wait_for_timeout: Option<f64>,
-}
-
 pub(crate) async fn open_tab(
     State(state): State<AppState>,
-    Json(req): Json<OpenRequestExt>,
+    Json(req): Json<OpenRequest>,
 ) -> Json<Value> {
     touch(&state).await;
     let wait_for = req.wait_for.clone();
@@ -34,7 +12,6 @@ pub(crate) async fn open_tab(
     if req.warm {
         warm_up_extension(&state).await;
     }
-    let req = req.inner;
     let extra_targets = req.targets.clone();
     let started = Instant::now();
     if extra_targets.len() > 1 {
@@ -134,7 +111,7 @@ async fn warm_up_extension(state: &AppState) {
 /// 否则下一条命令找不到新标签；批量打开时交给 `open_many` 收尾统一拉一次，
 /// 否则 N 个并发打开会各自排队刷新，把并发收益吃掉。
 ///
-/// `wait_for`： `--wait-for` 条件（dom-quiet / selector: / text:；
+/// `wait_for`： 的 `--wait-for` 条件（dom-quiet / selector: / text:；
 /// `networkidle` 作为 dom-quiet 的兼容别名）。
 /// 打开并注册会话成功后继续等条件满足；条件未满足时该目标 ok:false，
 /// error_code 取真实病因（wait_for_timeout / invalid_wait_for / extension_unavailable），
@@ -214,7 +191,7 @@ async fn open_single_inner(
             Ok(value) => value,
             Err(err) => {
                 // 查询失败 ≠ 扩展太旧。超时/断连报成 `extension_upgrade_required`
-                // 会让用户去重装扩展，而真正要做的是刷新标签或等扩展重连（P3 状态机组）。
+                // 会让用户去重装扩展，而真正要做的是刷新标签或等扩展重连（状态机组）。
                 let message = err.to_string();
                 let transient = [
                     "超时",
@@ -418,7 +395,7 @@ async fn open_single_inner(
                     driver.default_session_key = Some(key);
                     driver.clear_preferred_default_session();
                 } else {
-                    // A2：记「待生效目标」必须同时写时间戳（6h TTL 的起点）。
+                    // 记「待生效目标」必须同时写时间戳（6h TTL 的起点）。
                     driver.set_preferred_default_session(key);
                 }
             }
@@ -820,7 +797,7 @@ async fn run_dom_quiet_once(state: &AppState, session_key: &str, budget: Duratio
 /// 与「CLI 起 N 个线程各发一次请求」相比，这里只占一个 HTTP 往返，
 /// 也避免 N 个请求各自去争同一把会话锁。
 ///
-/// `wait_for`： `--wait-for` 条件，逐个目标在 `open_single` 里等待；
+/// `wait_for`： 的 `--wait-for` 条件，逐个目标在 `open_single` 里等待；
 /// 某个目标等不到只把该目标标成 ok:false + wait_for_timeout，其余目标照常。
 pub(crate) async fn open_many(
     state: &AppState,
@@ -842,7 +819,7 @@ pub(crate) async fn open_many(
         let permits = semaphore.clone();
         // task-local 不随 `spawn` 继承：不套 `with_agent` 的话，这批并发打开的标签
         // 会全部记到 `"default"` 名下——默认目标写到别人的 agent 上，`cleanup` 也
-        // 收不到自己开的页面（X-13）。`multi.rs` / `run.rs` 都是这么包的。
+        // 收不到自己开的页面。`multi.rs` / `run.rs` 都是这么包的。
         let agent = current_agent();
         let wait_for = wait_for.clone();
         set.spawn(with_agent(agent, async move {

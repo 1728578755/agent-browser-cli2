@@ -15,7 +15,7 @@ use clap::{Args, Parser, Subcommand};
 ///
 /// JS 缺省时用内置脚本取 `{title, url, text(正文前 9000 字)}`，
 /// 9000 字的上限是为了单行结果不撑爆 Agent 上下文。
-/// `String.prototype.slice` 按 UTF-16 code unit 截断，9000 处正好落在代理对
+/// `String.prototype.slice` 按 code unit 截断，9000 处正好落在代理对
 /// 中间时会切出半个 emoji（JSON 里变成替换字符）。用扩展运算符按 code point 切。
 const DEFAULT_SCRAPE_SCRIPT: &str =
     "return {title:document.title,url:location.href,text:[...document.body.innerText].slice(0,9000).join('')}";
@@ -512,7 +512,10 @@ pub(crate) fn cmd_scrape(args: ScrapeArgs, is_async: bool) -> Result<()> {
                 "targets": targets,
                 "active": false,
                 "keep_alive": true,
-                "timeout": args.timeout,
+                // 严格化后字段名必须与 OpenRequest 对齐：以前写 `timeout`，
+                // daemon 静默忽略（页面就绪预算一直用默认值）；现在未知字段会被
+                // 422 拒绝，必须用 `readiness_timeout`。
+                "readiness_timeout": args.timeout,
             });
             if let Some(group) = &args.group_title {
                 payload["group_title"] = json!(group);

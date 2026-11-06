@@ -10,7 +10,7 @@ use clap::{Args, Parser, Subcommand};
 /// 默认不动已在运行的窗口，只有 `--restart` 才温和关闭。
 pub(crate) fn run_launch(args: LaunchArgs) -> Result<()> {
     // 相对 `--user-data-dir` 必须在这里绝对化：daemon 由 CLI 以 `current_dir(home)` 拉起，
-    // 原样下发会被解析成 home 下的目录（P3 启动与路径）。
+    // 原样下发会被解析成 home 下的目录（启动与路径）。
     let user_data_dir = args
         .user_data_dir
         .as_ref()
@@ -159,6 +159,10 @@ pub(crate) fn run_navigation_command(
     };
     if let Err(problem) = finalize_page_payload("exec", &mut payload) {
         return usage_error(&problem);
+    }
+    // dry-run + async 必须在 ensure_server/HTTP 之前短路。
+    if async_dry_run_plan("exec", &payload, is_async)? {
+        return Ok(());
     }
     if is_async {
         // 需要 daemon 解析的多目标（all/@N/url:/title:/group:）在异步路径下拿不到
@@ -389,10 +393,11 @@ pub(crate) fn cmd_open(args: OpenArgs, is_async: bool) -> Result<()> {
         "readiness_timeout": args.timeout,
         "challenge": args.challenge,
         "challenge_timeout": args.challenge_timeout,
-        // 新 flag：daemon 侧按 OpenRequestExt（flatten 包装）读取，旧字段不动，
+        // wait_for / wait_for_timeout 已并入 OpenRequest（原先的 flatten wrapper
+        // 与 deny_unknown_fields 互斥， 收口时已合并）；旧字段不动，
         // 旧版 daemon 收到多余字段会忽略，天然向后兼容。
         "wait_for": args.wait_for,
-        // 等待预算显式下发，默认与 readiness_timeout 相。
+        // 等待预算显式下发，默认与 readiness_timeout 相同。
         "wait_for_timeout": wait_for_timeout,
         "warm": args.warm,
     });
@@ -675,6 +680,69 @@ pub(crate) fn cmd_close(args: CloseArgs, is_async: bool) -> Result<()> {
     Ok(())
 }
 
+/// 「关掉当前 daemon 并确认端口已释放」的结构化失败。
+///
+/// 与 `restart` 共用，避免「关没关掉」在两个命令里各有一套判定。`code` 会原样进
+/// `error_code`：`daemon_token_mismatch` 指向「换 token / 强杀」，`shutdown_failed`
+/// 指向「端口没释放」——两者的救援动作完全不同，不能合并成一句。
+pub(crate) struct ShutdownFailure {
+    pub(crate) code: &'static str,
+    pub(crate) message: String,
+    pub(crate) hint: String,
+}
+
+impl ShutdownFailure {
+    pub(crate) fn to_json(&self) -> Value {
+        json!({
+            "ok": false,
+            "error_code": self.code,
+            "error": self.message,
+            "hint": self.hint,
+        })
+    }
+}
+
+/// 请求 daemon 退出并**确认**它真的停了（API 端口 + 插件端口都释放）。
+///
+/// 以前两处调用都是 `let _ = request("/shutdown"); wait_server_stopped(...)`：
+/// 401 被吞、`false` 返回值被丢，于是「没停下来」被当成成功。这里把两种
+/// 失败分开：token 不匹配给 `daemon_token_mismatch`（可 `restart --force` 自救），
+/// 其余给 `shutdown_failed`。
+fn stop_daemon_confirmed() -> std::result::Result<(), ShutdownFailure> {
+    let reply = request("POST", "/shutdown", Some(json!({})), 3.0);
+    if wait_server_stopped(Duration::from_secs(5)) {
+        return Ok(());
+    }
+    let token_rejected = matches!(
+        reply.as_ref().err().and_then(http_failure_code),
+        Some("invalid_api_token")
+    );
+    if token_rejected || daemon_token_mismatch() {
+        return Err(ShutdownFailure {
+            code: "daemon_token_mismatch",
+            message: format!(
+                "{PORT} 上的 daemon 不认当前 API token，/shutdown 被拒绝，它仍在运行（新配置尚未生效）"
+            ),
+            hint: format!(
+                "结束占用 {PORT} 的进程后重试：Windows `netstat -ano | findstr :{PORT}` 再 `taskkill /PID <pid> /F`；\
+                 或直接 `atb restart --force`（自动核对进程身份后强杀）"
+            ),
+        });
+    }
+    let detail = match &reply {
+        Ok(_) => "daemon 已回包，但端口仍在监听".to_string(),
+        Err(err) => err.to_string(),
+    };
+    Err(ShutdownFailure {
+        code: "shutdown_failed",
+        message: format!("关闭 daemon 未确认完成：{detail}"),
+        hint: format!(
+            "稍后重试；若 {PORT} 被别的程序占着，先结束占用进程（`netstat -ano | findstr :{PORT}`），\
+             或用 `atb restart --force` 让本工具核对身份后处理"
+        ),
+    })
+}
+
 pub(crate) fn cmd_set_extension_port(args: SetExtensionPortArgs, is_async: bool) -> Result<()> {
     reject_async_if_set("set-extension-port", is_async)?;
     // 0 和 18767（API 端口）都不是合法插件端口：以前直接下发 config::set_extension_port，
@@ -706,17 +774,34 @@ pub(crate) fn cmd_set_extension_port(args: SetExtensionPortArgs, is_async: bool)
     }
     let was_running = is_server_alive();
     let config = config::set_extension_port(args.port)?;
-    let mut restarted = false;
-    if was_running {
-        let _ = request("POST", "/shutdown", Some(json!({})), 3.0);
-        wait_server_stopped(Duration::from_secs(5));
-        ensure_server()?;
-        restarted = true;
+    if !was_running {
+        // 没在跑就没有「重启」可言：新端口在下次 daemon 启动时生效。
+        print_json(json!({
+            "ok": true,
+            "extension_port": config.extension_port,
+            "restarted": false,
+            "note": "daemon 未运行，新端口在下次启动时生效",
+        }));
+        return Ok(());
     }
+    // 关闭必须**确认**完成。以前 `/shutdown` 的 401 被 `let _ =` 吞掉、
+    // `wait_server_stopped` 的 false 被丢弃，于是输出 `restarted:true`，而实际生效的
+    // 还是旧 daemon 的旧端口。
+    if let Err(failure) = stop_daemon_confirmed() {
+        let mut value = failure.to_json();
+        // 配置已经写盘（`config::set_extension_port` 在关闭之前完成）：说清楚
+        // 「文件改了、进程没换」，调用方才知道下一步该动进程而不是再改一次配置。
+        value["extension_port"] = json!(config.extension_port);
+        value["config_written"] = json!(true);
+        value["restarted"] = json!(false);
+        print_json(value);
+        return Ok(());
+    }
+    ensure_server()?;
     print_json(json!({
         "ok": true,
         "extension_port": config.extension_port,
-        "restarted": restarted
+        "restarted": true
     }));
     Ok(())
 }
@@ -895,7 +980,7 @@ pub(crate) fn process_identity(pid: u32) -> Option<String> {
 /// strict（默认）：进程名必须等于当前可执行文件名，且参数含独立词 `daemon`；
 /// loose：沿用旧的「路径含 exe / 同时含 atb+daemon」宽松判据（自动化救援用）。
 pub(crate) fn force_assume_atb() -> String {
-    crate::settings::env_enum("ATB_FORCE_ASSUME_ATB", "strict", &["strict", "loose"])
+    crate::settings::force_assume_atb()
 }
 
 /// 从 `process_identity` 的输出里拆出 (exe, cmdline)。
@@ -1092,7 +1177,7 @@ fn finish_force_kill(pids: Vec<u32>, source: &str) -> Result<Vec<KillOutcome>> {
 /// `--force` 路径：定位占用 API 端口（18767）且处于 LISTENING 状态的 PID 并强杀。
 ///
 /// 旧实现只会在报错里让人手工执行 netstat/taskkill，而报错的对象往往是自动化流程
-/// 本身，等于自锁（P0 实测反馈）；这里替调用方执行同一条命令。强杀是破坏性动作，
+/// 本身，等于自锁（实测反馈）；这里替调用方执行同一条命令。强杀是破坏性动作，
 /// 所以只认 LISTENING 行（不碰临时连接），并过滤掉自己的 PID 防误杀。
 #[cfg(windows)]
 fn kill_api_port_listener() -> Result<Vec<KillOutcome>> {
@@ -1189,7 +1274,7 @@ pub(crate) fn cmd_restart(args: RestartArgs, is_async: bool) -> Result<()> {
         }));
         return Ok(());
     }
-    // 旧实现（自锁，P0 实测反馈）：daemon 活着但 token 不匹配时，/shutdown 被 401
+    // 旧实现（自锁， 实测反馈）：daemon 活着但 token 不匹配时，/shutdown 被 401
     // 拒绝并被 `let _` 吞掉，旧 daemon 继续占着 18767；随后带 token 的 /health 也以
     // 「结束占用 18767 的进程后重试」失败——可 restart 本身就是用来解这个局的，
     // 让调用方「重试 restart」是死循环。现在先显式探测这种状态：
@@ -1213,8 +1298,14 @@ pub(crate) fn cmd_restart(args: RestartArgs, is_async: bool) -> Result<()> {
             }
         }
     }
-    let _ = request("POST", "/shutdown", Some(json!({})), 3.0);
-    wait_server_stopped(Duration::from_secs(5));
+    // 关闭确认与 set-extension-port 共用同一原语。以前这里同样是
+    // `let _ = /shutdown` + 丢弃 `wait_server_stopped` 的结果：端口没释放时
+    // `ensure_server()` 会撞上「端口被占用但对 /ping 无响应」，报错指向环境而不是
+    // 「这次关闭没成功」。
+    if let Err(failure) = stop_daemon_confirmed() {
+        print_json(failure.to_json());
+        return Ok(());
+    }
     ensure_server()?;
     let mut value = request("GET", "/health", None, 3.0)?;
     if let Some(report) = force_report {

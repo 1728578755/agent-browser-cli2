@@ -78,7 +78,7 @@ atb cleanup             # 关闭本智能体 open 的标签页
 
 ## 5. 版本配套与升级
 
-三个版本：CLI/daemon 的 API 协议（当前 5）、扩展的消息协议（当前 4）、扩展的文件版本（当前 5.3.0）。
+三个版本：CLI/daemon 的 API 协议（当前 5）、扩展的消息协议（当前 4）、扩展的文件版本（当前 5.4.2）。
 
 ```bash
 atb status | jq '.compatibility'
@@ -240,4 +240,7 @@ atb stealth scrub
 - 非 `compat` 档是 fail-closed：配置缺失或校验失败会直接拒绝握手，不会退回放行。
 - 切档后跑一次 `atb status`：`security.mode` 与 `security.warning` 会告诉你当前档位；`compat` 一定带告警。
 - 关掉 `ATB_NO_DEBUGGER` 之外的加固：`ATB_NO_DEBUGGER=1` 禁止 attach；`ATB_IDEMPOTENCY_PERSIST=redacted`（默认）确保幂等记录不写响应体。
-- 白名单/token 只约束「谁能连 daemon」；扩展仍然无法验证「对端是不是真 daemon」，这是单向信任的已知边界。
+- 白名单/token 约束「谁能连 daemon」；配上 token 后握手还有双向鉴权（`ws_hello` + HMAC proof），扩展能验证对端是不是真 daemon；没配 token 时扩展无法验证对端身份，这是默认档的已知边界。
+- 从 Release 手工下载二进制时先核 `SHA256SUMS`（有 `SHA256SUMS.asc` 时再 `gpg --verify`），
+  从 npm 安装时用 `npm audit signatures` 校验 provenance；平台包哈希在 `package-lock.json` 里锁死，
+  发布门禁要求与 registry 一致（详见 `SECURITY.md` 的「发布产物校验」）。

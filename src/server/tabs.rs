@@ -74,11 +74,16 @@ pub(crate) async fn cleanup(
     // 截止时间用 tokio 的 Instant：`timeout_at` 不接受 std 的时钟。
     let deadline = tokio::time::Instant::now() + CLEANUP_BUDGET;
     let mut set = tokio::task::JoinSet::new();
+    // 任务 id → session_key。panic 时 `JoinError` 只带任务 id，没有返回值；
+    // 没有这张表就只能把它算成「超时」，hint 文案会误导用户去等一个已经崩掉的关闭。
+    let mut task_keys: HashMap<tokio::task::Id, String> = HashMap::new();
     for key in alive.iter().cloned() {
         let task_state = state.clone();
         let permits = permits.clone();
         // 身份要跟着任务走：`current_agent()` 不会随 spawn 继承。
-        set.spawn(with_agent(current_agent(), async move {
+        let task_key = key.clone();
+        let handle = set.spawn(with_agent(current_agent(), async move {
+            let key = task_key;
             // 同类：拿不到许可就明确失败，不要「无许可继续跑」。
             let _permit = match permits.acquire_owned().await {
                 Ok(permit) => permit,
@@ -94,30 +99,50 @@ pub(crate) async fn cleanup(
             let outcome = close_session_by_key(&task_state, &key).await;
             (key, outcome)
         }));
+        task_keys.insert(handle.id(), key);
     }
 
     let mut closed = 0usize;
     let mut failed: Vec<Value> = Vec::new();
     let mut finished: HashSet<String> = HashSet::new();
     loop {
-        let joined = match tokio::time::timeout_at(deadline, set.join_next()).await {
+        let joined = match tokio::time::timeout_at(deadline, set.join_next_with_id()).await {
             Ok(Some(joined)) => joined,
             // None = 全部任务结束；Err = 预算用完。
             Ok(None) | Err(_) => break,
         };
         match joined {
-            Ok((key, Ok(()))) => {
+            Ok((_task, (key, Ok(())))) => {
                 closed += 1;
                 finished.insert(key.clone());
                 record_cleanup_closed(&state, &key).await;
             }
-            Ok((key, Err(err))) => {
+            Ok((_task, (key, Err(err)))) => {
                 finished.insert(key.clone());
                 failed.push(json!({ "session_key": key, "error": err.to_string() }));
             }
-            // 任务 panic 时拿不到 key，只能留给下面的 timeout 列表（它是 bug，
-            // 不该被伪装成"成功关闭"）。
-            Err(err) => eprintln!("cleanup: 关闭任务异常退出: {err}"),
+            // panic 是 bug，不是「还没关完」。归到 `task_panicked`，
+            // 既不进超时列表（用户不该等它），也不进成功计数。
+            Err(err) => {
+                eprintln!("cleanup: 关闭任务 panic（task_panicked）: {err}");
+                if let Some(key) = task_keys.remove(&err.id()) {
+                    finished.insert(key.clone());
+                    failed.push(json!({
+                        "session_key": key,
+                        "error": format!("task_panicked: 关闭任务异常终止，标签状态未知（{err}）"),
+                        "error_code": "task_panicked",
+                        // 与 `atb schema` 的 error_codes 声明对齐（cli 域）：这个码
+                        // 允许在复核目标状态后重试，所以是 retryable，但这不等于
+                        // 「等一会儿就会好」——hint 明确要求先复核。
+                        "retryable": true,
+                        // 重试前必须先看 `errors[]` 里的 session_key：同一批 cleanup 里
+                        // 可能有多条 panic，直接整批重试会对已经关掉的目标重复关闭。
+                        // `cleanup --dry-run` 的输出正好是「现在会被关掉的集合」，与
+                        // 「刚才哪些可能已关」对齐后就能只重试剩余部分。
+                        "hint": "这是 atb 的 bug：附上 daemon 日志反馈；先看 errors[] 里已失败的 session_key，不要整批重试（该标签可能已关也可能没关）；`atb cleanup --dry-run` 可列出当前仍会被关闭的目标，据此只重试剩余部分",
+                    }));
+                }
+            }
         }
     }
     // `set` 在这里 drop，仍在跑的任务会被 abort：关闭指令可能已经发出，
@@ -259,7 +284,7 @@ pub(crate) async fn health(State(state): State<AppState>) -> Json<Value> {
     let active_tabs_count = active_tabs(&state, false).await.len();
     let extension_connected = has_extension_connection(&state).await;
     let mut profile_capabilities = extension_profile_capabilities(&state).await;
-    // A2：默认目标落在哪个会话 / 哪个浏览器。默认失效或尚未建立时如实给 null。
+    // 默认目标落在哪个会话 / 哪个浏览器。默认失效或尚未建立时如实给 null。
     let (default_session_key, default_browser_id, default_profile_id) = {
         let driver = state.driver.read().await;
         let key = driver.default_session_key.clone();
@@ -270,7 +295,7 @@ pub(crate) async fn health(State(state): State<AppState>) -> Json<Value> {
             session.map(|session| session.profile_id.clone()),
         )
     };
-    // A2：让调用方直接看出「默认落在哪个浏览器/profile」。只加字段，
+    // 让调用方直接看出「默认落在哪个浏览器/profile」。只加字段，
     // 既有字段与顺序不变（`extension_freshness` 只读 version 相关字段）。
     for profile in profile_capabilities.iter_mut() {
         let is_default = default_browser_id.is_some()
@@ -352,13 +377,13 @@ pub(crate) async fn health(State(state): State<AppState>) -> Json<Value> {
         "connection": {
             "extension_connected": extension_connected,
             "active_tabs": active_tabs_count,
-            // A2：隐式默认落在哪个会话 / 哪个浏览器；没有默认时是 null（不伪造）。
+            // 隐式默认落在哪个会话 / 哪个浏览器；没有默认时是 null（不伪造）。
             "default_session_key": default_session_key,
             "default_browser_id": default_browser_id,
             "profiles": profile_capabilities
         },
         "extension": extension_freshness,
-        // 扩展自检报错（R-19）：非空就说明它那边已经有功能降级了，
+        // 扩展自检报错：非空就说明它那边已经有功能降级了，
         // 比让用户盯着「没有可用标签页」猜要直接得多。
         "extension_warnings": state.ext_warnings.lock().await.clone(),
         "compatibility": compatibility,
@@ -375,7 +400,7 @@ pub(crate) async fn health(State(state): State<AppState>) -> Json<Value> {
             "total": jobs_total,
             // 真正的执行并发上限（`ATB_MAX_RUNNING_JOBS` 可调）。
             // 和 `total`/`running` 一起给出，才看得出「被拒绝」是不是并发打满了。
-            "max_running": max_running_jobs(),
+            "max_running": crate::settings::max_running_jobs(),
         }
     }))
 }
@@ -892,7 +917,7 @@ pub(crate) async fn lookup_browser(
             )))
         });
     }
-    // 按 profile 归并并查歧义（P3）：旧实现直接取 `sessions[0]` 的 profile，
+    // 按 profile 归并并查歧义：旧实现直接取 `sessions[0]` 的 profile，
     // 却用**全部** profile 的会话数当 `tabs_count`，同一浏览器开多个 profile 时
     // 返回的 profile_id 与实际统计对不上，也不像 `lookup_profile` 那样报歧义。
     let profile_ids: HashSet<String> = sessions.iter().map(|s| s.profile_id.clone()).collect();
@@ -1077,7 +1102,7 @@ pub(crate) async fn update_profile_label(
                     "会话在命令执行间隙失效（扩展重载或标签关闭）：重新 open 或用 tabs 另选目标",
                 )
             })?;
-        // 查重必须在**副作用之前**（P3）：旧实现先让扩展落盘并广播，再在写内存时
+        // 查重必须在**副作用之前**：旧实现先让扩展落盘并广播，再在写内存时
         // 二次查重；冲突时扩展侧已经挂上同名 label，两个 profile 共享一个 label，
         // 之后 `--profile <label>` 恒报歧义，而且没有任何命令能改回去。
         // `profile_label_lock` 已经把 daemon 侧并发请求串起来，这一次查重就是权威判定。
@@ -1163,7 +1188,7 @@ async fn send_profile_label_to_extension(
     state: &AppState,
     session_key: &str,
     tab_id: &str,
-    sender: &mpsc::UnboundedSender<String>,
+    sender: &mpsc::Sender<String>,
     label: Option<&str>,
 ) -> Result<()> {
     let exec_id = Uuid::new_v4().to_string();
@@ -1186,9 +1211,11 @@ async fn send_profile_label_to_extension(
             tx,
         },
     );
-    if sender.send(payload).is_err() {
+    // 队列满 / 连接已断都要翻译成结构化错误（`ws_backpressure` /
+    // `ws_disconnected`），而不是像旧实现那样只回一句「连接已断开」。
+    if let Err(err) = send_downstream(sender, payload).await {
         state.execs.lock().await.take(&exec_id);
-        return Err(anyhow!("浏览器扩展连接已断开"));
+        return Err(err);
     }
     match tokio::time::timeout(Duration::from_secs(10), rx).await {
         Ok(Ok(Ok(_))) => Ok(()),

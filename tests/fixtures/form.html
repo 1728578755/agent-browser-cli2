@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>ABC 测试页</title>
+<style>
+  body { font: 14px/1.6 system-ui, sans-serif; margin: 24px; max-width: 720px; }
+  .row { margin: 12px 0; }
+  #log { background: #f4f4f4; padding: 8px; min-height: 24px; white-space: pre-wrap; }
+  #hoverBox { display: inline-block; padding: 8px 16px; background: #eef; }
+  #hoverBox:hover { background: #ccf; }
+  .filler { height: 1400px; background: linear-gradient(#fff, #eee); }
+</style>
+</head>
+<body>
+<h1>ABC 测试页</h1>
+<p id="intro">用于验证 read / find / hover / select / check / scroll / click / fill。</p>
+
+<div class="row">
+  <label>邮箱 <input id="email" name="email" type="email" placeholder="you@example.com"></label>
+</div>
+
+<div class="row">
+  <label>城市
+    <select id="city" name="city">
+      <option value="bj">北京</option>
+      <option value="sh">上海</option>
+      <option value="sz">深圳</option>
+    </select>
+  </label>
+</div>
+
+<div class="row">
+  <label><input id="agree" type="checkbox" name="agree"> 我已阅读并同意</label>
+</div>
+
+<div class="row">
+  <button id="submit" type="button">提交</button>
+  <span id="hoverBox">悬停我</span>
+</div>
+
+<div class="row"><div id="log">事件日志：</div></div>
+<div class="filler"></div>
+<div class="row"><button id="bottomBtn" type="button">页面底部按钮</button></div>
+
+<script>
+  const log = (text) => {
+    const el = document.getElementById('log');
+    el.textContent += ' ' + text;
+  };
+  document.getElementById('submit').addEventListener('click', () => log('click:submit'));
+  document.getElementById('hoverBox').addEventListener('mouseenter', () => log('hover'));
+  document.getElementById('city').addEventListener('change', (e) => log('change:' + e.target.value));
+  document.getElementById('agree').addEventListener('change', (e) => log('agree:' + e.target.checked));
+  document.getElementById('email').addEventListener('input', (e) => log('input:' + e.target.value.length));
+</script>
+</body>
+</html>

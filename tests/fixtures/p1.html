@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>atb P1 fixture</title></head>
+<body>
+  <main>
+    <h1>P1 Fixture</h1>
+    <label>用户名 <input id="username" placeholder="用户名"></label>
+    <textarea id="bio"></textarea>
+    <div id="editor" contenteditable="true" role="textbox">旧内容</div>
+    <button id="submit" onclick="document.querySelector('#result').textContent='提交完成'">提交</button>
+    <button id="mouseOnly" onmousedown="document.querySelector('#mouse-result').textContent='鼠标完成'">鼠标按钮</button>
+    <p id="result"></p>
+    <p id="mouse-result"></p>
+  </main>
+</body>
+</html>

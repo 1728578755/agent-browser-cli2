@@ -39,7 +39,7 @@ pub(crate) async fn read_value(state: &AppState, req: ReadRequest) -> Result<Val
     // `innerTextLimit` 是 page_read.js 的**节点数**阈值（页面侧默认 30000），
     // 不是字符数：节点数 <= 该值时用 innerText 精确抽取，超过则退化为近似可见
     // 文本（textMode:'visible-approx'）。此前 daemon 侧根本没有下发通道，
-    // CLI 传什么都不会生效（X-15 read 侧）。
+    // CLI 传什么都不会生效（read 侧）。
     // - None 不下发，保持页面默认；
     // - `0` 视为「未指定」而不是「最小上限」：页面脚本的约定就是 <=0 用默认
     //   （见 page_read.js 的参数约定注释），把它夹成 1000 会让「顺手写 0」的
@@ -64,8 +64,11 @@ pub(crate) async fn read_value(state: &AppState, req: ReadRequest) -> Result<Val
         execute_page_js_with_target(state, &script, selector.clone(), true, timeout, &target).await;
     match executed {
         Ok(result) => {
+            // 页面脚本明确回 `ok:false`（非法选择器 / 找不到文档）时，
+            // 旧实现照样包成顶层 `ok:true`，CLI 以退出码 0 结束 —— 调用方以为读到了。
+            ensure_page_result_ok(&result, "read")?;
             let mut payload = page_payload(result, "page");
-            // A2：多浏览器并存且本次走隐式默认时，在顶层说明「默认落在哪个浏览器」。
+            // 多浏览器并存且本次走隐式默认时，在顶层说明「默认落在哪个浏览器」。
             attach_multi_browser_hint(state, &mut payload, &selector).await;
             if let Some(note) = &clamped_note {
                 payload["clamped"] = note.clone();
@@ -90,7 +93,7 @@ pub(crate) async fn read_value(state: &AppState, req: ReadRequest) -> Result<Val
                 "page": page,
                 "via": "no-eval",
             });
-            // A2：同一条 read 的降级路径也要给同样的提示（顶层附加字段）。
+            // 同一条 read 的降级路径也要给同样的提示（顶层附加字段）。
             attach_multi_browser_hint(state, &mut payload, &selector).await;
             if let Some(note) = &clamped_note {
                 payload["clamped"] = note.clone();
@@ -143,7 +146,12 @@ pub(crate) async fn find_value(state: &AppState, req: FindRequest) -> Result<Val
     )
     .await;
     match executed {
-        Ok(result) => Ok(page_payload(result, "find")),
+        Ok(result) => {
+            // 同上：find 的 invalid_selector / invalid_xpath 必须变成失败，
+            // 而不是「0 个匹配」的成功。
+            ensure_page_result_ok(&result, "find")?;
+            Ok(page_payload(result, "find"))
+        }
         Err(err) if is_csp_error(&err.to_string()) => {
             let session_key = select_tab(
                 state,
@@ -293,6 +301,9 @@ pub(crate) async fn wait_value(
     } else {
         min_interval_sec
     };
+    // 失败码要区分 js 条件与 selector/text 条件（下文的 `wait_failure_code`）：
+    // 两者对调用方的含义不同（一个是谓词没成立，一个是元素/文本没出现）。
+    let is_js_condition = req.js.as_deref().is_some_and(|js| !js.trim().is_empty());
     let condition = if let Some(js) = req.js.as_deref().filter(|js| !js.trim().is_empty()) {
         js.to_string()
     } else if let Some(selector) = req.selector.as_deref().filter(|s| !s.trim().is_empty()) {
@@ -486,5 +497,128 @@ pub(crate) async fn wait_value(
     {
         body["text_match_mode"] = mode.clone();
     }
+    // 结构化错误码原样上提（起 wait 也会产出 `wait_js_eval_blocked` /
+    // `wait_js_failed`）：CLI 只认 `error_code` 分支，别让等待失败退化成纯文本。
+    if let Some(code) = outcome.get("error_code").filter(|value| !value.is_null()) {
+        body["error_code"] = code.clone();
+    }
+    // 页面通道（非 CSP 回退）超时本身不带码：这里按条件类型补一个稳定码，
+    // 让 `wait --js` / `wait --selector|--text` 的失败在 CLI 侧可分支。
+    if body.get("error_code").is_none()
+        && body.get("ok").and_then(Value::as_bool) == Some(false)
+        && body.get("cancelled").and_then(Value::as_bool) != Some(true)
+    {
+        body["error_code"] = json!(wait_failure_code(is_js_condition));
+    }
     Ok(body)
+}
+
+/// `wait` 失败但通道没给码时的稳定兜底码。
+///
+/// `--js` 的失败语义是「谓词没成立」，选择器/文本的语义是「目标没出现」，
+/// 调用方的处置不同（前者改条件、后者多半是页面没加载完），用两个码区分。
+pub(crate) fn wait_failure_code(is_js_condition: bool) -> &'static str {
+    if is_js_condition {
+        "wait_js_failed"
+    } else {
+        "wait_timeout"
+    }
+}
+
+/// 页面脚本回包的 `ok:false` 必须提升为 daemon 失败。
+///
+/// `read` / `find` 以前只看 `execute_page_js*` 的 `Ok`，不看页面自己的结论：
+/// 非法选择器 / 文档没有 body 时页面回 `{ok:false,error_code:"invalid_selector"}`，
+/// daemon 仍包成顶层 `ok:true`，CLI 退出码 0。这里把已知的用法类错误码保留下来
+/// （CLI 的 `invalid_` 前缀会映射成退出码 2），未知页面错误归为 `page_op_failed`。
+fn ensure_page_result_ok(result: &Value, op: &str) -> Result<()> {
+    let payload = result.get("js_return").unwrap_or(result);
+    match payload.get("ok").and_then(Value::as_bool) {
+        Some(false) => {
+            let page_code = payload
+                .get("error_code")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let message = payload
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("页面脚本返回 ok:false");
+            // 旧版 page_read / page_find 的选择器错误只带 message、不带 error_code
+            // （`invalid selector: ...` / `invalid xpath: ...`）。这里按文案兜底归类，
+            // 否则会退化成 `page_op_failed`，CLI 映射成 exit 1，Agent 会以为可重试。
+            let code = match page_code {
+                "invalid_selector" => "invalid_selector",
+                "invalid_xpath" => "invalid_xpath",
+                "selector_not_found" => "selector_not_found",
+                "no_document_body" => "no_document_body",
+                _ if message.trim_start().starts_with("invalid selector") => "invalid_selector",
+                _ if message.trim_start().starts_with("invalid xpath") => "invalid_xpath",
+                _ => "page_op_failed",
+            };
+            Err(SessionSelectError {
+                code,
+                message: format!("{op}: {message}"),
+                hint: "按页面返回的 error 修正选择器/参数；find 可用 --text 或更宽的选择器，read 先确认页面已加载出 body".to_string(),
+                retryable: false,
+                retry_after_ms: None,
+            }
+            .into_anyhow())
+        }
+        // 没有 ok 字段：保持旧行为（部分老扩展/第三方回包可能不带），
+        // 真正的「没有结论」由动作类命令的 ensure_page_action_ok 守。
+        _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod page_ok_contract_tests {
+    use super::*;
+
+    /// 契约：页面脚本回 `ok:false` 时 daemon 必须报失败，且 `error_code`
+    /// 原样保留（CLI 的 `is_usage_error_code` 会把它映射成退出码 2）。旧实现无条件
+    /// 当成成功，非法选择器会以 `ok:true` + exit 0 结束。
+    #[test]
+    fn page_ok_false_becomes_error_with_code() {
+        let result = json!({
+            "js_return": { "ok": false, "error_code": "invalid_selector", "error": "bad selector '>>>'" }
+        });
+        let err = ensure_page_result_ok(&result, "find").expect_err("ok:false 必须变成 Err");
+        let typed = err
+            .downcast_ref::<SessionSelectError>()
+            .expect("应保留结构化的 SessionSelectError");
+        assert_eq!(typed.code, "invalid_selector");
+        assert!(!typed.retryable, "选择器写错不可重试");
+        assert!(typed.message.starts_with("find: "), "{}", typed.message);
+
+        let xpath = json!({ "js_return": { "ok": false, "error_code": "invalid_xpath" } });
+        let err = ensure_page_result_ok(&xpath, "find").expect_err("invalid_xpath");
+        assert_eq!(
+            err.downcast_ref::<SessionSelectError>()
+                .map(|typed| typed.code),
+            Some("invalid_xpath")
+        );
+
+        // 未知页面错误码兜到 page_op_failed，仍然是失败（不再是假成功）。
+        let other = json!({ "js_return": { "ok": false } });
+        let err = ensure_page_result_ok(&other, "read").expect_err("未知错误也要失败");
+        assert_eq!(
+            err.downcast_ref::<SessionSelectError>()
+                .map(|typed| typed.code),
+            Some("page_op_failed")
+        );
+    }
+
+    /// `wait` 的兜底错误码：js 条件与 selector/text 条件必须区分（CLI 按码分支）。
+    #[test]
+    fn wait_failure_codes_are_distinct() {
+        assert_eq!(wait_failure_code(true), "wait_js_failed");
+        assert_eq!(wait_failure_code(false), "wait_timeout");
+    }
+
+    /// 没有 `ok` 字段的回包保持旧行为（老扩展 / 第三方回包），不能凭空判失败。
+    #[test]
+    fn missing_ok_keeps_legacy_behavior() {
+        assert!(ensure_page_result_ok(&json!({ "js_return": { "title": "x" } }), "read").is_ok());
+        assert!(ensure_page_result_ok(&json!({ "js_return": { "ok": true } }), "read").is_ok());
+    }
 }

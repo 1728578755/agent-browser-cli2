@@ -640,7 +640,7 @@ pub fn validate_js(code: &str) -> Result<(), Problem> {
 /// 正则字面量不能跨行，所以「同一行没有结尾 `/`」就说明这里更可能是除号
 /// （`(a+b) / 2`）。扫描时跳过字符类 `[...]` 和转义字符。
 ///
-/// 括号深度是收紧：`count(a) / (total / 100)` 里，`)` 后第一个 `/`
+/// 括号深度是 的收紧：`count(a) / (total / 100)` 里，`)` 后第一个 `/`
 /// 后面紧跟着未闭合的 `(`，里面的 `/` 不是正则的结尾而是除号；旧实现把它当正则
 /// 起始，最终报「多了一个 `)`」。`{` 同理（`{a:1} / {b:2}`）。字符类里的括号
 /// 不参与深度（`/[(]/` 仍然能正确识别为正则）。
@@ -741,7 +741,7 @@ pub const TIMEOUT_MAX_SECONDS: f64 = 3600.0;
 ///
 /// 非有限值（NaN/Inf）按最小值处理：宁可立刻超时并报错，也不要让命令静默挂一小时。
 // 旧注释声称 daemon 侧尚未接入，实际 server/state.rs 的 secs() 与 cli/http.rs 的 secs()
-// 都已走本函数（v8 修复），过期的 allow(dead_code) 连同该注释一并删除。
+// 都已走本函数，过期的 allow(dead_code) 连同该注释一并删除。
 pub fn clamp_timeout_seconds(value: f64) -> f64 {
     if !value.is_finite() {
         return TIMEOUT_MIN_SECONDS;
@@ -751,8 +751,9 @@ pub fn clamp_timeout_seconds(value: f64) -> f64 {
 
 /// 这个超时值是否会被 `clamp_timeout_seconds` 改动（调用方可在结果里带
 /// `timeout_clamped: true`）。
-// 目前仅单元测试使用（生产路径尚未回报「参数被收敛过」），因此只在 test 编译下存在。
-#[cfg(test)]
+// 目前仅单元测试使用（生产路径尚未回报「参数被收敛过」），allow(dead_code) 仍需
+// 保留：非 test 编译下它是死代码，与上面已接入的 clamp 不同。
+#[allow(dead_code)]
 pub fn timeout_clamped(value: f64) -> bool {
     clamp_timeout_seconds(value).to_bits() != value.to_bits()
 }

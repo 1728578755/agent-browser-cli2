@@ -214,6 +214,15 @@ pub(crate) fn cmd_tabs(args: TabsArgs, is_async: bool) -> Result<()> {
         return Ok(());
     }
     // 精简视图：只留选目标要用的字段，省 token 也省得智能体在长 JSON 里找 tab_id。
+    print_json(tabs_ids_view(&value, fields.as_deref(), args.limit));
+    Ok(())
+}
+
+/// `tabs --ids` 的精简视图（与 full 视图共用 `--limit` 语义）。
+///
+/// `--limit 0` = 不截断：full 视图早已按 / 这么定义，ids 路径以前
+/// 直接 `truncate(0)` 返回空列表，同一条命令只是换了输出形态就得到相反的结果。
+fn tabs_ids_view(value: &Value, fields: Option<&[String]>, limit: Option<usize>) -> Value {
     let tabs = value
         .pointer("/result/metadata/tabs")
         .and_then(Value::as_array)
@@ -223,8 +232,8 @@ pub(crate) fn cmd_tabs(args: TabsArgs, is_async: bool) -> Result<()> {
     // 默认字段集的别名。旧实现先在精简视图里裁到 6 个字段，再应用 --fields，
     // 于是 `tabs --ids --fields session_key` 恒为 null——字段根本没被带出来。
     const IDS_DEFAULT_FIELDS: &[&str] = &["tab_id", "window", "title", "url", "active", "group"];
-    let selected: Vec<String> = match &fields {
-        Some(fields) => fields.clone(),
+    let selected: Vec<String> = match fields {
+        Some(fields) => fields.to_vec(),
         None => IDS_DEFAULT_FIELDS
             .iter()
             .map(|field| field.to_string())
@@ -245,10 +254,10 @@ pub(crate) fn cmd_tabs(args: TabsArgs, is_async: bool) -> Result<()> {
             Value::Object(item)
         })
         .collect();
-    if let Some(limit) = args.limit {
+    if let Some(limit) = limit.filter(|value| *value > 0) {
         items.truncate(limit);
     }
-    print_json(json!({
+    json!({
         "ok": value.get("ok").cloned().unwrap_or(json!(false)),
         "count": items.len(),
         "returned_count": items.len(),
@@ -256,8 +265,7 @@ pub(crate) fn cmd_tabs(args: TabsArgs, is_async: bool) -> Result<()> {
         "total": total_before_limit,
         "tabs": items,
         "hint": "把某个 tab_id 直接传给 --tab；也可以 --tab @1 按序号、--tab window:<id> 按窗口",
-    }));
-    Ok(())
+    })
 }
 
 pub(crate) fn cmd_tabtree(args: TabtreeArgs, is_async: bool) -> Result<()> {
@@ -283,4 +291,47 @@ pub(crate) fn cmd_tabtree(args: TabtreeArgs, is_async: bool) -> Result<()> {
     }
     print_json(request("GET", &path, None, 30.0)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_tabs() -> Value {
+        json!({
+            "ok": true,
+            "result": { "metadata": { "tabs": [
+                { "tab_id": "a", "title": "A", "url": "https://a/", "window": 1, "session_key": "s1" },
+                { "tab_id": "b", "title": "B", "url": "https://b/", "window": 1, "session_key": "s2" },
+                { "tab_id": "c", "title": "C", "url": "https://c/", "window": 2, "session_key": "s3" },
+            ] } }
+        })
+    }
+
+    /// D10 / `--ids --limit 0` 与 full 视图同语义（0 = 不截断）。
+    #[test]
+    fn ids_view_limit_zero_means_no_truncation() {
+        let view = tabs_ids_view(&sample_tabs(), None, Some(0));
+        assert_eq!(view["count"], json!(3));
+        assert_eq!(view["total"], json!(3));
+        assert_eq!(view["tabs"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn ids_view_limit_truncates_and_reports_total() {
+        let view = tabs_ids_view(&sample_tabs(), None, Some(2));
+        assert_eq!(view["count"], json!(2));
+        assert_eq!(view["returned_count"], json!(2));
+        assert_eq!(view["total_before_limit"], json!(3));
+        assert_eq!(view["tabs"].as_array().unwrap().len(), 2);
+    }
+
+    /// `--fields` 作用于原始 tab 对象（不能先裁到默认字段集）。
+    #[test]
+    fn ids_view_applies_custom_fields() {
+        let fields = vec!["tab_id".to_string(), "session_key".to_string()];
+        let view = tabs_ids_view(&sample_tabs(), Some(&fields), None);
+        assert_eq!(view["tabs"][0]["session_key"], json!("s1"));
+        assert!(view["tabs"][0].get("title").is_none());
+    }
 }

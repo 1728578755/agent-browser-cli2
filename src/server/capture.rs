@@ -160,7 +160,7 @@ async fn tab_is_active(state: &AppState, tab_id: &str) -> bool {
 
 /// 一次 `chrome.tabs.captureVisibleTab` 截图（已解码 + 校验 + 落盘）。
 ///
-/// 抽成函数是为了「退避重试」：首次失败与重试必须走完全相同的
+/// 抽成函数是为了 的「退避重试」：首次失败与重试必须走完全相同的
 /// 解码/校验/落盘路径，否则重试成功也可能写出一张坏图。
 async fn capture_visible_once(
     state: &AppState,
@@ -389,12 +389,7 @@ async fn fetch_full_page(
         }
     }
     // 拼接结果的像素总量也有预算，否则单张图就能吃掉几百 MB。
-    let max_pixels = crate::settings::env_usize_clamped(
-        "ATB_CAPTURE_MAX_PIXELS",
-        80_000_000,
-        1_000_000,
-        500_000_000,
-    ) as u64;
+    let max_pixels = crate::settings::capture_max_pixels();
     let pixels = u64::from(width) * u64::from(height);
     if pixels > max_pixels {
         return Err(anyhow!(
@@ -960,7 +955,7 @@ pub(crate) fn write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     {
         fs::create_dir_all(parent).map_err(|err| {
             // 带上绝对路径：只回一句 "No such file or directory" 时调用方无法判断
-            // 是哪个目录没权限/没建起来（P3）。
+            // 是哪个目录没权限/没建起来。
             anyhow!(
                 "写入失败：无法创建输出目录 {}：{err}",
                 absolute_path(parent).display()
@@ -1026,7 +1021,7 @@ pub(crate) fn sanitize_filename(input: &str) -> String {
         }
     }
     // 只裁尾部：`trim_matches('-')` 会把开头的 `-` 也削掉，`-draft` 这类合法文件名
-    // 首字符被吃掉后可能与另一个文件同名、互相覆盖（P3）。
+    // 首字符被吃掉后可能与另一个文件同名、互相覆盖。
     let trimmed = out.trim_end_matches(['-', '_', ' ']).to_string();
     if trimmed.is_empty() {
         "page".to_string()
@@ -1036,7 +1031,7 @@ pub(crate) fn sanitize_filename(input: &str) -> String {
 }
 
 pub(crate) fn decode_base64(input: &str) -> Result<Vec<u8>> {
-    // 除了「能解出来」，还要能判断「这份数据是不是完整的」（D-02）：
+    // 除了「能解出来」，还要能判断「这份数据是不是完整的」：
     // ① `=` 之后不允许再有数据字符（拼接/截断的典型形态）；
     // ② 带 padding 时总长度必须是 4 的倍数；
     // ③ 最后一组残留 bit 必须为 0（末字节只来了半个字符时不为 0）。
@@ -1099,7 +1094,7 @@ pub(crate) const MIN_PDF_BYTES: usize = 200;
 /// 校验 CDP 回传的画面数据：**能解码 ≠ 可用**。
 ///
 /// `decode_base64` 对空串和截断串都会「成功」返回（0 字节或半截文件），
-/// 旧实现照样写盘并返回 `status:success`，退出码 0，调用方拿到坏图却以为成功（C-10）。
+/// 旧实现照样写盘并返回 `status:success`，退出码 0，调用方拿到坏图却以为成功。
 pub(crate) fn validate_screenshot_bytes(bytes: &[u8], format: &str) -> Result<()> {
     let magic_ok = match format {
         "png" => bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]),
@@ -1115,7 +1110,7 @@ pub(crate) fn validate_screenshot_bytes(bytes: &[u8], format: &str) -> Result<()
         ));
     }
     // 尾部魔数：只查头部的话，「截掉尾部若干个 4 字符组」的 base64 会被判成合法，
-    // 于是写盘一张打不开的图、却报 status:success（D-02，v7 已实测复现）。
+    // 于是写盘一张打不开的图、却报 status:success（v7 已实测复现）。
     // 只在最后 16 字节里找，容忍少量尾部填充，但不接受「完全没有结束标记」。
     if !tail_magic_ok(bytes, format) {
         return Err(anyhow!(
@@ -1146,7 +1141,7 @@ pub(crate) fn validate_pdf_bytes(bytes: &[u8]) -> Result<()> {
             bytes.len()
         ));
     }
-    // 与截图同理：PDF 必须以 `%%EOF` 收尾，只有 `%PDF-` 头说明文件被截断（D-02 同族）。
+    // 与截图同理：PDF 必须以 `%%EOF` 收尾，只有 `%PDF-` 头说明文件被截断（同族）。
     let tail_start = bytes.len().saturating_sub(64);
     if !bytes[tail_start..]
         .windows(5)

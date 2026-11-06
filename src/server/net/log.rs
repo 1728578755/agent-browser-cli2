@@ -5,7 +5,7 @@ use super::*;
 /// 合并两份日志时，任何一条的响应体都可能是一整页 HTML 或一段 base64，
 /// 不设上限就会让一次 `net log` 的回包达到几十 MB。值域 `256..=1M`，默认 8192。
 fn net_log_item_chars() -> usize {
-    crate::settings::env_usize_clamped("ATB_NET_LOG_ITEM_CHARS", 8192, 256, 1_048_576)
+    crate::settings::net_log_item_chars()
 }
 
 /// 超过 `max` 字符时截断并追加标记；未超限返回 `None`（避免无谓的克隆）。
@@ -74,7 +74,7 @@ pub(crate) async fn merge_net_log(
     timeout: Duration,
 ) -> Value {
     let mut items: Vec<Value> = Vec::new();
-    // CDP 侧取日志失败时不能静默：`sources.cdp=0` 与「确实没有日志」无法区分（B-12）。
+    // CDP 侧取日志失败时不能静默：`sources.cdp=0` 与「确实没有日志」无法区分。
     let mut cdp_error: Option<String> = None;
     let include_page = log_source != "cdp";
     let include_cdp = log_source != "page";

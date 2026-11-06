@@ -1,4 +1,4 @@
-//! 用户可调参数（统一入口）。
+//! 用户可调参数（修复轮统一入口）。
 //!
 //! 设计原则：
 //! - **默认值保持向后兼容**：不设置任何环境变量时，行为与本轮修复前一致或更安全；
@@ -8,6 +8,8 @@
 //! 值域与语义写在每个访问器上方；完整清单同步在 `README` 的「环境变量」章节。
 
 use std::env;
+use std::path::PathBuf;
+use std::sync::OnceLock;
 
 fn parse_bool(raw: &str) -> Option<bool> {
     match raw.trim().to_ascii_lowercase().as_str() {
@@ -17,28 +19,38 @@ fn parse_bool(raw: &str) -> Option<bool> {
     }
 }
 
+/// 读取环境变量：`ATB_*` 优先，旧前缀 `AGENT_BROWSER_CLI_*` 继续生效。
+///
+/// 把参数集中到 `settings.rs` 时只认新前缀，旧前缀会静默失效（尤其
+/// `NO_DEBUGGER` 这种安全开关）。这里统一走 `config::env_compat`，一个入口同时
+/// 兼容两套前缀；非 值按 `to_string_lossy` 处理（配置值本就是 ASCII）。
+fn read_env(name: &str) -> Option<String> {
+    if let Ok(value) = env::var(name) {
+        return Some(value);
+    }
+    name.strip_prefix("ATB_")
+        .and_then(crate::config::env_compat)
+        .map(|value| value.to_string_lossy().into_owned())
+}
+
 /// 读取字符串型环境变量；空串视为未设置。
 pub(crate) fn env_string(name: &str, default: &str) -> String {
-    match env::var(name) {
-        Ok(value) if !value.trim().is_empty() => value.trim().to_string(),
+    match read_env(name) {
+        Some(value) if !value.trim().is_empty() => value.trim().to_string(),
         _ => default.to_string(),
     }
 }
 
 /// 读取布尔型环境变量；非法值回落缺省。
 pub(crate) fn env_bool(name: &str, default: bool) -> bool {
-    env::var(name)
-        .ok()
+    read_env(name)
         .and_then(|value| parse_bool(&value))
         .unwrap_or(default)
 }
 
 /// 读取浮点型环境变量并夹到 `[min, max]`；NaN/非法值回落缺省。
 pub(crate) fn env_f64_clamped(name: &str, default: f64, min: f64, max: f64) -> f64 {
-    match env::var(name)
-        .ok()
-        .and_then(|value| value.trim().parse::<f64>().ok())
-    {
+    match read_env(name).and_then(|value| value.trim().parse::<f64>().ok()) {
         Some(value) if value.is_finite() => value.clamp(min, max),
         _ => default.clamp(min, max),
     }
@@ -46,10 +58,7 @@ pub(crate) fn env_f64_clamped(name: &str, default: f64, min: f64, max: f64) -> f
 
 /// 读取无符号整数环境变量并夹到 `[min, max]`；非法值回落缺省。
 pub(crate) fn env_u64_clamped(name: &str, default: u64, min: u64, max: u64) -> u64 {
-    match env::var(name)
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-    {
+    match read_env(name).and_then(|value| value.trim().parse::<u64>().ok()) {
         Some(value) => value.clamp(min, max),
         None => default.clamp(min, max),
     }
@@ -62,8 +71,8 @@ pub(crate) fn env_usize_clamped(name: &str, default: usize, min: usize, max: usi
 
 /// 读取枚举型环境变量；不在白名单内回落缺省。
 pub(crate) fn env_enum(name: &str, default: &str, allowed: &[&str]) -> String {
-    match env::var(name) {
-        Ok(value) => {
+    match read_env(name) {
+        Some(value) => {
             let value = value.trim().to_ascii_lowercase();
             if allowed.iter().any(|candidate| *candidate == value) {
                 value
@@ -71,7 +80,7 @@ pub(crate) fn env_enum(name: &str, default: &str, allowed: &[&str]) -> String {
                 default.to_string()
             }
         }
-        Err(_) => default.to_string(),
+        None => default.to_string(),
     }
 }
 
@@ -158,6 +167,31 @@ pub(crate) fn io_max_output_bytes() -> usize {
     env_usize_clamped("ATB_IO_MAX_OUTPUT_MB", 50, 1, 512) * 1024 * 1024
 }
 
+/// `ATB_EXEC_MAX_BYTES`：`exec` 回包在 daemon 侧的默认大小预算。
+///
+/// 只在不传 `--max-bytes` 时生效：直连 API 的调用方从来不带这个字段，旧实现
+/// 等于完全不截断，一条 `exec` 就能把整页 innerHTML 之类的几百 MB 回包打给客户端。
+///
+/// 值域：`0` 表示**不限**；其余夹到 `4 KiB..=256 MiB`，默认 `1 MiB`。
+/// 口径与 `--max-bytes` 一致，按**字符**计（字段名沿用历史叫法只为线协议兼容），
+/// 所以中文页面的实际字节上限约为 3×该值。
+pub(crate) fn exec_max_bytes() -> usize {
+    const DEFAULT_BYTES: u64 = 1024 * 1024;
+    const MIN_BYTES: u64 = 4 * 1024;
+    const MAX_BYTES: u64 = 256 * 1024 * 1024;
+    let raw = match env::var("ATB_EXEC_MAX_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+    {
+        Some(value) => value,
+        None => DEFAULT_BYTES,
+    };
+    if raw == 0 {
+        return 0;
+    }
+    raw.clamp(MIN_BYTES, MAX_BYTES) as usize
+}
+
 /// `ATB_IDEMPOTENCY_PERSIST`：幂等缓存落盘策略。
 ///
 /// - `redacted`（默认）：只落 `{key, scope, at, status}` 元数据，不落响应体；
@@ -217,6 +251,246 @@ pub(crate) fn ws_trust_mode() -> String {
     )
 }
 
+// ---------------------------------------------------------------------------
+// 启动 / 生命周期 / 进程（2026-11-06 收拢：原散落于 boot / run / launch / config / cli）
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// 调试器 / 扩展 / 会话 / WS
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// 幂等 / 网络 / 挑战 / 截图 / 监控 / 下载 / CLI 开关
+// ---------------------------------------------------------------------------
+
+/// 读取可选字符串：未设置或空白返回 `None`（`ATB_*` 的空值一律视同未设置）。
+/// 与 `env_string` 一样走 `read_env`，旧前缀继续生效。
+fn env_opt_string(name: &str) -> Option<String> {
+    read_env(name)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// `ATB_AGENT`（旧名 `AGENT_BROWSER_CLI_AGENT`）：显式调用方身份。
+pub(crate) fn agent_from_env() -> Option<String> {
+    env_opt_string("ATB_AGENT").or_else(|| env_opt_string("AGENT_BROWSER_CLI_AGENT"))
+}
+
+/// `ATB_HOME`：配置目录覆盖（mock 扩展自检靠它跑独立 daemon）。
+pub(crate) fn atb_home() -> Option<PathBuf> {
+    env_opt_string("ATB_HOME").map(PathBuf::from)
+}
+
+/// `ATB_PACKAGE_DIR`：npm 包目录覆盖（install-skill / 扩展资产定位）。
+pub(crate) fn package_dir() -> Option<PathBuf> {
+    env_opt_string("ATB_PACKAGE_DIR").map(PathBuf::from)
+}
+
+/// `ATB_BROWSER_EXE`：`launch --restart` 使用的浏览器可执行文件。
+pub(crate) fn browser_exe() -> Option<String> {
+    env_opt_string("ATB_BROWSER_EXE")
+}
+
+/// `ATB_EXTENSION_ID`：多份扩展共存时识别自身 iframe（默认自动探测）。
+pub(crate) fn extension_id() -> String {
+    env_opt_string("ATB_EXTENSION_ID").unwrap_or_default()
+}
+
+/// `ATB_FILE_HOSTS`：允许的 `file://host/...` 主机，逗号分隔；默认只允许 localhost。
+pub(crate) fn file_hosts() -> String {
+    env_string("ATB_FILE_HOSTS", "")
+}
+
+/// `ATB_EXIT0`（旧名 `AGENT_BROWSER_CLI_EXIT0`）：trim 后为 `1` / `true` 时，
+/// `status` 恢复旧版恒 0 退出码（语义以文档为准：`yes` / `on` 不启用）。
+pub(crate) fn exit0_enabled() -> bool {
+    read_env("ATB_EXIT0")
+        .map(|value| matches!(value.trim(), "1" | "true"))
+        .unwrap_or(false)
+}
+
+/// `ATB_FORCE_ASSUME_ATB`：`restart --force` / `doctor --fix` 的身份判据。
+/// 值域 `strict | loose`，默认 `strict`（只处理能确认属于本安装的进程）。
+pub(crate) fn force_assume_atb() -> String {
+    env_enum("ATB_FORCE_ASSUME_ATB", "strict", &["strict", "loose"])
+}
+
+/// `ATB_HTTP_NO_PROXY`：CLI 对回环地址跳过系统代理，默认开。
+pub(crate) fn http_no_proxy() -> bool {
+    env_bool("ATB_HTTP_NO_PROXY", true)
+}
+
+/// `ATB_REQUIRE_TAB`：写/破坏性命令必须显式 `--tab`，默认关。
+pub(crate) fn require_tab() -> bool {
+    env_bool("ATB_REQUIRE_TAB", false)
+}
+
+/// `ATB_ALLOW_RELATIVE_OUT`：`broadcast` 保留相对输出路径（旧行为），默认关。
+pub(crate) fn allow_relative_out() -> bool {
+    env_bool("ATB_ALLOW_RELATIVE_OUT", false)
+}
+
+/// `ATB_IDLE_TTL`：无扩展连接时的空闲退出秒数，默认 300；0 = 禁用空闲退出。
+pub(crate) fn idle_shutdown_ttl_sec() -> Option<u64> {
+    // 未设置 / 0 / 非法值都回落到 `None`（boot 用内置默认 300s），
+    // 只有显式给出正整数才覆盖；不设上界（与原实现一致）。
+    read_env("ATB_IDLE_TTL")
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+}
+
+/// `ATB_MAX_RUNNING_JOBS`：同时运行的 job 上限，默认 32；仅 >0 生效。
+/// 进程级 `OnceLock` 缓存：`/health` 与拒绝分支必须看到同一个值。
+pub(crate) fn max_running_jobs() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        read_env("ATB_MAX_RUNNING_JOBS")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|limit| *limit > 0)
+            .unwrap_or(32)
+    })
+}
+
+/// `ATB_PROC_CMD_TIMEOUT_MS`：进程枚举 / `tasklist` 类命令超时，默认 5000，值域 100..=60000。
+pub(crate) fn proc_cmd_timeout_ms() -> u64 {
+    env_u64_clamped("ATB_PROC_CMD_TIMEOUT_MS", 5_000, 100, 60_000)
+}
+
+/// `ATB_LAUNCH_SETTLE_MS`：`launch` 后等待窗口稳定，默认 800，值域 0..=10000。
+pub(crate) fn launch_settle_ms() -> u64 {
+    env_u64_clamped("ATB_LAUNCH_SETTLE_MS", 800, 0, 10_000)
+}
+
+/// `ATB_LAUNCH_CLOSE_WAIT_MS`：温和关闭浏览器的最长等待，默认 3000，值域 100..=60000。
+pub(crate) fn launch_close_wait_ms() -> u64 {
+    env_u64_clamped("ATB_LAUNCH_CLOSE_WAIT_MS", 3_000, 100, 60_000)
+}
+
+/// `ATB_LAUNCH_KILL_WAIT_MS`：强杀后的最长等待，默认 8000，值域 100..=120000。
+pub(crate) fn launch_kill_wait_ms() -> u64 {
+    env_u64_clamped("ATB_LAUNCH_KILL_WAIT_MS", 8_000, 100, 120_000)
+}
+
+/// `ATB_LAUNCH_POLL_MS`：启动期进程轮询间隔，默认 500，值域 20..=5000。
+pub(crate) fn launch_poll_ms() -> u64 {
+    env_u64_clamped("ATB_LAUNCH_POLL_MS", 500, 20, 5_000)
+}
+
+/// `ATB_LOCK_RETRIES`：锁文件重试次数，默认 40，值域 1..=500。
+pub(crate) fn lock_retries() -> u64 {
+    env_u64_clamped("ATB_LOCK_RETRIES", 40, 1, 500)
+}
+
+/// `ATB_LOCK_RETRY_MS`：锁重试间隔（毫秒），默认 25，值域 1..=2000。
+pub(crate) fn lock_retry_ms() -> u64 {
+    env_u64_clamped("ATB_LOCK_RETRY_MS", 25, 1, 2_000)
+}
+
+/// `ATB_NO_DEBUGGER`：彻底禁止 `chrome.debugger` attach，默认关。
+pub(crate) fn no_debugger() -> bool {
+    env_bool("ATB_NO_DEBUGGER", false)
+}
+
+/// `ATB_BROWSERS_SNAPSHOT_TTL_SEC`：`browsers` 快照短 TTL，默认 5；0 = 不缓存。
+pub(crate) fn browsers_snapshot_ttl_sec() -> u64 {
+    env_u64_clamped("ATB_BROWSERS_SNAPSHOT_TTL_SEC", 5, 0, 300)
+}
+
+/// `ATB_PREFERRED_MISS_LIMIT`：首选默认目标连续未命中多少次后放弃，默认 3。
+pub(crate) fn preferred_miss_limit() -> u32 {
+    env_u64_clamped("ATB_PREFERRED_MISS_LIMIT", 3, 1, 1_000) as u32
+}
+
+/// `ATB_PREFERRED_MISS_TTL_SEC`：首选默认目标未命中持续多久后放弃，默认 120。
+pub(crate) fn preferred_miss_ttl_sec() -> u64 {
+    env_u64_clamped("ATB_PREFERRED_MISS_TTL_SEC", 120, 1, 86_400)
+}
+
+/// `ATB_WS_OUTBOUND_MAX`：扩展下行控制通道容量，默认 512（8–65536）。
+pub(crate) fn ws_outbound_max() -> usize {
+    env_usize_clamped("ATB_WS_OUTBOUND_MAX", 512, 8, 65_536)
+}
+
+/// `ATB_IDEMPOTENCY_FILE_MAX_MB`：`idempotency.jsonl` 运行期上限，默认 32MB。
+pub(crate) fn idempotency_file_max_mb() -> u64 {
+    env_u64_clamped("ATB_IDEMPOTENCY_FILE_MAX_MB", 32, 1, 512)
+}
+
+/// `ATB_CAPTURE_MAX_PIXELS`：拼接截图 / 图片 PDF 的像素总量上限，默认 8000 万。
+pub(crate) fn capture_max_pixels() -> u64 {
+    env_u64_clamped("ATB_CAPTURE_MAX_PIXELS", 80_000_000, 1_000_000, 500_000_000)
+}
+
+/// `ATB_CHALLENGE_FOCUS_ON_NEED_HUMAN`：挑战需要人工时自动切前台，默认开。
+pub(crate) fn challenge_focus_on_need_human() -> bool {
+    env_bool("ATB_CHALLENGE_FOCUS_ON_NEED_HUMAN", true)
+}
+
+/// `ATB_CHALLENGE_SRCDOC_MIN_AREA`：srcdoc / about: iframe 纳入候选的最小面积，默认 2000，值域 0..=1e9。
+pub(crate) fn challenge_srcdoc_min_area() -> f64 {
+    env_f64_clamped("ATB_CHALLENGE_SRCDOC_MIN_AREA", 2_000.0, 0.0, 1.0e9)
+}
+
+/// `ATB_NET_RULE_MAX_BYTES`：单条规则 body 字节上限，默认 2MiB。
+pub(crate) fn net_rule_max_bytes() -> usize {
+    env_usize_clamped(
+        "ATB_NET_RULE_MAX_BYTES",
+        2 * 1024 * 1024,
+        1024,
+        16 * 1024 * 1024,
+    )
+}
+
+/// `ATB_NET_RULE_MAX_RULES`：每 profile 规则条数上限，默认 64。
+pub(crate) fn net_rule_max_rules() -> usize {
+    env_usize_clamped("ATB_NET_RULE_MAX_RULES", 64, 1, 500)
+}
+
+/// `ATB_NET_MAX_ENTRIES`：network 缓冲上限，默认 5000。
+pub(crate) fn net_max_entries() -> usize {
+    env_usize_clamped("ATB_NET_MAX_ENTRIES", 5_000, 100, 100_000)
+}
+
+/// `ATB_CONSOLE_MAX_ENTRIES`：console 缓冲上限，默认 5000。
+pub(crate) fn console_max_entries() -> usize {
+    env_usize_clamped("ATB_CONSOLE_MAX_ENTRIES", 5_000, 100, 100_000)
+}
+
+/// `ATB_NET_LOG_ITEM_CHARS`：单条 url/body/headers 字符上限，默认 8192，值域 256..=1048576。
+pub(crate) fn net_log_item_chars() -> usize {
+    env_usize_clamped("ATB_NET_LOG_ITEM_CHARS", 8_192, 256, 1_048_576)
+}
+
+/// `ATB_MONITOR_SAMPLES`：`--monitor` 保留的样本条数，默认 50。
+pub(crate) fn monitor_samples() -> usize {
+    env_usize_clamped("ATB_MONITOR_SAMPLES", 50, 1, 500)
+}
+
+/// `ATB_HTML_KEEP_SCRIPTS`：HTML 优化保留 `<script>`（调试用），默认关。
+pub(crate) fn html_keep_scripts() -> bool {
+    env_bool("ATB_HTML_KEEP_SCRIPTS", false)
+}
+
+/// `ATB_DOWNLOAD_REGISTRY_DEPTH`：每个 agent 记住的下载 id 条数，默认 8。
+pub(crate) fn download_registry_depth() -> usize {
+    env_usize_clamped("ATB_DOWNLOAD_REGISTRY_DEPTH", 8, 1, 64)
+}
+
+/// `ATB_DOWNLOAD_WAIT_LIMIT`：`download-wait` 每轮查询条数，默认 200。
+pub(crate) fn download_wait_limit() -> usize {
+    env_usize_clamped("ATB_DOWNLOAD_WAIT_LIMIT", 200, 1, 500)
+}
+
+/// `ATB_DOWNLOAD_CANCEL_ON_TIMEOUT`：`download-wait` 超时是否向浏览器发起取消，默认关。
+pub(crate) fn download_cancel_on_timeout() -> bool {
+    env_bool("ATB_DOWNLOAD_CANCEL_ON_TIMEOUT", false)
+}
+
+/// `ATB_DOWNLOAD_CANCEL_ERASE`：取消后是否擦除下载记录，默认关。
+pub(crate) fn download_cancel_erase() -> bool {
+    env_bool("ATB_DOWNLOAD_CANCEL_ERASE", false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,5 +509,44 @@ mod tests {
         assert!((1..=60_000).contains(&wait_min_interval_ms()));
         assert!((1..=64).contains(&challenge_max_iframes()));
         assert!((1..=512).contains(&(io_max_output_bytes() / (1024 * 1024))));
+    }
+
+    #[test]
+    fn consolidated_defaults_are_within_documented_ranges() {
+        // 2026-11-06 收拢轮的默认值域断言（不依赖进程环境；CI 不设这些变量）。
+        assert_eq!(max_running_jobs(), 32);
+        assert_eq!(proc_cmd_timeout_ms(), 5_000);
+        assert_eq!(launch_settle_ms(), 800);
+        assert_eq!(launch_close_wait_ms(), 3_000);
+        assert_eq!(launch_kill_wait_ms(), 8_000);
+        assert_eq!(launch_poll_ms(), 500);
+        assert!(http_no_proxy());
+        assert_eq!(force_assume_atb(), "strict");
+        assert_eq!(lock_retries(), 40);
+        assert_eq!(lock_retry_ms(), 25);
+        assert!(!no_debugger());
+        assert_eq!(browsers_snapshot_ttl_sec(), 5);
+        assert_eq!(preferred_miss_limit(), 3);
+        assert_eq!(preferred_miss_ttl_sec(), 120);
+        assert_eq!(ws_outbound_max(), 512);
+        assert_eq!(idempotency_file_max_mb(), 32);
+        assert_eq!(net_rule_max_bytes(), 2 * 1024 * 1024);
+        assert_eq!(net_rule_max_rules(), 64);
+        assert_eq!(net_max_entries(), 5000);
+        assert_eq!(console_max_entries(), 5000);
+        assert_eq!(net_log_item_chars(), 8192);
+        assert!(challenge_focus_on_need_human());
+        assert_eq!(challenge_srcdoc_min_area(), 2000.0);
+        assert_eq!(capture_max_pixels(), 80_000_000);
+        assert!(!html_keep_scripts());
+        assert_eq!(file_hosts(), "");
+        assert_eq!(monitor_samples(), 50);
+        assert_eq!(download_registry_depth(), 8);
+        assert_eq!(download_wait_limit(), 200);
+        assert!(!download_cancel_on_timeout());
+        assert!(!download_cancel_erase());
+        assert!(!require_tab());
+        assert!(!allow_relative_out());
+        assert!(browser_exe().is_none());
     }
 }

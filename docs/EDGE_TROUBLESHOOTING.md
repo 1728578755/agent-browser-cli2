@@ -3,7 +3,7 @@
 目标现象：
 
 ```text
-ATB（atb_bridge）
+Agent Browser CLI Bridge
 问题 已找到 1 个
 Service worker registration failed. Status code: 2
 ```
@@ -18,11 +18,11 @@ Service worker registration failed. Status code: 2
 `edge://extensions` 里本扩展卡片上显示的版本号，必须等于磁盘上 `manifest.json` 的版本。
 
 ```bash
-node -e "console.log(require('<你的扩展目录>/manifest.json').version)"
+node -e "console.log(require('<你的扩展目录>/manifest.json').version)"   # <你的扩展目录> 换成浏览器实际加载的目录
 ```
 
 - **两边一致** → 浏览器跑的是当前代码，继续往下排查；
-- **卡片上更旧**（例如磁盘 5.3.0、卡片 5.0.1）→ 浏览器从没重载过，`Service worker registration failed`
+- **卡片上更旧**（例如磁盘 5.4.2、卡片 5.0.1）→ 浏览器从没重载过，`Service worker registration failed`
   多半是上一次替换文件时读到了半截 `background.js`。这种情况**改代码没用**，点一次「重新加载」即可。
 
 ### 为什么会出现「半截文件」
@@ -34,9 +34,42 @@ Chrome / Edge 重新注册 Service Worker 时会重新读 `background.js`。如�
 统一用原子部署脚本，不再有这个问题：
 
 ```bash
-node scripts/deploy-extension.mjs --dry-run   # 看计划
-node scripts/deploy-extension.mjs             # 逐文件「临时文件 + rename」，写完逐字节校验
+node scripts/deploy-extension.mjs --to "<你的扩展目录>" --dry-run   # 看计划
+node scripts/deploy-extension.mjs --to "<你的扩展目录>"             # 原子替换 + 逐字节校验
 ```
+
+### 已安装位置（路径按你的机器替换）
+
+| 角色 | 目录 | 说明 |
+| --- | --- | --- |
+| Chrome / Edge | `<你的扩展目录>` | 两个浏览器可以共用同一份目录（实测 `Secure Preferences` 都指向它） |
+| 镜像 | `<镜像目录>` | 只作备份 / 打包用，浏览器**不加载**它；不要以为改了这里就会生效 |
+
+两个目录都保持同步（镜像用于打包），但判定「是否生效」只看浏览器实际加载的那个。想确认浏览器到底加载了哪一份：
+
+```bash
+node -e "const fs=require('fs');const base=process.env.LOCALAPPDATA;for(const [n,p] of [['Chrome',base+'/Google/Chrome/User Data/Default/Secure Preferences'],['Edge',base+'/Microsoft/Edge/User Data/Default/Secure Preferences']]){const j=JSON.parse(fs.readFileSync(p,'utf8'));for(const [id,v] of Object.entries(j.extensions.settings)){if(v&&v.path&&/chrome-extensions|atb/i.test(v.path))console.log(n,id,v.path)}}"
+```
+
+两个目录都要部署（镜像用于打包），否则会出现版本漂移：
+
+```bash
+node scripts/deploy-extension.mjs --to "<你的扩展目录>"
+node scripts/deploy-extension.mjs --to "<镜像目录>"
+```
+
+脚本**没有内置默认目录**（换台机器不会在错误位置静默建一套扩展），必须用 `--to` 或 `ATB_EXT_DIR` 指定。
+
+### 部署后什么时候生效（自动重载）
+
+`deploy-extension.mjs` 最后会写一个 `.atb-build.json` 指纹（整包 digest：manifest + 全部 js/html/css
+的 `rel:sha256` 排序哈希）。扩展每分钟自检一次这个文件，digest 变了就在空闲时
+`chrome.runtime.reload()`，**改 popup / options / css / manifest 也会生效**——不再需要手动动
+`background.js` 才能触发。
+
+- 想立刻生效：`chrome://extensions` → 本扩展 →「重新加载」（最快，也不依赖 daemon）；
+- 想确认到底跑的是哪版：`atb status` 看 `extension.bundled_version` 与
+  `extension.connected_versions`，两边一致才是真的换了；`stale:true` 时会附一行提示。
 
 判断是不是这一类问题的旁证：扩展页显示旧版本、`atb status` 里看不到这个浏览器（SW 没起来就不会连 daemon）、
 但用干净 profile 启动同一个目录能正常加载（`CDP Bridge installed`）。
@@ -139,10 +172,10 @@ atb doctor        # 逐项自检
 atb logs --tail 100
 ```
 
-### 扩展 5.3.0 的行为变化
+### 扩展 5.4.2 的行为变化
 
-- **open shadow DOM**：`find` / `snapshot` / `read` 现在会递归 open shadow root，返回项多出 `scope` / `host_selector` / `shadow_path` 字段。旧版扩展不返回这些字段，daemon 仍按旧形状解析，不会报错，但拿不到 shadow 内容——这才是「明明页面上有按钮却 `find` 不到」的常见原因，先确认扩展卡片是 5.3.0。
-- **exec 取消帧**：daemon 在命令超时/取消时会向扩展发 `{cmd:"cancel", execId}`。**旧 daemon 不认识这个帧也无所谓**：扩展只是不提前释放那次 CDP attach，等 idle 定时器回收即可，命令结果与错误语义都不受影响。反过来，5.3.0 扩展配旧 daemon 时也不会因为缺少 cancel 帧而失败。
+- **open shadow DOM**：`find` / `snapshot` / `read` 现在会递归 open shadow root，返回项多出 `scope` / `host_selector` / `shadow_path` 字段（这些字段 5.4.0 之前的版本就已提供）。旧版扩展不返回这些字段，daemon 仍按旧形状解析，不会报错，但拿不到 shadow 内容——这才是「明明页面上有按钮却 `find` 不到」的常见原因，先确认扩展卡片是 5.4.2。
+- **exec 取消帧**：daemon 在命令超时/取消时会向扩展发 `{cmd:"cancel", execId}`。**旧 daemon 不认识这个帧也无所谓**：扩展只是不提前释放那次 CDP attach，等 idle 定时器回收即可，命令结果与错误语义都不受影响。反过来，5.4.2 扩展配旧 daemon 时也不会因为缺少 cancel 帧而失败。
 - `extension_not_connected`：端口不一致（默认 18765）→ `set-extension-port` 或改扩展 popup 里的端口；
 - `compatibility.ok:false` 且 `issues[].kind=extension_outdated`：浏览器里跑的是旧版扩展文件，
   覆盖目录后重新加载；

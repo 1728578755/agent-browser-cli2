@@ -10,7 +10,7 @@ const BINARY_NAMES = ["atb"];
 /** 包根目录：<pkg>/npm/bin/atb.js → 上两级。 */
 const PACKAGE_DIR = path.resolve(__dirname, "..", "..");
 
-/** 平台清单唯一真相源。发布包会带上 scripts/platforms.json；缺失时退回内置表。 */
+/** 平台清单唯一真相源（PKG-17）。发布包会带上 scripts/platforms.json；缺失时退回内置表。 */
 function loadPlatforms() {
   const configPath = path.join(PACKAGE_DIR, "scripts", "platforms.json");
   try {
@@ -163,7 +163,7 @@ function findOnPath(expectedVersion) {
 
 function resolveBinary() {
   // 1) 显式指定：先校验文件存在。以前直接把 env 值交给 spawn，用户只能看到
-  //    `spawn xxx ENOENT`，不知道是自己的环境变量写错了。
+  // `spawn xxx ENOENT`，不知道是自己的环境变量写错了。
   for (const envName of ["ATB_BIN", "AGENT_BROWSER_CLI_BIN"]) {
     const value = process.env[envName];
     if (!value) continue;

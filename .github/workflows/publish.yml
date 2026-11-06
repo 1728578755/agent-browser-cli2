@@ -6,8 +6,15 @@ on:
     tags:
       - "v*"
 
+# 连发两个 tag 时不要并发发布：两条流水线会争同一批 npm 版本号与同一个 Release，
+# 后到的那个 `--clobber` 会把先发的附件覆盖掉。
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: write
+  # npm publish --provenance 用 OIDC 签署来源证明，缺这个权限会直接 403。
   id-token: write
 
 jobs:
@@ -42,6 +49,37 @@ jobs:
             exit 0
           fi
           node scripts/sync-version.mjs --check --expect "${tag}"
+
+      # / ：以下门禁以前只在 ci.yml 跑，而 ci.yml 与 publish 是并行触发的，
+      # tag 又不受分支保护约束 —— 锁文件漂移、扩展资产不同步、单测红都能照样发版。
+      # 全部前移到 npm publish 之前，失败即停。
+      - name: 扩展 JS 语法（assets/atb_bridge 全量，含 options 与 ui/）
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(find assets/atb_bridge -name '*.js' -type f | sort)
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "::error::assets/atb_bridge 下没有找到任何 .js"
+            exit 1
+          fi
+          for file in "${files[@]}"; do
+            node --check "${file}"
+          done
+          echo "已校验 ${#files[@]} 个扩展脚本"
+
+      # 的同一份检查：tag 里的主副本与 ops/ 不一致时，npm 包（prepack 会重写 ops）
+      # 与 Release 里的扩展 zip 就是两个东西，必须发版前拦住。
+      - name: 扩展资产一致性（主副本 vs ops）
+        run: node scripts/sync-extension-assets.mjs --check
+
+      # 锁文件门禁。默认模式允许「刚 bump、平台包还没上架」的临时缺 integrity；
+      # 严格模式在平台包发布之后单独跑（verify-platform-integrity）。
+      - name: 锁文件一致性（check-lock）
+        run: node scripts/check-lock.mjs
+
+      # 与 ci.yml 的 node-tests 同一条命令：发布前必须全绿。
+      - name: Node 回归测试（tests/*.test.mjs）
+        run: node --test tests/*.test.mjs
 
   platforms:
     name: Platform matrix
@@ -86,8 +124,10 @@ jobs:
         shell: bash
         run: npm install -g npm@11.5.1
 
+      # --locked：不带它时 cargo 会在 runner 上就地更新 Cargo.lock，用新解析的依赖版本
+      # 出二进制，npm 上发布的产物与仓库锁定的依赖集不一致。
       - name: Build binary
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Stage release binary
         shell: bash
@@ -107,10 +147,7 @@ jobs:
           mkdir -p dist/npm
           npm pack "npm/platform/${{ matrix.name }}" --pack-destination dist/npm
 
-      # 没有配置 NPM_TOKEN 时跳过 npm 发布，但二进制与 Release 产物照常生成：
-      # 发布凭据缺失不应该连带阻断 GitHub Release。
       - name: Publish platform package
-        if: ${{ env.NPM_TOKEN != '' }}
         shell: bash
         working-directory: npm/platform/${{ matrix.name }}
         env:
@@ -127,8 +164,9 @@ jobs:
           # 只有「确实已经发布过」才允许跳过。以前用 `npm view` 兜底：
           # 网络抖动 / 权限不足时 view 也失败，脚本却按 exit 0 收场，把真实发布失败
           # 吞成「已发布」。现在只认 npm 自己的错误码与原文。
+          # --provenance：让 npm 用 OIDC 签署来源证明，用户可追溯 tarball 出自哪次 workflow。
           set +e
-          output="$(npm publish --access public --tag "${NPM_TAG}" 2>&1)"
+          output="$(npm publish --access public --provenance --tag "${NPM_TAG}" 2>&1)"
           status=$?
           set -e
           printf '%s\n' "${output}"
@@ -156,14 +194,38 @@ jobs:
           name: npm-${{ matrix.name }}
           path: dist/npm/*.tgz
 
+  # / / ：平台包发布完成之后、主包发布之前，用 registry 上的真实哈希核对 lock。
+  # 平台包是原生二进制，npm ci 对 optionalDependency 不做内容校验 —— 这是供应链里最该
+  # 锁哈希的工件，缺 integrity 就必须在这里停住，而不是发到用户机器上。
+  verify-platform-integrity:
+    name: Verify platform integrity
+    if: ${{ !contains(github.ref_name, '-extension') }}
+    needs: publish-binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: Upgrade npm
+        run: npm install -g npm@11.5.1
+
+      # 严格门禁：lock 里缺 integrity 直接失败；--registry 再与 registry 的 dist.integrity
+      # 逐条比对（脚本内部对 404/网络抖动有重试，容忍刚 publish 的元数据延迟）。
+      # 失败时的修法：本地跑 `node scripts/fill-lock-integrity.mjs` 提交 lock 后重跑发布
+      # （平台包已存在会自动跳过）。
+      - name: 严格 integrity + registry 比对
+        run: node scripts/check-lock.mjs --strict-integrity --registry
+
   publish-main:
     name: Publish main package
     if: ${{ !contains(github.ref_name, '-extension') }}
     runs-on: ubuntu-latest
     environment: npm
-    needs: publish-binaries
     env:
       NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+    needs: [publish-binaries, verify-platform-integrity]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -178,7 +240,6 @@ jobs:
         run: npm install -g npm@11.5.1
 
       - name: Publish main package
-        if: ${{ env.NPM_TOKEN != '' }}
         shell: bash
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -192,7 +253,7 @@ jobs:
             NPM_TAG="${NPM_TAG:-latest}"
           fi
           set +e
-          output="$(npm publish --access public --tag "${NPM_TAG}" 2>&1)"
+          output="$(npm publish --access public --provenance --tag "${NPM_TAG}" 2>&1)"
           status=$?
           set -e
           printf '%s\n' "${output}"
@@ -208,7 +269,7 @@ jobs:
 
   github-release:
     name: GitHub Release
-    # ：以前只依赖 publish-binaries，且把 `skipped` 当成功 —— 版本门禁失败
+    # / ：以前只依赖 publish-binaries，且把 `skipped` 当成功 —— 版本门禁失败
     # 或 npm 主包发布失败时照样产出 Release，用户下到与 tag 不符 / npm 上不存在的版本。
     # 现在三条依赖都必须成功；扩展专用 tag（*-extension）没有 npm 包，单独走一条分支。
     needs: [version-check, publish-binaries, publish-main]
@@ -245,12 +306,8 @@ jobs:
           path: dist/npm
           merge-multiple: true
 
-      # ：Release 里的 zip 直接取自 tag 里的 assets/atb_bridge，而 npm 包的 prepack
-      # 会用主副本重写 ops/。两者可能一个旧一个新。打包前先做一次严格比对，失败即退出。
-      - name: Verify extension assets are in sync
-        shell: bash
-        run: node scripts/sync-extension-assets.mjs --check
-
+      # ：扩展资产一致性检查已前移到 `version-check`——放在这里时
+      # npm 主包已经发出去了，tag 里 ops/ 不一致只会变成「npm 有、Release 缺 zip」。
       - name: Package Chrome extension
         shell: bash
         run: |
@@ -274,6 +331,42 @@ jobs:
           [[ -f chrome-extensions.zip ]] && sha256sum chrome-extensions.zip >> SHA256SUMS
           cat SHA256SUMS
 
+      # / 0：可选 GPG 分离签名。仓库拿不到私钥是常态（fork、本地 workflow_dispatch），
+      # 所以不能硬性要求 —— 但「没签」和「签了」必须在 Release notes 里区分开，
+      # 否则用户会把「没有 .asc」当成「签名丢了」。
+      - name: Sign SHA256SUMS（未配置密钥则跳过）
+        id: sign
+        shell: bash
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GPG_PRIVATE_KEY:-}" ]; then
+            echo "未配置 GPG_PRIVATE_KEY，跳过签名（Release notes 会标注 unsigned）"
+            echo "::notice::未配置 GPG_PRIVATE_KEY，SHA256SUMS 仅提供哈希、未签名"
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          export GNUPGHOME="$(mktemp -d)"
+          chmod 700 "${GNUPGHOME}"
+          printf '%s\n' "${GPG_PRIVATE_KEY}" | gpg --batch --import
+          key_id="$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/ {print $10; exit}')"
+          if [ -z "${key_id}" ]; then
+            echo "::error::GPG_PRIVATE_KEY 导入成功但读不到指纹"
+            exit 1
+          fi
+          # --armor：Release 附件里放文本 .asc，用户肉眼能看出这是签名而不是二进制。
+          args=(--batch --yes --armor --detach-sign --local-user "${key_id}" --output dist/SHA256SUMS.asc)
+          if [ -n "${GPG_PASSPHRASE:-}" ]; then
+            printf '%s' "${GPG_PASSPHRASE}" | gpg "${args[@]}" --pinentry-mode loopback --passphrase-fd 0 dist/SHA256SUMS
+          else
+            gpg "${args[@]}" dist/SHA256SUMS
+          fi
+          gpg --verify dist/SHA256SUMS.asc dist/SHA256SUMS
+          echo "signed=true" >> "$GITHUB_OUTPUT"
+          echo "key_id=${key_id}" >> "$GITHUB_OUTPUT"
+
       - name: Create release
         shell: bash
         env:
@@ -290,6 +383,13 @@ jobs:
           extension_package="dist/chrome-extensions.zip"
           release_assets+=("${extension_package}")
           release_assets+=("dist/SHA256SUMS")
+          # 有签名才上传 .asc：没有密钥时不能放一个空文件让用户以为签名存在。
+          if [ -f dist/SHA256SUMS.asc ]; then
+            release_assets+=("dist/SHA256SUMS.asc")
+            verification_note="校验：SHA256SUMS 已用 GPG 分离签名，公钥指纹 ${{ steps.sign.outputs.key_id }}，见 SHA256SUMS.asc。"
+          else
+            verification_note="校验：只提供 SHA256SUMS 哈希，本次未做 GPG 签名（发布环境未配置 GPG_PRIVATE_KEY）。"
+          fi
           TAG_MESSAGE="$(git tag -l --format='%(contents)' "${GITHUB_REF_NAME}" | sed '/-----BEGIN PGP SIGNATURE-----/,$d' | sed '${/^$/d;}')"
           # push tag 时 GitHub 可能自动生成 draft release（body 预填 commit subject），
           # gh release create 会复用该 draft 发布，导致 --notes-file 不生效，这里先删除。
@@ -304,12 +404,17 @@ jobs:
           fi
           if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
             EXISTING_NOTES="$(gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --json body --jq '.body // ""')"
-            if [ -n "${TAG_MESSAGE}" ] && ! grep -Fq "${TAG_MESSAGE}" <<<"${EXISTING_NOTES}"; then
-              {
-                printf '%s\n' "${EXISTING_NOTES}"
-                [ -n "${EXISTING_NOTES}" ] && printf '\n'
-                printf '%s\n' "${TAG_MESSAGE}"
-              } > release-notes.md
+            # 重跑发布时也要把「签名状态」补进 notes：既有正文里已经提到 SH56SUMS 就视为已说明。
+            {
+              printf '%s\n' "${EXISTING_NOTES}"
+              if [ -n "${TAG_MESSAGE}" ] && ! grep -Fq "${TAG_MESSAGE}" <<<"${EXISTING_NOTES}"; then
+                printf '\n%s\n' "${TAG_MESSAGE}"
+              fi
+              if ! grep -Fq "SHA256SUMS" <<<"${EXISTING_NOTES}"; then
+                printf '\n%s\n' "${verification_note}"
+              fi
+            } > release-notes.md
+            if [ "$(cat release-notes.md)" != "${EXISTING_NOTES}" ]; then
               gh release edit "${GITHUB_REF_NAME}" \
                 --repo "${GITHUB_REPOSITORY}" \
                 --notes-file release-notes.md
@@ -323,6 +428,7 @@ jobs:
             else
               printf '%s\n' "${DEFAULT_NOTES}" > release-notes.md
             fi
+            printf '\n%s\n' "${verification_note}" >> release-notes.md
             release_flags=()
             if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
               release_flags+=(--prerelease)

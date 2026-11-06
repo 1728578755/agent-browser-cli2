@@ -105,7 +105,7 @@ if (window.self === window.top) flushPersistPending();
   // 早期版本每个 top frame 每 5s 无条件发一条 runtime 消息，等于把 MV3 的 Service Worker
   // 钉在常驻状态（30s 无活动才允许回收），多标签用户既费电也让 SW 生命周期失去意义。
   //
-  // 现在的行为（修订）：
+  // 现在的行为（审阅 修订）：
   //   1) 轮询与**渲染**解耦：只要角标实例还在且没被用户手动关闭，就保留一个 30s 的
   //      低频状态刷新；是否真的显示由「最近 10s 内有没有命令」决定；
   //   2) 旧实现用「当前是否可见」控制是否轮询 —— 角标因 10s 无命令而隐藏后轮询就停了，
@@ -152,7 +152,31 @@ if (window.self === window.top) flushPersistPending();
     host.id=HOST_ID;
     const root=host.attachShadow({mode:'closed'});
     const style=document.createElement('style');
-    style.textContent=':host{all:initial}#atb-badge{position:fixed;top:40%;right:0;display:flex;align-items:center;gap:10px;width:218px;height:36px;box-sizing:border-box;padding:0 8px 0 9px;color:white;border-radius:18px 0 0 18px;font-size:11px;font-weight:bold;line-height:36px;z-index:99999;cursor:grab;box-shadow:0 4px 12px rgba(0,0,0,0.22);background:#4CAF50;opacity:.72;overflow:visible;white-space:nowrap;user-select:none;transform:translateX(190px);transition:transform .18s ease,opacity .18s ease;}#atb-badge::after{content:"";position:absolute;inset:0;border-radius:18px 0 0 18px;background:#4CAF50;z-index:-1;}#atb-dot{flex:0 0 auto;width:10px;height:10px;border-radius:999px;background:white;}#atb-label{flex:0 0 auto;max-width:150px;overflow:hidden;}#atb-badge[data-expanded="1"]{opacity:.92;transform:translateX(0);}#atb-badge[data-dragging="1"]{cursor:grabbing;transition:none;}#atb-close{position:relative;flex:0 0 auto;width:20px;height:20px;border-radius:999px;line-height:18px;text-align:center;font-size:15px;font-weight:bold;background:#1f7a33;color:white;opacity:0;pointer-events:none;cursor:pointer;}#atb-badge[data-expanded="1"] #atb-close{opacity:1;pointer-events:auto;}#atb-close:hover{background:#145523;}#atb-close::after{content:"本次隐藏";position:absolute;right:0;bottom:28px;padding:4px 7px;border-radius:4px;background:#1f2937;color:white;font-size:12px;font-weight:500;line-height:16px;opacity:0;pointer-events:none;transform:translateY(4px);transition:opacity .12s ease,transform .12s ease;}#atb-close:hover::after{opacity:1;transform:translateY(0);}';
+    style.textContent = `:host{all:initial}
+#atb-badge{position:fixed;top:40%;right:0;display:flex;align-items:center;gap:8px;
+  width:200px;height:32px;box-sizing:border-box;padding:0 6px 0 10px;
+  color:#e8eef7;border-radius:16px 0 0 16px;
+  font:600 11.5px/32px "Segoe UI",system-ui,-apple-system,"PingFang SC","Microsoft YaHei UI",sans-serif;
+  letter-spacing:.01em;z-index:99999;cursor:grab;white-space:nowrap;user-select:none;
+  background:rgba(18,24,33,.94);border:1px solid rgba(255,255,255,.10);border-right:none;
+  box-shadow:0 8px 22px rgba(8,12,20,.30);opacity:.85;overflow:visible;
+  transform:translateX(172px);transition:transform .18s cubic-bezier(.2,.8,.2,1),opacity .18s ease,box-shadow .18s ease}
+#atb-dot{flex:0 0 auto;width:7px;height:7px;border-radius:999px;background:#4ade80;box-shadow:0 0 0 3px rgba(74,222,128,.18)}
+#atb-badge[data-connected="0"] #atb-dot{background:#f59e0b;box-shadow:0 0 0 3px rgba(245,158,11,.18)}
+#atb-label{flex:1 1 auto;min-width:0;max-width:132px;overflow:hidden;text-overflow:ellipsis;font-size:11.5px;line-height:32px}
+#atb-badge[data-expanded="1"]{opacity:.98;transform:translateX(0);box-shadow:0 10px 26px rgba(8,12,20,.38)}
+#atb-badge[data-dragging="1"]{cursor:grabbing;transition:none}
+#atb-close{position:relative;flex:0 0 auto;display:flex;align-items:center;justify-content:center;
+  width:18px;height:18px;border-radius:999px;background:rgba(255,255,255,.10);color:#cbd5e1;
+  font:600 12px/18px "Segoe UI",system-ui,sans-serif;text-align:center;opacity:0;pointer-events:none;cursor:pointer;
+  transition:background .12s ease,color .12s ease}
+#atb-badge[data-expanded="1"] #atb-close{opacity:1;pointer-events:auto}
+#atb-close:hover{background:rgba(248,113,113,.22);color:#fecaca}
+#atb-close::after{content:"本次隐藏";position:absolute;right:0;bottom:26px;padding:4px 8px;border-radius:6px;
+  background:#0b1119;border:1px solid rgba(255,255,255,.10);color:#e8eef7;
+  font:500 11px/16px "Segoe UI",system-ui,"Microsoft YaHei UI",sans-serif;white-space:nowrap;
+  opacity:0;pointer-events:none;transform:translateY(4px);transition:opacity .12s ease,transform .12s ease}
+#atb-close:hover::after{opacity:1;transform:translateY(0)}`;
     root.appendChild(style);
     const d=document.createElement('div');
     d.id='atb-badge';
@@ -160,7 +184,7 @@ if (window.self === window.top) flushPersistPending();
     dot.id='atb-dot';
     const label=document.createElement('span');
     label.id='atb-label';
-    label.textContent='agent_browser_cli: 已连接';
+    label.textContent='ATB 已连接';
     const close=document.createElement('span');
     close.id='atb-close';
     close.textContent='×';
@@ -190,7 +214,7 @@ if (window.self === window.top) flushPersistPending();
       if (commandAt > lastSeenCommandAt) lastSeenCommandAt = commandAt;
       const activeRecently = lastSeenCommandAt > 0 && Date.now() - lastSeenCommandAt <= 10000;
       d.style.display = connected && !dismissed && activeRecently ? 'flex' : 'none';
-      label.textContent = 'agent_browser_cli: 已连接';
+      label.textContent = connected ? 'ATB 已连接' : 'ATB 未连接';
       d.dataset.connected = connected ? '1' : '0';
       d.dataset.detail = detail || '';
       // 被手动关闭后不再重开轮询（setInterval 在 close 事件里已停掉）。

@@ -17,6 +17,7 @@ pub(crate) struct BrowserTarget {
 ///
 /// `force_refresh=true` 时跳过快照 TTL 缓存，强制向扩展拉一次（旧行为的逃生口）。
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct BrowsersQuery {
     #[serde(default, alias = "forceRefresh")]
     pub(crate) force_refresh: bool,
@@ -82,12 +83,7 @@ pub(crate) async fn browsers(
     // 只读档等待，避免浏览器真的没开时白等 5 秒。
     wait_for_sessions(&state, WAIT_SESSIONS_READ).await;
     // 快照按 TTL 复用，不再每次强制拉取；`force_refresh` 可绕过。
-    let ttl = Duration::from_secs(crate::settings::env_u64_clamped(
-        "ATB_BROWSERS_SNAPSHOT_TTL_SEC",
-        5,
-        0,
-        300,
-    ));
+    let ttl = Duration::from_secs(crate::settings::browsers_snapshot_ttl_sec());
     let now = Instant::now();
     let cache_fresh = {
         let last = SNAPSHOT_REFRESHED_AT
@@ -177,10 +173,11 @@ pub(crate) async fn browsers(
 /// 浏览器必须由 daemon 拉起：daemon 是常驻进程，浏览器作为它的子进程不会随
 /// 「一条命令结束」被回收（很多运行环境会把命令的整棵进程树一起收掉）。
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct LaunchRequest {
     #[serde(default)]
     pub(crate) browser: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "userDataDir")]
     pub(crate) user_data_dir: Option<String>,
     #[serde(default)]
     pub(crate) restart: bool,

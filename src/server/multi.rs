@@ -173,7 +173,7 @@ pub(crate) async fn multi_value(state: &AppState, req: MultiRequest) -> Value {
                 );
             }
             // 拿不到许可不能「无许可继续执行」：那会让 concurrency 形同虚设，
-            // 几十个目标一起压浏览器（的同类点，open/run 已修，这里补齐）。
+            // 几十个目标一起压浏览器（同类点，open/run 已修，这里补齐）。
             let _permit = match permits.acquire_owned().await {
                 Ok(permit) => permit,
                 Err(err) => {
@@ -248,6 +248,9 @@ pub(crate) async fn multi_value(state: &AppState, req: MultiRequest) -> Value {
                         "ok": false,
                         "error": format!("任务异常退出：{err}"),
                         "error_code": "task_panicked",
+                        // 与 `atb schema` 的 error_codes 声明对齐（cli 域）：复核后可重试。
+                        "retryable": true,
+                        "hint": hint_for_error("task_panicked"),
                     }));
                 }
                 continue;
@@ -369,7 +372,11 @@ pub(crate) fn classify_error(message: &str) -> &'static str {
 /// 常见失败的「下一步」提示。没有把握时返回 None，不硬编一条空话。
 pub(crate) fn hint_for_error(message: &str) -> Option<&'static str> {
     let lower = message.to_lowercase();
-    if lower.contains("未连接") || lower.contains("not connected") {
+    // panic 归 `task_panicked` 后必须有自己的 hint（§12.2：每个 error_code
+    // 都要能告诉调用方下一步）。文案必须与「超时」区分开：panic 不是"再等等就好"。
+    if lower.contains("task_panicked") || lower.contains("任务异常退出") {
+        Some("这是 atb 的 bug（任务 panic）：附上 daemon 日志反馈；先用 tabs 复核目标状态，不要立刻整批重试")
+    } else if lower.contains("未连接") || lower.contains("not connected") {
         Some("标签页可能已关闭或扩展刚断连；用 `tabs` 复核目标，再用 --tab 重新指定")
     } else if lower.contains("超时") || lower.contains("timed out") {
         Some("页面可能还在加载；加 --timeout，或用 `wait --selector` 先等元素出现")

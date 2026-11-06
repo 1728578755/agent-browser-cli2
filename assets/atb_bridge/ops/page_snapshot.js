@@ -14,12 +14,22 @@
 // 静默点错元素且返回 ok:true。这里逐层验唯一，不唯一就继续往上加祖先。
 // 唯一性只在**元素所属的 root** 内判定（shadow 里的同名路径在主文档可能重复）。
 //
-// C-04 已知边界（协议级限制，本轮不修）：CDP 引擎只给可操作角色发 `@e`
+// 已知边界（协议级限制，本轮不修）：CDP 引擎只给可操作角色发 `@e`
 // （ref_scheme=operable-only），本脚本给所有「有名字」的结构节点发 `@e`
 // （ref_scheme=all-named），非可操作节点（heading / img / label / generic 角色等）
 // 也会占号。两个引擎的 `@eN` **不保证指向同一元素**，跨模式复用 `@e` 前必须重新
 // snapshot；daemon 用回包里的 ref_scheme 区分口径。
 
+// ---- 入口挂载----
+// 扩展侧每次调用前都重新注入本文件（background.js 的 handlePageOp），同一 world
+// 里会执行多次。classic script 顶层的 const/let 会跨脚本持久，第二次注入直接
+// 「Identifier ... has already been declared」早期错误 → 整个 pageOp reject
+// （snapshot 第一次可用、第二次起必坏），直到页面导航才恢复。
+//
+// 因此整个文件包在 IIFE 里（与 page_net.js 同一套），入口用 defineProperty 挂：
+// 不可枚举（Object.keys 看不到）+ 可配置（stealth scrub 的 delete 能成功）。
+// 名字不变：daemon 用裸标识符 `return __abcSnapshot({...})` 解析全局属性。
+;(function () {
 const __ABC_SNAP_SHADOW_MAX_ROOTS = 200;
 const __ABC_SNAP_SHADOW_MAX_DEPTH = 8;
 
@@ -150,13 +160,18 @@ function __abcSnapSecretField(el) {
   return /current-password|new-password|cc-number|cc-csc|one-time-code/.test(autocomplete);
 }
 
-/// 派生文本掩码：与 page_find.js 的 __abcMaskDerived 同语义、不同名。
-/// 快照的 name 是**无障碍名**（可能来自 placeholder / label 正文），
-/// secret 字段上它常常就是半个明文（"请输入密码"、"卡号后四位"），必须一起掩码。
+/// 派生文本掩码（收口）：口径与 page_find.js 的 __abcMaskDerived
+/// **逐字对齐**，两份文件语义相同但各留一份、各叫各的名字（见 page_action.js
+/// 头部的命名约定）。快照的 name 是**无障碍名**（可能来自 placeholder / label
+/// 正文），secret 字段上它常常就是半个明文（"请输入密码"、"卡号后四位"），必须一起掩码。
+///
+/// 空值统一返回 null 而不是 ''：调用方据此区分「字段没写」与「写了但被掩码」，
+/// 这也是 find 侧的口径（`raw || null` / `raw ? '•••' : null`）。
+/// 只掩码**派生文本**，不碰 type/name 这类结构标识 —— agent 靠它们定位字段。
 function __abcSnapMaskDerived(el, value) {
   const raw = value === undefined || value === null ? '' : String(value);
-  if (!__abcSnapSecretField(el)) return raw;
-  return raw ? '•••' : raw;
+  if (!__abcSnapSecretField(el)) return raw || null;
+  return raw ? '•••' : null;
 }
 
 function __abcSnapRole(el) {
@@ -227,14 +242,14 @@ function __abcSnapshot(opts) {
   const maxItems = Math.max(1, Math.min(Number(opts.limit) || 400, 1000));
   // `offset`：跳过前 N 个可操作元素，从第 N+1 个开始返回（0 基，与 CLI 的 --offset 同义）。
   // 旧实现完全忽略 offset、永远从文档开头取 limit 条：daemon 侧只能本地切片，
-  // offset≥1000 时页面只给前 1000 条，切完一条不剩（P3 深分页）。
+  // offset≥1000 时页面只给前 1000 条，切完一条不剩（深分页）。
   const offset = Math.max(0, Math.floor(Number(opts.offset) || 0));
   const skipGeneric = opts.skipGeneric !== false;
   const interactiveOnly = opts.interactiveOnly === true;
   const shadowMode = __abcSnapShadowMode(opts);
   const shadow = __abcSnapShadowRoots(shadowMode);
   // XML / SVG 文档没有 body：旧实现拿到空列表后照样返回 ok:true + 0 条，
-  // 调用方于是以为「页面上没有可操作元素」，实际是这份脚本根本没看到内容（P3）。
+  // 调用方于是以为「页面上没有可操作元素」，实际是这份脚本根本没看到内容。
   // 结构不可用必须明确报错，而不是用一个空成功掩盖。
   if (!document.body) {
     return {
@@ -244,14 +259,14 @@ function __abcSnapshot(opts) {
       url: location.href,
       title: document.title,
       mode: 'js',
-      // C-04：JS 侧编号口径，见文件头「已知边界」。
+      // JS 侧编号口径，见文件头「已知边界」。
       ref_scheme: 'all-named',
       total: 0,
       truncated: false,
       items: []
     };
   }
-  // C-04：与 Rust `is_operable_role` 对齐的 18 个角色（此前只有 11 个，
+  // 与 Rust `is_operable_role` 对齐的 18 个角色（此前只有 11 个，
   // interactiveOnly 会漏掉 listbox / menuitem* / option / spinbutton / treeitem）。
   const OPERABLE = new Set([
     'button', 'link', 'textbox', 'searchbox', 'checkbox', 'radio', 'combobox',
@@ -337,7 +352,7 @@ function __abcSnapshot(opts) {
     url: location.href,
     title: document.title,
     mode: 'js',
-    // C-04：与 CDP 引擎（operable-only）区分编号口径。
+    // 与 CDP 引擎（operable-only）区分编号口径。
     ref_scheme: 'all-named',
     // 扫描覆盖范围：iframe 内容扫不到，shadow 的 open/closed 也要说清。
     scope: shadow.roots.length > 0 ? 'main-frame+shadow' : 'main-frame-only',
@@ -348,7 +363,7 @@ function __abcSnapshot(opts) {
     // 只有真的见到 open shadow root 才提示「可能有 closed root」：页面完全不用
     // shadow DOM 时无条件置 true，会让每一份 js 快照都被判成「覆盖不完整」。
     shadow_closed_unreachable: shadowMode === 'auto' && shadow.roots.length > 0,
-    // 显式回传分页窗口：daemon 侧据此确认「这一批的起点」而不是靠猜（P3）。
+    // 显式回传分页窗口：daemon 侧据此确认「这一批的起点」而不是靠猜。
     offset: offset,
     limit: maxItems,
     returned: items.length,
@@ -367,3 +382,22 @@ function __abcSnapshot(opts) {
     items
   };
 }
+
+// 实现标记（与 page_net / page_challenge 同一套）：给将来放开 world 留护栏。
+try {
+  Object.defineProperty(__abcSnapshot, '__abcOwn', {
+    value: true, enumerable: false, configurable: true
+  });
+} catch (_) {}
+
+try {
+  Object.defineProperty(window, '__abcSnapshot', {
+    value: __abcSnapshot,
+    writable: true,
+    enumerable: false,
+    configurable: true
+  });
+} catch (_) {
+  try { window.__abcSnapshot = __abcSnapshot; } catch (_) {}
+}
+})();

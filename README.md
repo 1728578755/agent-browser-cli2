@@ -10,7 +10,7 @@
   <a href="https://github.com/1728578755/atb-cli"><img src="https://img.shields.io/badge/CLI-atb-2ea44f" alt="CLI atb"></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-green" alt="License MIT"></a>
   <a href="https://github.com/1728578755/atb-cli"><img src="https://img.shields.io/badge/sys-win%2Fmac%2Flinux-0078D6?labelColor=0078D6&color=C0C0C0" alt="sys win/mac/linux"></a>
-  <a href="https://github.com/1728578755/atb-cli/releases"><img src="https://img.shields.io/badge/release-v0.7.3-orange" alt="release v0.7.3"></a>
+  <a href="https://github.com/1728578755/atb-cli/releases"><img src="https://img.shields.io/badge/release-v0.7.4-orange" alt="release v0.7.4"></a>
   <a href="https://github.com/1728578755/atb-cli/pulls"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen" alt="PRs welcome"></a>
 </p>
 
@@ -104,7 +104,8 @@ cargo build --release
 1. 从 [最新 Release](https://github.com/1728578755/atb-cli/releases/latest) 下载 `chrome-extensions.zip`，解压到一个固定目录（zip 根目录就是扩展文件，`manifest.json` 直接在该目录里），或直接用仓库里的 `assets/atb_bridge`。
 2. 打开 `chrome://extensions`（Edge 为 `edge://extensions`），开启开发者模式，点「加载已解压的扩展程序」，选中直接含 `manifest.json` 的那一层目录。
 3. 浏览器里至少留一个正常网页标签页，不要只停在 `about:blank` 或 `chrome://`。
-4. **本版本需要扩展 5.3.0**。覆盖扩展目录后，daemon 在下次握手时会让扩展自动重载；daemon 未运行就到扩展管理页手动点「重新加载」——只覆盖文件不重载，页面里跑的还是旧代码。
+4. **本版本需要扩展 5.4.2**。覆盖扩展目录后，daemon 在下次握手时会让扩展自动重载；daemon 未运行就到扩展管理页手动点「重新加载」——只覆盖文件不重载，页面里跑的还是旧代码。
+5. 点工具栏的 ATB 图标打开弹窗：顶部是连接状态，下面分「状态 / 数据 / 设置」。右上角齿轮进入**管理页面**（也可从 `chrome://extensions` → 详情 → 扩展程序选项 打开），可改端口、token、信任档位、主题、弹窗宽度与间距，并查看 Cookie、心跳与自检结果。
 
 ### 验证
 
@@ -134,7 +135,9 @@ WSL 需 `WSL 2.0.0+`，建议 Windows 11 22H2+ 并在 `.wslconfig` 开 `networki
 
 ### 扩展桥
 
-扩展以 WebSocket 连到 `127.0.0.1:18765`，端口来自 `~/.atb/config.json` 的 `extension_port`。daemon 下发命令，扩展在标签页里执行后回传 JSON。扩展重载或浏览器重启会让该浏览器名下的标签 id 全部失效，此时返回 `session_gone`，重新 `open` 或先 `tabs` 取新列表。
+扩展以 WebSocket 连到 `127.0.0.1:18765`，端口来自 `~/.atb/config.json` 的 `extension_port`。daemon 下发命令，扩展在标签页里执行后回传 JSON。
+
+`status` / `tabs` / `browsers` 里的 `browser_label` 带品牌与完整版本（如 `Chrome 156.0.8078.79 · Windows · #cac3`），多浏览器并行时可直接区分是哪一个、什么版本。扩展重载或浏览器重启会让该浏览器名下的标签 id 全部失效，此时返回 `session_gone`，重新 `open` 或先 `tabs` 取新列表。
 
 ### 智能体身份
 
@@ -146,9 +149,9 @@ WSL 需 `WSL 2.0.0+`，建议 Windows 11 22H2+ 并在 `.wslconfig` 开 `networki
 
 ### 协议
 
-三个版本必须配套：CLI ↔ daemon 的 API 协议（当前 **5**）、扩展消息协议（当前 **4**）、扩展文件版本（当前 **5.3.0**）。`atb status` 的 `compatibility` 字段会同时给出期望值与实际值，不配套时带 `fixes[]`。
+三个版本必须配套：CLI ↔ daemon 的 API 协议（当前 **5**）、扩展消息协议（当前 **4**）、扩展文件版本（当前 **5.4.2**）。`atb status` 的 `compatibility` 字段会同时给出期望值与实际值，不配套时带 `fixes[]`。
 
-### 0.7.2 / 扩展 5.3.0 的新增能力
+### 0.7.4 / 扩展 5.4.2 的新增能力
 
 | 能力 | 说明 |
 | --- | --- |
@@ -162,6 +165,9 @@ WSL 需 `WSL 2.0.0+`，建议 Windows 11 22H2+ 并在 `.wslconfig` 开 `networki
 | `tabs --limit 0` | 表示不截断；`tabs_count` 仍是原始总数 |
 | `logs` | 输出 JSON：`{ok, lines[], path, truncated}` |
 | WS 信任档位 | `ATB_WS_TRUST_MODE=compat\|whitelist\|token\|both`，默认 `compat`；共用机器建议 `both` |
+| WS 双向鉴权 | 配置 `ws-trust.json` 的 token 后，daemon 在握手时下发 `ws_hello`（nonce + HMAC-SHA256 proof），扩展验过才发 `ext_ready`；没配 token 时行为不变 |
+| 结果语义收紧 | `read` / `find` 的页面 `ok:false` 上浮为失败；`--world` 非法值退出 2；`--dry-run --async` 只出计划，不建 job |
+| 扩展界面 | popup 分「状态 / 数据 / 设置」，右上角进入管理页面：主题（跟随系统 / 浅色 / 深色）、弹窗宽度（340 / 420 / 560）、间距、角标开关、token 与信任档位、Cookie 与诊断；设置存在 `storage.local`，两个入口实时同步 |
 
 ## 常用工作流
 
@@ -240,7 +246,7 @@ atb challenge click --at 320,410             # 智能体自己点，不需要人
 atb challenge focus                          # 只有图片/短信等必须人做的验证才转人工
 ```
 
-`open` 与 `challenge solve` 不是干等：它们会定位挑战组件、用带轨迹的可信鼠标事件点击，再等 token 或跳转。求解失败时，智能体可以用 `widget` + `click --at` 自己兜底；`challenge wait` 才是纯等待，`focus` 是最后的人工通道。不保证通过，也不绕过访问控制。细节见 [docs/ANTI_DETECTION_AND_CHALLENGE.md](./docs/ANTI_DETECTION_AND_CHALLENGE.md)。
+`open` 与 `challenge solve` 不是干等：它们会定位挑战组件、用带轨迹的可信鼠标事件点击，再等 token 或跳转。求解失败时，智能体可以用 `widget` + `click --at` 自己兜底；`challenge wait` 才是纯等待，`focus` 是最后的人工通道。细节见 [docs/ANTI_DETECTION_AND_CHALLENGE.md](./docs/ANTI_DETECTION_AND_CHALLENGE.md)。
 
 ## 命令速查
 
@@ -305,14 +311,14 @@ atb logs --tail 100
 
 | 项 | 值 |
 | --- | --- |
-| CLI / daemon | `0.7.3` |
+| CLI / daemon | `0.7.4` |
 | CLI ↔ daemon API 协议 | `5` |
 | 扩展消息协议 | `4` |
-| 扩展文件版本 | `5.3.0` |
+| 扩展文件版本 | `5.4.2` |
 | 最低 Chrome | `120` |
 
-- 当前版本：`0.7.3`
-- 配套扩展：`5.3.0`（显示名 `ATB`）
+- 当前版本：`0.7.4`
+- 配套扩展：`5.4.2`（显示名 `ATB`）
 
 ```bash
 atb status
@@ -477,12 +483,12 @@ atb install-skill                # 主目录 ~/.agents/skills/atb；五个 Agent
 ## 安全与隐私
 
 - CLI、daemon、扩展之间的通信都在 `127.0.0.1`；无遥测、无远程代码、无广告 SDK。你操作的网页仍会按站点自身逻辑联网。
-- `trust-extension` 是单向的：只约束「谁能连 daemon」，不校验「扩展连的是不是真 daemon」。
+- `trust-extension` 配了 token 就是双向的：daemon 在 WS upgrade 后立刻下发 `ws_hello`（nonce + HMAC proof），扩展验过才发 `ext_ready`；没配 token 时（默认 `compat`）扩展无法验证对端身份。
 - daemon 在没有扩展连接且空闲 300 秒后退出；只 `atb stop` 会释放 18765 而扩展仍会重连，要收口就同时禁用扩展或关闭浏览器。
 - 扩展声明的权限：`cookies`、`tabs`、`tabGroups`、`activeTab`、`debugger`、`scripting`、`alarms`、`storage`、`declarativeNetRequest`、`webNavigation`、`downloads`（完整列表以 `assets/atb_bridge/manifest.json` 为准）。页面数据只在你或 CLI 主动下命令时读取；`blockingExtensions` 只回报挡路扩展的 id / 来源，不再反查扩展名。
-- WS 信任默认是 `compat`：任何本机进程都能连 18765。共用机器请配白名单 + token 并把 `ATB_WS_TRUST_MODE` 设为 `both` 再 `atb restart`；只配置不切档不会生效。`atb status` 的 `security.warning` 会提示当前档位。
+- WS 信任默认是 `compat`：未配 token 时任何本机进程都能连 18765。在 `ws-trust.json` 配上 token 后，握手即双向鉴权（`ws_hello` + HMAC proof），不依赖切档；`ATB_WS_TRUST_MODE` 的 `whitelist` / `token` / `both` 另控制「谁能连」，需显式切档才生效。共用机器请配白名单 + token 并按需设为 `both` 再 `atb restart`。`atb status` 的 `security.warning` 会提示当前档位。
 - 幂等记录默认 `ATB_IDEMPOTENCY_PERSIST=redacted`，只存 key / scope / 时间 / 状态，不存响应体；`daemon.log` 为 0600、目录 0700，`ws-trust.json` 与 `api-token` 同等收紧。
-- `challenge` 会主动与页面上的验证组件交互（点击并等待），但不保证通过；图片判读、短信/邮箱验证仍需人工。
+- `challenge` 会主动与页面上的验证组件交互（点击并等待）。
 
 报告漏洞见 [SECURITY.md](./SECURITY.md)，本地数据清单与删除方式见 [PRIVACY.md](./PRIVACY.md)。两者都只承诺代码能保证的事，其余写作「边界」。
 
@@ -490,14 +496,13 @@ atb install-skill                # 主目录 ~/.agents/skills/atb；五个 Agent
 
 支持：macOS arm64 / x64、Linux glibc x64 / arm64、Windows x64、WSL 2（用 Linux 包）、Chrome 与 Edge 120 及以上。
 
-明确做不到的事：
+明确的事：
 
-- 不提供 Windows ARM64（`win32-arm64`）与 Alpine / musl 预编译包，需要自编译。
 - 调试横幅是 Chrome 自己的 UI，运行时去不掉；唯一开关是启动参数，只能通过 `atb launch --restart` 重开浏览器生效。
 - 不接管 Firefox / Safari，只支持 Chromium 系浏览器加扩展。
-- 不伪装指纹：UA、canvas、WebGL、硬件参数保持浏览器原样，`stealth` 只清本工具自己写进页面的东西。
-- 不绕过验证码与访问控制；能自动处理的是 JS 挑战和可点击的 Turnstile，图片点选与短信验证仍需人工。
-- 扩展桥断开时无法操作任何标签页，这是设计而非缺陷。
+- 指纹伪装（改 UA / canvas / WebGL / 硬件值）尚未实现，列入未来工作；stealth 当前只清除本工具写入页面的内容。
+- 能自动处理的是 JS 挑战和可点击的 Turnstile；图片点选、滑块、短信/邮箱验证尚未实现，列入未来工作。
+- 扩展桥断开时无法操作任何标签页。
 
 ## 文档地图
 

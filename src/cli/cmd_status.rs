@@ -80,11 +80,11 @@ fn unhealthy_value(
 
 pub(crate) fn status_value() -> Result<Value> {
     let (configured, configured_error) = configured_extension_port();
-    let value = match request("GET", "/health", None, HEALTH_PROBE_TIMEOUT) {
+    let mut value = match request("GET", "/health", None, HEALTH_PROBE_TIMEOUT) {
         Ok(value) => enrich_status(value),
         Err(err) if is_server_alive() => {
             // 端口在监听却拿不到 /health：三种成因的下一步完全不同，不能一律归因 token
-            // （的 token 归因对「401/403」成立，对「没答完」是误诊）。
+            // （token 归因对「401/403」成立，对「没答完」是误诊）。
             match health_failure_code(&err) {
                 Some("health_timeout") => unhealthy_value(
                     "health_timeout",
@@ -127,7 +127,91 @@ pub(crate) fn status_value() -> Result<Value> {
             configured_error,
         ),
     };
+    // WS 鉴权现状（daemon 的 ws_security 优先，缺失时读本地配置）。
+    // 放在最后统一挂载：healthy / unhealthy 两条路径都能看到同一块结论。
+    let security = security_value(value.get("ws_security"));
+    value["security"] = security;
     Ok(value)
+}
+
+/// 可观测性：WS 鉴权现状（只增字段，不改任何信任判定逻辑）。
+///
+/// 优先用 daemon `/health` 的 `ws_security`（daemon 读的是同一份 `ws-trust.json`，
+/// 还知道配置是否损坏）；daemon 没跑时退回**只读**本地文件 + `ATB_WS_TRUST_MODE`，
+/// 让「daemon 都没起来」时也能回答「我到底有没有开鉴权」。
+fn security_value(daemon_block: Option<&Value>) -> Value {
+    let local = load_local_ws_trust();
+    // 配置路径只做展示：定位「到底读的哪份白名单」，不参与任何判定。
+    let config_path = ws_trust_path().ok().map(|path| path.display().to_string());
+    let mode = daemon_block
+        .and_then(|block| block.get("mode"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(crate::settings::ws_trust_mode);
+    let token_configured = daemon_block
+        .and_then(|block| block.get("token_required"))
+        .and_then(Value::as_bool)
+        .or_else(|| local.as_ref().ok().map(local_token_configured))
+        .unwrap_or(false);
+    let extension_ids = daemon_block
+        .and_then(|block| block.get("trusted_ids"))
+        .and_then(Value::as_u64)
+        .map(|count| count as usize)
+        .or_else(|| local.as_ref().ok().map(local_extension_ids))
+        .unwrap_or(0);
+    // 配置损坏时 daemon 会把原因写进 trust_config_error；daemon 不在时用本地读取错误代替。
+    let config_error = daemon_block
+        .and_then(|block| block.get("trust_config_error"))
+        .filter(|value| !value.is_null())
+        .cloned()
+        .or_else(|| local.as_ref().err().map(|err| json!(err)));
+
+    let mut block = json!({
+        "ws_trust_mode": mode,
+        "token_configured": token_configured,
+        "extension_ids": extension_ids,
+        // 双向鉴权：daemon 在 WS 握手下发 ws_hello proof 的前提就是配了 token。
+        "mutual_auth": if token_configured { "on" } else { "off" },
+        // daemon = 结论来自 /health 的 ws_security（含配置损坏判定）；local = 只读了文件。
+        "source": if daemon_block.is_some() { "daemon" } else { "local" },
+        "config_path": config_path,
+    });
+    if let Some(err) = config_error {
+        block["config_error"] = err;
+    } else if mode == "compat" && !token_configured {
+        block["warning"] = json!(
+            "当前为兼容档且没有握手 token：任何本机进程都可能连入扩展端口/冒充 daemon；\
+             建议 atb trust-extension <扩展ID> --token <随机值>，并在扩展选项页填入同一 token"
+        );
+    }
+    block
+}
+
+/// 只读 `ws-trust.json`：缺失或空文件按「未配置」处理，解析失败按错误上抛（不改文件）。
+fn load_local_ws_trust() -> std::result::Result<Value, String> {
+    let path = ws_trust_path().map_err(|err| err.to_string())?;
+    match fs::read_to_string(&path) {
+        Ok(text) if text.trim().is_empty() => Ok(json!({})),
+        Ok(text) => serde_json::from_str(&text)
+            .map_err(|err| format!("{} 不是合法 JSON: {err}", path.display())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(json!({})),
+        Err(err) => Err(format!("读取 {} 失败: {err}", path.display())),
+    }
+}
+
+fn local_token_configured(value: &Value) -> bool {
+    value
+        .get("token")
+        .and_then(Value::as_str)
+        .is_some_and(|token| !token.trim().is_empty())
+}
+
+fn local_extension_ids(value: &Value) -> usize {
+    value
+        .get("extension_ids")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0)
 }
 
 pub(crate) fn enrich_status(mut value: Value) -> Value {
@@ -249,6 +333,8 @@ pub(crate) fn enrich_status(mut value: Value) -> Value {
             value["warning"] = hint;
         }
     }
+    // 的 `security` 块由 `status_value` 统一挂载（healthy / unhealthy 两条路径
+    // 都要有），这里不再重复写，避免两个实现互相覆盖。
     value
 }
 
@@ -471,6 +557,41 @@ pub(crate) fn doctor_value() -> Result<Value> {
         "hint": "文件网址访问是可选能力；关闭时不影响普通 http/https 页面控制"
     }));
 
+    // WS 鉴权档位的可观测性 + 加固建议。
+    // `ok` 恒 true：这是「可以更安全」的建议，不是故障，不能把 doctor 变成非 0。
+    let security = security_value(health.as_ref().and_then(|value| value.get("ws_security")));
+    let insecure = security
+        .get("ws_trust_mode")
+        .and_then(Value::as_str)
+        .map(|mode| mode == "compat")
+        .unwrap_or(false)
+        && security
+            .get("token_configured")
+            .and_then(Value::as_bool)
+            .map(|configured| !configured)
+            .unwrap_or(true);
+    checks.push(json!({
+        "name": "ws_trust",
+        "ok": true,
+        "optional": true,
+        "status": if insecure { "warn" } else { "ok" },
+        "ws_trust_mode": security.get("ws_trust_mode").cloned().unwrap_or(Value::Null),
+        "token_configured": security.get("token_configured").cloned().unwrap_or(Value::Null),
+        "extension_ids": security.get("extension_ids").cloned().unwrap_or(Value::Null),
+        "mutual_auth": security.get("mutual_auth").cloned().unwrap_or(Value::Null),
+        // fix 只给命令模板，不自动执行：token 必须在扩展选项页里手工填同一个值。
+        "fix": if insecure {
+            json!("atb trust-extension <扩展ID> --token <随机值>")
+        } else {
+            Value::Null
+        },
+        "hint": if insecure {
+            json!("当前为兼容档且没有握手 token：本机任意进程都可能占用插件端口冒充 daemon/扩展，读到标签页数据。建议执行 fix 里的命令切到 token 档（需在扩展选项页填同一 token）")
+        } else {
+            Value::Null
+        }
+    }));
+
     let ok = checks.iter().all(|c| {
         c.get("optional").and_then(Value::as_bool).unwrap_or(false)
             || c.get("ok").and_then(Value::as_bool).unwrap_or(false)
@@ -599,8 +720,8 @@ fn find_port_pids(port: u16) -> Vec<u32> {
 /// 与 `install-skill` 的解析口径一致：ATB_PACKAGE_DIR → exe 祖先目录 → cwd。
 fn resolve_extension_source_dir() -> Option<PathBuf> {
     let mut candidates = Vec::new();
-    if let Some(package_dir) = config::env_compat("PACKAGE_DIR") {
-        candidates.push(PathBuf::from(package_dir).join("assets/atb_bridge"));
+    if let Some(package_dir) = crate::settings::package_dir() {
+        candidates.push(package_dir.join("assets/atb_bridge"));
     }
     if let Ok(exe) = env::current_exe() {
         for ancestor in exe.ancestors().take(6) {

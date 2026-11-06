@@ -249,7 +249,7 @@ test('入口隐藏：__abcStealth 不可枚举、可删除，删了也不影响�
 
 test('eraseSelfSoon：定时器到期后入口真的从 window 消失', async () => {
   // 这条锁的是**行为**而不是形状，别当冗余删掉：用例 2 只断言描述符（configurable
-  // 为 true），而顶层 function 声明那条路径上描述符看着也对、delete 却被 V8 的
+  // 为 true），而顶层 function 声明那条路径上描述符看着也对、delete 却被 的
   // DONT_DELETE 挡掉。把入口的 configurable 改回 false 时，这条会红在
   // 「eraseSelfSoon 没真的删掉入口」，用例 2 只能红在描述符断言上——两者缺一不可。
   const env = makeEnv();

@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ATB 管理页面</title>
+<link rel="stylesheet" href="ui/tokens.css">
+<link rel="stylesheet" href="ui/base.css">
+<link rel="stylesheet" href="options.css">
+<script src="ui/theme-boot.js"></script>
+</head>
+<body class="options">
+<div class="shell">
+  <aside class="sidebar">
+    <div class="side-brand">
+      <img src="icons/atb-48.png" width="34" height="34" alt="">
+      <div class="brand-text">
+        <div class="brand-title">ATB</div>
+        <div class="brand-sub">浏览器桥接 · 管理</div>
+      </div>
+    </div>
+
+    <nav class="nav" aria-label="设置分区">
+      <button class="nav-item" type="button" data-section="overview" aria-current="page">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="3.5" width="7" height="7" rx="1.6"></rect><rect x="13.5" y="3.5" width="7" height="7" rx="1.6"></rect><rect x="3.5" y="13.5" width="7" height="7" rx="1.6"></rect><rect x="13.5" y="13.5" width="7" height="7" rx="1.6"></rect></svg>
+        <span>概览</span>
+      </button>
+      <button class="nav-item" type="button" data-section="connection">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 15 15 9"></path><path d="M10.5 6.5 12 5a4 4 0 0 1 5.7 5.7l-1.5 1.5"></path><path d="M13.5 17.5 12 19a4 4 0 0 1-5.7-5.7l1.5-1.5"></path></svg>
+        <span>连接</span>
+      </button>
+      <button class="nav-item" type="button" data-section="identity">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8.5" r="3.6"></circle><path d="M4.8 20a7.2 7.2 0 0 1 14.4 0"></path></svg>
+        <span>身份</span>
+      </button>
+      <button class="nav-item" type="button" data-section="cookies">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12.4A8.4 8.4 0 1 1 11.6 4a3.4 3.4 0 0 0 4 4 3.4 3.4 0 0 0 4.4 4.4Z"></path><circle cx="8.6" cy="10" r="0.9" fill="currentColor" stroke="none"></circle><circle cx="11.4" cy="15.2" r="0.9" fill="currentColor" stroke="none"></circle><circle cx="15.8" cy="14.6" r="0.9" fill="currentColor" stroke="none"></circle></svg>
+        <span>Cookies</span>
+      </button>
+      <button class="nav-item" type="button" data-section="appearance">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.5"></circle><path d="M12 3.5a8.5 8.5 0 0 0 0 17Z" fill="currentColor" stroke="none" opacity="0.35"></path></svg>
+        <span>外观</span>
+      </button>
+      <button class="nav-item" type="button" data-section="diagnostics">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12h3.6l2.2-6 4 12 2.4-6H21"></path></svg>
+        <span>诊断</span>
+      </button>
+      <button class="nav-item" type="button" data-section="about">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.5"></circle><path d="M12 11v5.4"></path><circle cx="12" cy="7.9" r="0.9" fill="currentColor" stroke="none"></circle></svg>
+        <span>关于</span>
+      </button>
+    </nav>
+
+    <div class="sidebar-foot">
+      <span class="pill" id="sideConnPill"><i class="dot"></i><span id="sideConnText">检测中</span></span>
+      <span class="side-version mono" id="optVersion">-</span>
+    </div>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <div class="topbar-text">
+        <h1 class="page-title" id="pageTitle">概览</h1>
+        <p class="page-sub" id="pageSub">连接状态与本机环境</p>
+      </div>
+      <div class="topbar-actions">
+        <button class="btn btn-secondary btn-sm" id="btnRefresh" type="button">刷新状态</button>
+        <button class="btn btn-primary btn-sm" id="btnReconnect" type="button">重新连接</button>
+      </div>
+    </header>
+
+    <div class="content">
+      <!-- ============================================================ 概览 -->
+      <section class="section" data-section="overview">
+        <div class="stat-grid">
+          <div class="stat">
+            <div class="stat-label">连接状态</div>
+            <div class="stat-value" id="statConnState">检测中</div>
+            <div class="stat-sub mono" id="statConnSub">-</div>
+          </div>
+          <div class="stat">
+            <div class="stat-label">插件端口</div>
+            <div class="stat-value mono" id="statPort">-</div>
+            <div class="stat-sub" id="statPortSub">daemon WebSocket</div>
+          </div>
+          <div class="stat">
+            <div class="stat-label">信任档位</div>
+            <div class="stat-value" id="statTrust">-</div>
+            <div class="stat-sub" id="statTrustSub">-</div>
+          </div>
+          <div class="stat">
+            <div class="stat-label">心跳延迟</div>
+            <div class="stat-value mono" id="statRtt">-</div>
+            <div class="stat-sub" id="statRttSub">最近一次 ping/pong</div>
+          </div>
+        </div>
+
+        <div class="notice notice-warn" id="ovAuthWarning" role="alert" hidden></div>
+        <div class="notice notice-err" id="ovConnectError" role="alert" hidden></div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2 class="card-title">本机环境</h2>
+            <span class="card-sub">只在本机读取，不上传</span>
+          </div>
+          <dl class="kv">
+            <div class="kv-row"><dt>浏览器</dt><dd id="ovBrowser">-</dd></div>
+            <div class="kv-row"><dt>Profile</dt><dd id="ovProfile">-</dd></div>
+            <div class="kv-row"><dt>扩展版本</dt><dd class="mono" id="ovExtVersion">-</dd></div>
+            <div class="kv-row"><dt>文件网址权限</dt><dd id="ovFileAccess">-</dd></div>
+            <div class="kv-row"><dt>最近命令</dt><dd id="ovLastCommand">-</dd></div>
+            <div class="kv-row"><dt>连接地址</dt><dd class="mono" id="ovWsUrl">-</dd></div>
+          </dl>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2 class="card-title">快捷操作</h2></div>
+          <div class="btn-row">
+            <button class="btn btn-secondary btn-sm" id="ovReload" type="button">重新加载扩展</button>
+            <button class="btn btn-secondary btn-sm" id="ovCopyDiag" type="button">复制诊断信息</button>
+            <button class="btn btn-ghost btn-sm" id="ovOpenPopup" type="button">打开弹窗页面</button>
+          </div>
+          <p class="hint">「重新加载扩展」会中断正在执行中的命令；CLI 侧会看到一次超时重试。</p>
+        </div>
+      </section>
+
+      <!-- ============================================================ 连接 -->
+      <section class="section" data-section="connection" hidden>
+        <div class="card">
+          <div class="card-head">
+            <h2 class="card-title">daemon 连接</h2>
+            <span class="card-sub mono" id="connUrl">-</span>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-text">
+              <div class="setting-title">插件端口</div>
+              <div class="setting-desc">扩展通过该端口连本机 daemon，默认 18765。18767 是 API 端口，不能混用。</div>
+            </div>
+            <div class="setting-control">
+              <input class="input mono" id="portInput" type="number" min="1" max="65535" inputmode="numeric" aria-label="插件端口">
+              <button class="btn btn-secondary" id="btnSavePort" type="button">保存并重连</button>
+            </div>
+          </div>
+          <div class="msg" id="portMsg" role="status" aria-live="polite"></div>
+
+          <div class="setting-row">
+            <div class="setting-text">
+              <div class="setting-title">访问 token</div>
+              <div class="setting-desc">设置后 daemon 只接受带 token 的连接。推荐 <code>atb trust-extension --token</code> 生成并写入两端。</div>
+            </div>
+            <div class="setting-control">
+              <input class="input mono" id="tokenInput" type="password" autocomplete="off" placeholder="未设置" aria-label="访问 token">
+              <button class="btn btn-secondary" id="btnSaveToken" type="button">保存</button>
+              <button class="btn btn-ghost" id="btnClearToken" type="button">清空</button>
+            </div>
+          </div>
+          <div class="msg" id="tokenMsg" role="status" aria-live="polite"></div>
+
+          <div class="setting-row">
+            <div class="setting-text">
+              <div class="setting-title">信任档位</div>
+              <div class="setting-desc">兼容档接受未带 token 的连接，任何本机进程都可能接管浏览器；严格档要求 token 匹配。</div>
+            </div>
+            <div class="setting-control">
+              <select class="select" id="trustSelect" aria-label="信任档位">
+                <option value="compat">兼容（默认）</option>
+                <option value="strict">严格</option>
+              </select>
+            </div>
+          </div>
+          <div class="msg" id="trustMsg" role="status" aria-live="polite"></div>
+
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2 class="card-title">改了不生效怎么办</h2></div>
+          <ol class="steps">
+            <li>确认 CLI 与扩展用的是同一个端口：<code>atb status</code> 里的 <code>extension.port</code> 应与这里一致。</li>
+            <li>token 档下两端必须一致，改完一侧要同步另一侧。</li>
+            <li>仍然连不上时，先「重新加载扩展」，再看诊断页的「最近一次连接错误」。</li>
+          </ol>
+        </div>
+      </section>
+
+      <!-- ============================================================ 身份 -->
+      <section class="section" data-section="identity" hidden>
+        <div class="card">
+          <div class="card-head">
+            <h2 class="card-title">Profile Label</h2>
+            <span class="card-sub">给人看的名字，不是标识符</span>
+          </div>
+          <div class="field">
+            <label class="field-label" for="labelInput">名称</label>
+            <div class="field-row">
+              <input class="input" id="labelInput" type="text" maxlength="40" placeholder="例如 work / personal / ci">
+              <button class="btn btn-secondary" id="btnSaveLabel" type="button">保存</button>
+              <button class="btn btn-ghost" id="btnClearLabel" type="button">清空</button>
+            </div>
+            <div class="msg" id="labelMsg" role="status" aria-live="polite"></div>
+            <p class="hint">多浏览器 / 多 Profile 时用它区分。需要跨 Profile 唯一性校验时用 <code>atb profile label</code>。</p>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2 class="card-title">标识</h2><span class="card-sub">只读</span></div>
+          <div class="id-row">
+            <div class="id-text"><span class="id-label">browserId</span><span class="mono id-value" id="idBrowser">-</span></div>
+            <button class="btn btn-ghost btn-sm" type="button" data-copy="idBrowser">复制</button>
+          </div>
+          <div class="id-row">
+            <div class="id-text"><span class="id-label">profileId</span><span class="mono id-value" id="idProfile">-</span></div>
+            <button class="btn btn-ghost btn-sm" type="button" data-copy="idProfile">复制</button>
+          </div>
+          <div class="id-row">
+            <div class="id-text"><span class="id-label">extensionId</span><span class="mono id-value" id="idExtension">-</span></div>
+            <button class="btn btn-ghost btn-sm" type="button" data-copy="idExtension">复制</button>
+          </div>
+          <p class="hint">这些标识用于 CLI 选择标签页/Profile，属于本机环境信息，不要贴到公开渠道。</p>
+          <p class="hint">标识跨重载保持不变是刻意的：会话 key 由 browserId + profileId 拼成，一换，CLI 里的默认浏览器与 <code>@e</code> 引用就全部失联。只有在「整份浏览器 profile 被克隆到另一台机器、两个实例撞同一个 id」时才需要重置。</p>
+          <div class="btn-row reset-row">
+            <button class="btn btn-danger btn-sm" id="btnResetIdentity" type="button">重置浏览器标识</button>
+          </div>
+          <div class="msg" id="resetIdentityMsg" role="status" aria-live="polite"></div>
+        </div>
+      </section>
+
+      <!-- ============================================================ Cookies -->
+      <section class="section" data-section="cookies" hidden>
+        <div class="card">
+          <div class="card-head">
+            <h2 class="card-title">当前站点 Cookies</h2>
+            <span class="card-sub mono" id="cookieSite">未读取</span>
+          </div>
+
+          <div class="btn-row">
+            <button class="btn btn-primary btn-sm" id="btnLoadCookies" type="button">读取当前站点</button>
+            <button class="btn btn-secondary btn-sm" id="btnRevealCookies" type="button">显示值</button>
+            <button class="btn btn-secondary btn-sm" id="btnCopyCookies" type="button">复制</button>
+            <span class="toolbar-spacer"></span>
+            <label class="inline-field">
+              <span>复制后清除</span>
+              <select class="select select-sm" id="cookieTtl" aria-label="剪贴板清除时间">
+                <option value="30">30 秒</option>
+                <option value="60">60 秒</option>
+                <option value="120">120 秒</option>
+                <option value="300">300 秒</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="cookie-toolbar">
+            <input class="input input-sm" id="cookieSearch" type="search" placeholder="筛选名称或标记…" autocomplete="off" aria-label="筛选 cookie">
+            <label class="check"><input id="includeSensitive" type="checkbox"><span>复制时包含 httpOnly/secure</span></label>
+            <span class="cookie-count" id="cookieCountLabel"></span>
+          </div>
+
+          <div class="msg" id="cookieMsg" role="status" aria-live="polite"></div>
+
+          <div class="table-wrap" id="cookieTableWrap" hidden>
+            <table class="table">
+              <thead>
+                <tr><th scope="col">名称</th><th scope="col">值</th><th scope="col">标记</th><th scope="col" class="col-action">操作</th></tr>
+              </thead>
+              <tbody id="cookieRows"></tbody>
+            </table>
+          </div>
+          <div class="empty" id="cookieEmpty">还没有读取 cookie。点「读取当前站点」；值默认打码，二次确认后才显示明文。</div>
+
+          <div class="notice">
+            仅在本机弹窗/管理页内展示，不会上传。关闭页面或切换分区会立即恢复打码；复制到剪贴板的内容会按上面设定的时长自动清除。
+          </div>
+        </div>
+      </section>
+
+      <!-- ============================================================ 外观 -->
+      <section class="section" data-section="appearance" hidden>
+        <div class="card">
+          <div class="card-head"><h2 class="card-title">主题</h2><span class="card-sub">立即生效</span></div>
+          <div class="choice-grid" role="radiogroup" aria-label="主题">
+            <label class="choice">
+              <input type="radio" name="theme" value="auto">
+              <span class="choice-preview auto"></span>
+              <span class="choice-label">跟随系统</span>
+            </label>
+            <label class="choice">
+              <input type="radio" name="theme" value="light">
+              <span class="choice-preview light"></span>
+              <span class="choice-label">浅色</span>
+            </label>
+            <label class="choice">
+              <input type="radio" name="theme" value="dark">
+              <span class="choice-preview dark"></span>
+              <span class="choice-label">深色</span>
+            </label>
+          </div>
+          <div class="msg" id="themeMsg" role="status" aria-live="polite"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2 class="card-title">弹窗</h2><span class="card-sub">影响浏览器工具栏里的弹窗，不影响本页</span></div>
+
+          <div class="setting-row">
+            <div class="setting-text">
+              <div class="setting-title">宽度</div>
+              <div class="setting-desc">分屏或小屏时用紧凑；大屏看 cookie 列表可以用宽松。</div>
+            </div>
+            <div class="setting-control">
+              <select class="select" id="widthSelect" aria-label="弹窗宽度">
+                <option value="compact">紧凑 · 340px</option>
+                <option value="standard">标准 · 420px</option>
+                <option value="wide">宽松 · 560px</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-text">
+              <div class="setting-title">间距</div>
+              <div class="setting-desc">紧凑只压缩留白，不缩小字号，避免中文挤成一团。</div>
+            </div>
+            <div class="setting-control">
+              <select class="select" id="densitySelect" aria-label="间距">
+                <option value="standard">标准</option>
+                <option value="compact">紧凑</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-text">
+              <div class="setting-title">页面状态角标</div>
+              <div class="setting-desc">在网页右侧显示一个可拖动的连接状态条。它是页面 DOM，站点可以检测到。</div>
+            </div>
+            <div class="setting-control">
+              <span class="switch"><input id="badgeToggle" type="checkbox" aria-label="页面状态角标"><i></i></span>
+            </div>
+          </div>
+          <div class="msg" id="appearanceMsg" role="status" aria-live="polite"></div>
+
+          <div class="btn-row section-actions">
+            <button class="btn btn-secondary btn-sm" id="btnPreviewPopup" type="button">打开弹窗页面预览</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============================================================ 诊断 -->
+      <section class="section" data-section="diagnostics" hidden>
+        <div class="card">
+          <div class="card-head"><h2 class="card-title">链路状态</h2><span class="card-sub" id="diagDegraded">-</span></div>
+          <dl class="kv">
+            <div class="kv-row"><dt>连接地址</dt><dd class="mono" id="diagUrl">-</dd></div>
+            <div class="kv-row"><dt>最近 ping</dt><dd id="diagPing">-</dd></div>
+            <div class="kv-row"><dt>最近 pong</dt><dd id="diagPong">-</dd></div>
+            <div class="kv-row"><dt>往返延迟</dt><dd class="mono" id="diagRtt">-</dd></div>
+            <div class="kv-row"><dt>最近命令</dt><dd id="diagLastCommand">-</dd></div>
+            <div class="kv-row"><dt>最近错误</dt><dd class="wrap" id="diagLastError">-</dd></div>
+            <div class="kv-row"><dt>文件网址</dt><dd id="diagFileAccess">-</dd></div>
+          </dl>
+          <div class="btn-row section-actions">
+            <button class="btn btn-secondary btn-sm" id="btnCopyDiag2" type="button">复制诊断信息</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2 class="card-title">扩展自检</h2>
+            <span class="card-sub">读取自身构建哈希与自检告警</span>
+          </div>
+          <p class="hint">用于确认扩展文件是否被改动、自检 alarm 是否正常调度。只在点击时执行一次。</p>
+          <div class="btn-row section-actions">
+            <button class="btn btn-secondary btn-sm" id="btnSelfCheck" type="button">运行自检</button>
+          </div>
+          <pre class="code" id="selfCheckOut" hidden></pre>
+        </div>
+      </section>
+
+      <!-- ============================================================ 关于 -->
+      <section class="section" data-section="about" hidden>
+        <div class="card">
+          <div class="card-head"><h2 class="card-title">版本</h2></div>
+          <dl class="kv">
+            <div class="kv-row"><dt>浏览器</dt><dd id="aboutBrowser">-</dd></div>
+            <div class="kv-row"><dt>平台</dt><dd id="aboutPlatform">-</dd></div>
+            <div class="kv-row"><dt>扩展版本</dt><dd class="mono" id="aboutVersion">-</dd></div>
+            <div class="kv-row"><dt>扩展 ID</dt><dd class="mono" id="aboutId">-</dd></div>
+            <div class="kv-row"><dt>协议</dt><dd class="mono" id="aboutProtocol">5 / 4</dd></div>
+            <div class="kv-row"><dt>磁盘构建</dt><dd class="mono" id="aboutBuild" title="">-</dd></div>
+          </dl>
+          <div class="ua-block">
+            <div class="ua-label">User-Agent</div>
+            <code class="ua-text" id="aboutUa">-</code>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2 class="card-title">权限</h2><span class="card-sub">manifest 声明</span></div>
+          <ul class="perm-list" id="permList"></ul>
+          <p class="hint">扩展不声明 management / contentSettings，不会枚举或修改你安装的其他扩展与站点设置。</p>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2 class="card-title">数据边界</h2></div>
+          <ul class="bullets">
+            <li>cookie 只在本机读取与展示，不上传；复制到剪贴板后按设定时长自动清除。</li>
+            <li>页面内容、截图、网络数据只在 CLI 命令执行期间经本机 WebSocket 传输。</li>
+            <li>本页面不加载任何远端资源，全部文件随扩展本地发布。</li>
+          </ul>
+        </div>
+      </section>
+    </div>
+  </div>
+</div>
+
+<script src="ui/common.js"></script>
+<script src="options.js"></script>
+</body>
+</html>

@@ -7,14 +7,65 @@ use super::*;
 /// 返回 `(单条字节上限, 单 profile 规则条数上限)`，可用环境变量调整。
 fn net_rule_limits() -> (usize, usize) {
     (
-        crate::settings::env_usize_clamped(
-            "ATB_NET_RULE_MAX_BYTES",
-            2 * 1024 * 1024,
-            1024,
-            16 * 1024 * 1024,
-        ),
-        crate::settings::env_usize_clamped("ATB_NET_RULE_MAX_RULES", 64, 1, 500),
+        crate::settings::net_rule_max_bytes(),
+        crate::settings::net_rule_max_rules(),
     )
+}
+
+/// 页面引擎（hook / route / mock）的规则条数校验。
+///
+/// 旧实现只有 CDP 引擎有条数上限，页面引擎可以无限堆规则（每条 body 还允许 2MiB），
+/// 全部落进 `net-hooks.json`、并在每次导航时随持久注入重放；而页面侧的 hook 重放
+/// 分支只接受前 N 条 → `net routes` 显示全量、浏览器实际生效的却是被裁过的子集，
+/// first-match 优先级也跟着失真。现在两个引擎共用 `ATB_NET_RULE_MAX_RULES`
+/// （默认 64），页面侧重放裁剪也用同一个数字（`page_net.js` 由 pages 域同步）。
+///
+/// 只校验「新增」：同 match + 同 method 是原位替换（页面侧与 CDP 侧都是这个语义），
+/// 不该被上限挡住。
+pub(crate) fn ensure_page_rule_capacity(
+    config: &Value,
+    action: &str,
+    rule: Option<&Value>,
+) -> Result<()> {
+    let Some(rule) = rule.filter(|value| value.is_object()) else {
+        return Ok(());
+    };
+    let routes: Vec<Value> = config
+        .get("routes")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let pattern = rule
+        .get("match")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let method = rule
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or("*")
+        .to_uppercase();
+    let exists = routes.iter().any(|item| {
+        item.get("match").and_then(Value::as_str) == Some(pattern)
+            && item
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or("*")
+                .to_uppercase()
+                == method
+    });
+    let (_, max_rules) = net_rule_limits();
+    if !exists && routes.len() >= max_rules {
+        return Err(target_select_error(
+            "too_many_rules",
+            format!(
+                "net {action}: 该 profile 已有 {} 条页面规则，达到上限 {max_rules}；本次规则未下发、配置未写入",
+                routes.len()
+            ),
+            "先 `atb net routes` 看全量规则，再用 `atb net unroute <match>` 释放名额；\
+             上限与 CDP 引擎同源（ATB_NET_RULE_MAX_RULES，默认 64）",
+        ));
+    }
+    Ok(())
 }
 
 fn json_kind(value: &Value) -> &'static str {
@@ -39,9 +90,15 @@ pub(crate) fn validate_net_rule(action: &str, rule: &Value) -> Result<()> {
             continue;
         };
         if !(value.is_string() || value.is_object() || value.is_array()) {
-            return Err(anyhow!(
-                "net {action}: rule.{key} 必须是字符串或 JSON 对象/数组（收到 {}）",
-                json_kind(value)
+            // 形状写错属于「改命令即可」：用 `invalid_` 前缀的结构化码，
+            // CLI 的 `is_usage_error_code` 会自动映射成退出码 2。
+            return Err(target_select_error(
+                "invalid_rule_body",
+                format!(
+                    "net {action}: rule.{key} 必须是字符串或 JSON 对象/数组（收到 {}）",
+                    json_kind(value)
+                ),
+                "按 --rule 的 JSON 形状传 body/requestBody；要下发原始字符串就直接给 string",
             ));
         }
         let bytes = value
@@ -49,10 +106,14 @@ pub(crate) fn validate_net_rule(action: &str, rule: &Value) -> Result<()> {
             .map(str::len)
             .unwrap_or_else(|| value.to_string().len());
         if bytes > max_bytes {
-            return Err(anyhow!(
-                "net_rule_too_large: rule.{key} 有 {bytes} 字节，超过上限 {max_bytes} 字节\
-                 （可用 ATB_NET_RULE_MAX_BYTES 调整，值域 1KiB..16MiB）；\
-                 建议改为短 stub，或让页面自己请求大文件（clamped: 未下发，规则未写入）"
+            // 结构化码（旧实现只有一句以 `net_rule_too_large:` 开头的自由文本，调用方
+            // 只能靠字符串前缀分支）。消息里保留同一个前缀，旧的 grep 消费者不受影响。
+            return Err(target_select_error(
+                "net_rule_too_large",
+                format!(
+                    "net_rule_too_large: rule.{key} 有 {bytes} 字节，超过上限 {max_bytes} 字节（可用 ATB_NET_RULE_MAX_BYTES 调整，值域 1KiB..16MiB）；本次未下发，规则未写入"
+                ),
+                "把 body 缩到上限以内，或让页面自己请求大文件；确需更大时调 ATB_NET_RULE_MAX_BYTES",
             ));
         }
     }
@@ -62,9 +123,13 @@ pub(crate) fn validate_net_rule(action: &str, rule: &Value) -> Result<()> {
         .filter(|value| !value.is_null())
     {
         if !(response_body.is_string() || response_body.is_object() || response_body.is_array()) {
-            return Err(anyhow!(
-                "net {action}: rule.response.body 必须是字符串或 JSON 对象/数组（收到 {}）",
-                json_kind(response_body)
+            return Err(target_select_error(
+                "invalid_rule_body",
+                format!(
+                    "net {action}: rule.response.body 必须是字符串或 JSON 对象/数组（收到 {}）",
+                    json_kind(response_body)
+                ),
+                "按 --rule 的 JSON 形状传 response.body；要下发原始字符串就直接给 string",
             ));
         }
         let bytes = response_body
@@ -72,9 +137,12 @@ pub(crate) fn validate_net_rule(action: &str, rule: &Value) -> Result<()> {
             .map(str::len)
             .unwrap_or_else(|| response_body.to_string().len());
         if bytes > max_bytes {
-            return Err(anyhow!(
-                "net_rule_too_large: rule.response.body 有 {bytes} 字节，超过上限 {max_bytes} 字节\
-                 （可用 ATB_NET_RULE_MAX_BYTES 调整）；clamped: 未下发，规则未写入"
+            return Err(target_select_error(
+                "net_rule_too_large",
+                format!(
+                    "net_rule_too_large: rule.response.body 有 {bytes} 字节，超过上限 {max_bytes} 字节（可用 ATB_NET_RULE_MAX_BYTES 调整）；本次未下发，规则未写入"
+                ),
+                "把 response.body 缩到上限以内，或改用短 stub；确需更大时调 ATB_NET_RULE_MAX_BYTES",
             ));
         }
     }
@@ -145,10 +213,17 @@ pub(crate) async fn net_cdp_action(
             if existing.is_none() {
                 let (_, max_rules) = net_rule_limits();
                 if rules.len() >= max_rules {
-                    return Err(anyhow!(
-                        "net_rule_too_large: 当前 profile 已有 {} 条 CDP 规则，达到上限 {max_rules}\
-                         （可用 ATB_NET_RULE_MAX_RULES 调整）；请先 `net unroute` 掉不用的规则",
-                        rules.len()
+                    // 与页面引擎同一个结构化码（`too_many_rules`）：这属于「先清理再重试」的
+                    // 用法问题，CLI 按 `too_many_` 前缀映射退出码 2。旧文案写的是
+                    // `net_rule_too_large`（那是**单条 body 超字节**的码），两个引擎对同一类
+                    // 「条数满」给出不同码会让 Agent 一边改命令、一边无限重试。
+                    return Err(target_select_error(
+                        "too_many_rules",
+                        format!(
+                            "net {action}: 当前 profile 已有 {} 条 CDP 规则，达到上限 {max_rules}；本次规则未下发、配置未写入（可用 ATB_NET_RULE_MAX_RULES 调整）",
+                            rules.len()
+                        ),
+                        "先 `atb net routes` 看清清单，再 `atb net unroute <match>` 释放名额，或用 `atb net reset` 整体清空；上限与页面引擎同源（默认 64）",
                     ));
                 }
             }
@@ -311,8 +386,8 @@ pub(crate) async fn net_cdp_set_debug_pass(
 /// 把规则下发到该 profile 下的每个标签（Fetch 域是 per-tab 的）。
 ///
 /// 并发 + 统一 deadline：旧实现串行等待每个标签，N 个标签各带一个
-/// `timeout`，总耗时可达 N×timeout；调用方此时正持有 `net_persist_lock`，
-/// 后续所有 net 命令都会被一起堵住（首请求慢 → 之后 150s 全线超时）。
+/// `timeout`，总耗时可达 N×timeout；调用方此时正持有该 profile 的落盘锁，
+/// 同 profile 的后续 net 命令都会被一起堵住（首请求慢 → 之后 150s 全线超时）。
 pub(crate) async fn net_cdp_broadcast(
     state: &AppState,
     profile_key: &str,
@@ -400,4 +475,78 @@ pub(crate) async fn net_cdp_broadcast(
         "failed": failures,
         "fallback_matches": fallback_matches,
     }))
+}
+
+#[cfg(test)]
+mod rule_validation_tests {
+    use super::*;
+
+    /// 单条 body 超字节要给结构化码（不再只有自由文本前缀），且不可重试。
+    #[test]
+    fn oversized_body_is_structured() {
+        let rule = json!({ "body": "x".repeat(2 * 1024 * 1024 + 1) });
+        let err = validate_net_rule("mock", &rule).expect_err("超限必须报错");
+        let typed = err
+            .downcast_ref::<SessionSelectError>()
+            .expect("结构化错误");
+        assert_eq!(typed.code, "net_rule_too_large");
+        assert!(!typed.retryable);
+        // 旧的 grep 前缀仍保留在消息里，不打断只读文本的消费者。
+        assert!(
+            typed.message.starts_with("net_rule_too_large: "),
+            "{}",
+            typed.message
+        );
+    }
+
+    /// 形状写错用 `invalid_` 前缀（CLI 自动映射退出码 2）。
+    #[test]
+    fn wrong_body_shape_is_usage_error() {
+        let rule = json!({ "body": 42 });
+        let err = validate_net_rule("mock", &rule).expect_err("类型错误必须报错");
+        assert_eq!(
+            err.downcast_ref::<SessionSelectError>()
+                .map(|typed| typed.code),
+            Some("invalid_rule_body")
+        );
+        assert!(crate::cli::is_usage_error_code("invalid_rule_body"));
+    }
+}
+
+#[cfg(test)]
+mod page_rule_capacity_tests {
+    use super::*;
+
+    fn config_with(n: usize) -> Value {
+        let routes: Vec<Value> = (0..n)
+            .map(|index| json!({ "match": format!("/r{index}"), "method": "*" }))
+            .collect();
+        json!({ "routes": routes })
+    }
+
+    /// 页面引擎与 CDP 引擎共用同一个条数上限（默认 64），超限返回结构化
+    /// `too_many_rules`；同 match+method 是原位替换，不占新名额。
+    #[test]
+    fn page_engine_caps_new_rules_per_profile() {
+        let full = config_with(64);
+        let err = ensure_page_rule_capacity(&full, "route", Some(&json!({ "match": "/new" })))
+            .expect_err("超限必须报错");
+        assert!(
+            err.downcast_ref::<SessionSelectError>()
+                .map(|typed| typed.code == "too_many_rules")
+                .unwrap_or(false),
+            "{err}"
+        );
+        assert!(
+            ensure_page_rule_capacity(&full, "route", Some(&json!({ "match": "/r3" }))).is_ok()
+        );
+        assert!(ensure_page_rule_capacity(
+            &config_with(63),
+            "route",
+            Some(&json!({ "match": "/new" }))
+        )
+        .is_ok());
+        // 没有 rule（例如 unroute）不参与条数校验。
+        assert!(ensure_page_rule_capacity(&full, "route", None).is_ok());
+    }
 }

@@ -157,7 +157,7 @@ impl TargetSpec {
         }
         // 去重按原顺序（保留首次出现）：`--tab 5,5` 只该命中一个标签页，否则同一条
         // 命令会对同一个页面执行两遍（点击两次、填两次）。daemon 侧已有去重，这里是
-        // 双保险（D-07）。
+        // 双保险。
         Ok(TargetSpec::Ids(dedupe(ids)))
     }
 
@@ -197,7 +197,7 @@ impl TargetSpec {
     ///
     /// 当前调用方都直接 match 目标形态，没有用到这个捷径；保留是为了不让
     /// 「单目标 / 多目标」的判定散落到各处。
-    #[cfg(test)]
+    #[allow(dead_code)]
     pub fn single_id(&self) -> Option<&str> {
         match self {
             TargetSpec::Ids(ids) if ids.len() == 1 => Some(ids[0].as_str()),
@@ -234,6 +234,12 @@ impl TargetSpec {
                 .join(","),
         }
     }
+
+    /// 序号选择器需要 daemon 的标签页顺序；其它选择器不需要。
+    #[allow(dead_code)]
+    pub fn needs_index(&self) -> bool {
+        matches!(self, TargetSpec::Index(_))
+    }
 }
 
 /// 合法的 id 字符：可见 ASCII，排除逗号（逗号是列表分隔符）。
@@ -261,7 +267,7 @@ fn strip_prefix_ci<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
     // 切片前必须确认落在**字符边界**上。`prefix` 恒为 ASCII（`all` / `url:` / `title:`
     // / `group:` / `window:` / `current`），但 `text` 可能紧接着一个多字节字符：
     // `--tab "all中"` 时 `split_at(4)` 会落在 '中'（3..6 字节）中间，直接 panic 到
-    // exit 101 —— 101 不在对外退出码契约（1/2/3/130）里，Agent 无法机器判读（R-04）。
+    // exit 101 —— 101 不在对外退出码契约（1/2/3/130）里，Agent 无法机器判读。
     // `str::get(..n)` 在越界或非边界时返回 None，正好等价于「前缀不匹配」。
     let head = text.get(..prefix.len())?;
     let rest = text.get(prefix.len()..)?;
@@ -379,7 +385,7 @@ mod tests {
 
     #[test]
     fn duplicate_ids_are_collapsed() {
-        // `--tab 5,5` 只该命中一个标签页（D-07）；顺序按首次出现保留。
+        // `--tab 5,5` 只该命中一个标签页；顺序按首次出现保留。
         assert_eq!(
             TargetSpec::parse("5,5").unwrap(),
             TargetSpec::Ids(vec!["5".into()])

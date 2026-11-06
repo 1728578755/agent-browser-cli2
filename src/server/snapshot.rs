@@ -3,7 +3,7 @@ use super::*;
 /// 分页窗口右端（`offset + limit`）。
 ///
 /// `offset` 来自用户 JSON 且没有上限：debug 构建下 `usize::MAX + 1` 会 panic，
-/// release 会回绕，导致 `has_more` / `next_offset` 全错（B-14）。
+/// release 会回绕，导致 `has_more` / `next_offset` 全错。
 /// 这里用 `checked_add`，并保留一个宽松上限把明显越界的请求直接拒掉。
 pub(crate) const MAX_SNAPSHOT_OFFSET: usize = 1_000_000;
 
@@ -12,7 +12,7 @@ pub(crate) const MAX_SNAPSHOT_OFFSET: usize = 1_000_000;
 /// 这个常量不是「offset 上限」：Rust 侧会多要一条（`offset + limit + 1`）来确认
 /// 「是否真的还有下一批」。页面脚本支持 `offset` 时，offset 可以超过这个值；
 /// 只有旧版脚本（不支持 offset、总是从文档开头取）才受它限制 —— 那种情况下
-/// `offset >= 1000` 无法取到数据，Rust 侧会显式报错而不是返回空页（P3）。
+/// `offset >= 1000` 无法取到数据，Rust 侧会显式报错而不是返回空页。
 pub(crate) const PAGE_SNAPSHOT_MAX_ITEMS: usize = 1000;
 
 pub(crate) fn page_window(offset: usize, limit: usize) -> Result<usize> {
@@ -141,7 +141,7 @@ pub(crate) async fn snapshot_page(state: &AppState, req: SnapshotRequest) -> Res
     let mut builder = SnapshotBuilder::new(req.offset, limit, req.details);
     let tree = builder.build(nodes);
     let mut all_refs = builder.refs;
-    // C-02：详情收集只在显式请求 `--details` 时执行。旧实现不看 `req.details`、
+    // 详情收集只在显式请求 `--details` 时执行。旧实现不看 `req.details`、
     // 对窗口内全部元素无条件发起最多 25 批 `DOM.resolveNode + Runtime.callFunctionOn`
     // CDP 往返，结果只写进快照缓存的 `entry.dom` —— 而该字段唯一的消费点是
     // `attach_details_to_tree`（同样只在 `--details` 时调用），不带 `--details`
@@ -173,7 +173,7 @@ pub(crate) async fn snapshot_page(state: &AppState, req: SnapshotRequest) -> Res
         tree
     };
     // 本页窗口内的引用总数（fold 之前）。`max_nodes` 会把树裁短，必须和
-    // 实际返回量分开记，否则「树被裁剪」在输出里完全看不出来（P3）。
+    // 实际返回量分开记，否则「树被裁剪」在输出里完全看不出来。
     let window_refs = all_refs
         .values()
         .filter(|entry| entry.index >= req.offset && entry.index < end)
@@ -221,7 +221,7 @@ pub(crate) async fn snapshot_page(state: &AppState, req: SnapshotRequest) -> Res
         );
     }
     // has_more 要同时反映两件事：还有下一页（end < total）、以及这一页的树被
-    // `max_nodes` 裁短（tree_truncated）。只看前者时「树被静默裁剪」不会出现在输出里（P3）。
+    // `max_nodes` 裁短（tree_truncated）。只看前者时「树被静默裁剪」不会出现在输出里。
     let has_more = end < total || tree_truncated;
     let mut pagination = json!({
         "total_operable": total,
@@ -244,7 +244,7 @@ pub(crate) async fn snapshot_page(state: &AppState, req: SnapshotRequest) -> Res
     Ok(json!({
         "status": "success",
         "mode": "cdp",
-        // C-04：`@e` 的编号口径随快照引擎不同。CDP 只给可操作角色发引用
+        // `@e` 的编号口径随快照引擎不同。CDP 只给可操作角色发引用
         // （`ref_scheme=operable-only`），JS 回退给所有有名字的节点发引用
         // （`ref_scheme=all-named`）。两个引擎的 `@e5` 不保证指向同一元素，
         // 跨引擎复用引用前必须重新 snapshot。显式回传口径，调用方才有可能判断。
@@ -460,7 +460,7 @@ pub(crate) async fn snapshot_via_js(state: &AppState, req: &SnapshotRequest) -> 
     let timeout = secs(req.timeout.max(0.1));
     let end = page_window(offset, limit)?;
     // 多要一条：页面脚本的 `truncated` 是 `items.length >= maxItems`，恰好取满时也是
-    // true，只看它会让 `has_more` 永远为真、每页都空（P3）。多取一条才能区分
+    // true，只看它会让 `has_more` 永远为真、每页都空。多取一条才能区分
     // 「刚好取完」与「确实还有下一批」。
     let probe = end.saturating_add(1).min(PAGE_SNAPSHOT_MAX_ITEMS);
     let opts = json!({
@@ -470,7 +470,7 @@ pub(crate) async fn snapshot_via_js(state: &AppState, req: &SnapshotRequest) -> 
         "offset": offset,
         "limit": probe,
         "interactiveOnly": req.interactive_only,
-        // X-15：接通页面侧 skipGeneric 开关。None 序列化成 null，页面脚本
+        // 接通页面侧 skipGeneric 开关。None 序列化成 null，页面脚本
         // `opts.skipGeneric !== false` 判定为 true（保持默认跳过 generic），
         // 请求体显式带 skipGeneric:false 时保留 generic 角色节点。
         "skipGeneric": req.skip_generic
@@ -521,7 +521,7 @@ pub(crate) async fn snapshot_via_js(state: &AppState, req: &SnapshotRequest) -> 
     // 这一批条目在**全页序号**里的起点。新版页面脚本认 offset，回包的首个 ref 就是
     // `@e{offset+1}`（或显式回传 offset）；旧版脚本永远从文档开头取，起点是 0。
     // 以前不看起点、一律按 `index >= offset` 过滤，于是 offset≥1000 时页面只给
-    // 前 1000 条、过滤后一条不剩（P3）。
+    // 前 1000 条、过滤后一条不剩。
     let base_offset = snapshot_items_base_offset(&payload, &items, offset);
     if base_offset == 0 && offset >= PAGE_SNAPSHOT_MAX_ITEMS {
         // 旧版页面脚本只回前 1000 条，再大的 offset 无论怎么切片都取不到数据。
@@ -658,7 +658,7 @@ pub(crate) async fn snapshot_via_js(state: &AppState, req: &SnapshotRequest) -> 
     }
     // 页面脚本只回传「抓到多少条」（受 limit 截断），并没有全页真实总数；
     // 但「本批覆盖到哪里」是确定的：批次起点 + 本批条数，多要的那一条若存在，
-    // 覆盖范围就会越过 `end`，据此判断「是否真的还有下一批」（P3）。
+    // 覆盖范围就会越过 `end`，据此判断「是否真的还有下一批」。
     let truncated = payload
         .get("truncated")
         .and_then(Value::as_bool)
@@ -678,7 +678,7 @@ pub(crate) async fn snapshot_via_js(state: &AppState, req: &SnapshotRequest) -> 
     let has_more = more_batches || tree_truncated;
     // 旧版页面脚本只能回到前 1000 条：`end >= 1000` 时下一页必然取不到数据，
     // 不给 next_offset（否则调用方会一路翻到报错）。新版脚本认 offset，不受此限。
-    // C-06 边界保护：第一页（offset==0）时 ref 编号无法区分「支持 offset 的新脚本」
+    // 边界保护：第一页（offset==0）时 ref 编号无法区分「支持 offset 的新脚本」
     // 与「永远从文档开头取的旧脚本」——两者首个 ref 都是 @e1。旧实现无条件豁免
     // offset==0（`offset_supported` 恒真），于是旧脚本页面上 total 恰好被 1000 封顶时
     // 也给出 `next_offset`，调用方跟进后必然在 `snapshot_items_base_offset` 处报
@@ -728,7 +728,7 @@ pub(crate) async fn snapshot_via_js(state: &AppState, req: &SnapshotRequest) -> 
     let mut out = json!({
         "status": "success",
         "mode": "js",
-        // C-04：把页面脚本声明的引用口径透出来。JS 回退给所有有名字的节点发 `@e`，
+        // 把页面脚本声明的引用口径透出来。JS 回退给所有有名字的节点发 `@e`，
         // 与 CDP 的 `operable-only` 不是同一套编号；调用方跨引擎复用引用前必须重拍。
         "ref_scheme": payload
             .get("ref_scheme")
@@ -1002,7 +1002,7 @@ pub(crate) const DETAIL_BATCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// 收集元素详情。返回 `(详情表, details_truncated)`。
 ///
 /// 以前把调用方的 `timeout` 原样传给每个 batch：`--details --limit 1000` 要串行往返
-/// 25 次，每次单独算超时，整体耗时可以是 `timeout` 的好几倍（P3）。
+/// 25 次，每次单独算超时，整体耗时可以是 `timeout` 的好几倍。
 /// 现在按整体 deadline 分配：每次 batch 只拿 `min(单次上限, 剩余预算)`，预算耗尽就停下，
 /// 并用 `details_truncated` 明确告诉调用方「详情不全」。
 pub(crate) async fn collect_dom_details(
@@ -1083,7 +1083,7 @@ pub(crate) async fn batch_dom_details(
     for index in 0..refs.len() {
         let step = results.get(index * 2 + 1);
         // 与 call_function_resolved 同判据：页面脚本抛异常时没有 result，
-        // 真异常在 exceptionDetails 里。不读它就只能报 "missing value"（P3 同族）。
+        // 真异常在 exceptionDetails 里。不读它就只能报 "missing value"（同族）。
         if let Some(message) = step.and_then(cdp_exception_text) {
             details.push(empty_dom_info(Some(message)));
             continue;
@@ -1281,7 +1281,7 @@ mod regression_tests {
         assert!(!is_csp_error("/csp-report 404"));
     }
 
-    /// P3：旧版页面脚本从文档开头取，起点是 0；新版认 offset 时起点必须跟着走。
+    /// 旧版页面脚本从文档开头取，起点是 0；新版认 offset 时起点必须跟着走。
     #[test]
     fn snapshot_batch_base_offset_follows_page_support() {
         let legacy = vec![json!({ "ref": "@e1" }), json!({ "ref": "@e2" })];

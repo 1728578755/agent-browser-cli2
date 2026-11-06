@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 /// 杀软拦截），调用方会无限期挂着。默认 5s 上限，超时就当查询失败处理。
 /// 可用 `ATB_PROC_CMD_TIMEOUT_MS` 调整（100..=60000）。
 fn command_timeout() -> Duration {
-    let millis = crate::settings::env_u64_clamped("ATB_PROC_CMD_TIMEOUT_MS", 5_000, 100, 60_000);
+    let millis = crate::settings::proc_cmd_timeout_ms();
     Duration::from_millis(millis)
 }
 
@@ -35,25 +35,25 @@ fn command_timeout() -> Duration {
 /// 或者反之太快把转发误判成失败。默认 800ms，可用 `ATB_LAUNCH_SETTLE_MS` 调整
 /// （0..=10000）。
 fn launch_settle() -> Duration {
-    let millis = crate::settings::env_u64_clamped("ATB_LAUNCH_SETTLE_MS", 800, 0, 10_000);
+    let millis = crate::settings::launch_settle_ms();
     Duration::from_millis(millis)
 }
 
 /// 温和关闭后等待进程退出的时间（默认 3s）。
 fn close_wait_budget() -> Duration {
-    let millis = crate::settings::env_u64_clamped("ATB_LAUNCH_CLOSE_WAIT_MS", 3_000, 100, 60_000);
+    let millis = crate::settings::launch_close_wait_ms();
     Duration::from_millis(millis)
 }
 
 /// 强杀后等待进程退出的时间（默认 8s）。
 fn kill_wait_budget() -> Duration {
-    let millis = crate::settings::env_u64_clamped("ATB_LAUNCH_KILL_WAIT_MS", 8_000, 100, 120_000);
+    let millis = crate::settings::launch_kill_wait_ms();
     Duration::from_millis(millis)
 }
 
 /// 关闭实例时轮询 `instances()` 的间隔（默认 500ms）。
 fn close_poll_interval() -> Duration {
-    let millis = crate::settings::env_u64_clamped("ATB_LAUNCH_POLL_MS", 500, 20, 5_000);
+    let millis = crate::settings::launch_poll_ms();
     Duration::from_millis(millis)
 }
 
@@ -158,7 +158,7 @@ impl Kind {
                 Kind::Edge => "msedge.exe",
                 // Chromium 的二进制在 Windows 上也叫 chrome.exe
                 // （`resolve_exe` 打开的是 `Chromium\Application\chrome.exe`）。
-                // 这里返回 chromium.exe 会让 `instances()` 永远空（P3）。
+                // 这里返回 chromium.exe 会让 `instances` 永远空。
                 Kind::Chromium => "chrome.exe",
             }
         }
@@ -341,7 +341,7 @@ pub fn execute(
     let alive = running.iter().any(|item| item.pid == pid);
     if !alive {
         // 旧实例本来就带静默开关：新进程把 URL 转过去后退出，这是成功的转发，
-        // 不能报「参数没生效」——否则 `atb launch <url>` 永远打不开页面（P3）。
+        // 不能报「参数没生效」——否则 `atb launch <url>` 永远打不开页面。
         // 只在「没有要求重启」时成立：重启路径上进程退出说明关闭失败/参数没生效。
         if plan.already_silent && urls_requested && !restart {
             return Ok(Executed {
@@ -421,7 +421,7 @@ pub fn run(req: &Request) -> serde_json::Value {
 
     // 已经在用这条参数跑（进程命令行里有），再重启一次只会打断用户，直接如实回答。
     // 但**有 URL 时必须继续往下走**：早退会把 `atb launch https://example.com` 的
-    // URL 整个丢掉，只返回 launched:false 让调用方以为已打开（P3）。旧条件只看
+    // URL 整个丢掉，只返回 launched:false 让调用方以为已打开。旧条件只看
     // extra_args，不看 req.urls。
     if plan.already_silent && req.extra_args.is_empty() && req.urls.is_empty() {
         return json!({
@@ -640,8 +640,8 @@ fn validate_browser_exe(path: &Path) -> Result<()> {
     {
         use std::os::unix::ffi::OsStrExt;
         // `access(X_OK)` 用**当前进程的真实 uid/gid** 判断，比「任意一个执行位」准确：
-        // 0644 root 文件、或 ACL 允许但 mode 位不匹配的文件，旧判定会给出相反结论
-        // 。拿不到 C 字符串时退回 mode 位近似。
+        // 0644 root 文件、或 ACL 允许但 mode 位不匹配的文件，旧判定会给出相反结论。
+        // 拿不到 C 字符串时退回 mode 位近似。
         let executable = match std::ffi::CString::new(path.as_os_str().as_bytes()) {
             Ok(value) => {
                 // SAFETY: `value` 以 NUL 结尾且在调用期间存活。
@@ -664,7 +664,7 @@ fn validate_browser_exe(path: &Path) -> Result<()> {
 
 /// 找到浏览器可执行文件。`ATB_BROWSER_EXE` 优先，便于装在非标准路径时覆盖。
 pub fn resolve_exe(kind: Kind) -> Result<PathBuf> {
-    if let Ok(raw) = env::var("ATB_BROWSER_EXE") {
+    if let Some(raw) = crate::settings::browser_exe() {
         let path = PathBuf::from(raw);
         validate_browser_exe(&path)?;
         return Ok(path);
@@ -733,7 +733,7 @@ pub fn resolve_exe(kind: Kind) -> Result<PathBuf> {
             command.arg(name);
             if let Some(output) = run_with_timeout(&mut command, command_timeout()) {
                 if output.status.success() {
-                    // 不再 `from_utf8_lossy`：非 UTF-8 路径会被替换成 U+FFFD，随后
+                    // 不再 `from_utf8_lossy`：非 路径会被替换成 U+FFFD，随后
                     // spawn 必然报「文件不存在」，错误位置远离真实原因。
                     if let Some(path) = path_from_which_output(&output.stdout) {
                         return Ok(path);
@@ -802,9 +802,9 @@ fn wsl_browser_candidates(kind: Kind) -> Vec<PathBuf> {
     bases.into_iter().map(|base| base.join(relative)).collect()
 }
 
-/// 把 `which` 的原始 stdout 转成 PathBuf，全程不经过 UTF-8。
+/// 把 `which` 的原始 stdout 转成 PathBuf，全程不经过。
 ///
-/// 旧实现 `String::from_utf8_lossy` 会把非 UTF-8 字节替换成 U+FFFD，得到的路径
+/// 旧实现 `String::from_utf8_lossy` 会把非 字节替换成 U+FFFD，得到的路径
 /// 一定不存在。这里只取第一行并裁掉首尾 ASCII 空白。
 #[cfg(all(unix, not(target_os = "macos")))]
 fn path_from_which_output(stdout: &[u8]) -> Option<PathBuf> {
@@ -865,7 +865,7 @@ pub fn default_user_data_dir(kind: Kind) -> Result<PathBuf> {
 /// 把相对路径按**调用进程**的 cwd 绝对化。
 ///
 /// 注意：`/launch` 是由常驻 daemon 执行的，daemon 由 CLI 以 `current_dir(home)`
-/// 拉起，所以这里的 cwd 很可能不是用户 shell 的 cwd（P3）。CLI 侧下发绝对的
+/// 拉起，所以这里的 cwd 很可能不是用户 shell 的 cwd。CLI 侧下发绝对的
 /// `--user-data-dir` 才是最优解；这里绝对化是为了至少不再把相对路径直接塞给浏览器
 /// （否则浏览器按自己的 cwd 解析，同一个参数在两次启动里可能指向不同 profile）。
 fn absolutize(path: &Path) -> Result<PathBuf> {
@@ -1012,8 +1012,8 @@ fn instances_windows(kind: Kind) -> Result<Vec<Instance>> {
     // 到 PowerShell 手里就变成了 `-Filter name='chrome.exe'`（语法错误，静默返回空）。
     // 用 Where-Object 过滤，全程单引号，跨 shell 都稳。
     //
-    // 输出编码固定 UTF-8：zh-CN 系统默认 cp936，`--user-data-dir` 里的中文会变成
-    // mojibake，`same_dir` 比对失败 → 误判「没有实例在跑」（P3）。
+    // 输出编码固定 zh-CN 系统默认 cp936，`--user-data-dir` 里的中文会变成
+    // mojibake，`same_dir` 比对失败 → 误判「没有实例在跑」。
     let script = format!(
         "[Console]::OutputEncoding=[Text.Encoding]::UTF8; $OutputEncoding=[Text.Encoding]::UTF8; \
          Get-CimInstance Win32_Process | Where-Object {{ $_.Name -eq '{name}' }} | \
@@ -1107,7 +1107,7 @@ fn unix_bundle_prefixes(kind: Kind) -> &'static [&'static str] {
 ///
 /// 只看 argv[0] 的可执行文件名（或 macOS 包前缀），不做裸子串匹配：旧实现用
 /// `command.contains("chromium")`，会把 `python3 -m http.server --directory
-/// ~/chromium-downloads` 也当成浏览器并 SIGTERM（P3）。
+/// ~/chromium-downloads` 也当成浏览器并 SIGTERM。
 // Windows 上生产代码走 Win32_Process.Name，这里只有单元测试用到；逻辑本身跨平台，
 // 所以不加 cfg 门，避免 Unix 的正确性只能靠 CI 验证。
 #[cfg_attr(windows, allow(dead_code))]
@@ -1577,8 +1577,8 @@ mod tests {
 
     #[test]
     fn uses_dir_honors_explicit_flag() {
-        let dir = Path::new("C://Profiles//lprof");
-        let command = r#""chrome.exe" --user-data-dir=C:/Profiles/lprof --no-first-run"#;
+        let dir = Path::new("C://temp//atb-lprof");
+        let command = r#""chrome.exe" --user-data-dir=C:/temp/atb-lprof --no-first-run"#;
         assert!(uses_dir(command, dir, Some(Path::new("C://default"))));
         let other = r#""chrome.exe" --user-data-dir=E:/another --no-first-run"#;
         assert!(!uses_dir(other, dir, None));
@@ -1629,7 +1629,7 @@ mod tests {
             &chrome,
             &[]
         ));
-        // 旧实现按裸子串匹配，会把这行也当成浏览器并 SIGTERM（P3）。
+        // 旧实现按裸子串匹配，会把这行也当成浏览器并 SIGTERM。
         assert!(!command_uses_exe(
             "python3 -m http.server --directory /home/me/chromium-downloads",
             &["chromium"],
@@ -1653,7 +1653,7 @@ mod tests {
     #[test]
     fn chromium_process_name_matches_its_exe() {
         // resolve_exe 打开的是 `Chromium\Application\chrome.exe`，进程名必须一致，
-        // 否则 instances() 永远为空（P3）。
+        // 否则 instances 永远为空。
         assert_eq!(Kind::Chromium.process_name(), "chrome.exe");
     }
 
@@ -1671,7 +1671,7 @@ mod tests {
     #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn which_output_keeps_non_utf8_paths() {
-        // 非 UTF-8 字节不能被替换成 U+FFFD，否则返回的路径一定不存在。
+        // 非 字节不能被替换成 U+FFFD，否则返回的路径一定不存在。
         let mut raw = b"/opt/chr".to_vec();
         raw.push(0xFF);
         raw.extend_from_slice(b"ome\n");

@@ -76,7 +76,7 @@ impl JobRecord {
 #[derive(Default)]
 pub(crate) struct JobStore {
     pub(crate) jobs: HashMap<String, JobRecord>,
-    /// 强制淘汰存根（D-05）：硬上限淘汰只打 eprintln 时，调用方拿到的 `job_not_found`
+    /// 强制淘汰存根：硬上限淘汰只打 eprintln 时，调用方拿到的 `job_not_found`
     /// 看起来像 id 写错，会去改一条本来正确的命令。留存根后 `job get/wait` 能拿到
     /// 稳定的 `job_evicted` 语义。存根不含业务结果，只是「这个 id 被 daemon 丢了」的回执。
     pub(crate) evicted: HashMap<String, JobEvictStub>,
@@ -128,31 +128,10 @@ pub(crate) const JOB_STORE_SOFT_LIMIT: usize = 100;
 ///
 /// 旧实现只在 `len >= 100` 时从 `values()` 里随便删 20 条（HashMap 无序），
 /// 可能删掉刚完成、正等 `job wait` 的新任务，陈旧结果反而留着；
-/// 且 >=100 条全 Running 时一条也删不掉，insert 照常 → 表没有上界（C-05）。
+/// 且 >=100 条全 Running 时一条也删不掉，insert 照常 → 表没有上界。
 pub(crate) const JOB_STORE_HARD_LIMIT: usize = 500;
 /// 一次常规淘汰的批量大小。
 pub(crate) const JOB_EVICT_BATCH: usize = 20;
-/// 同时运行中的后台任务上限，可用 `ATB_MAX_RUNNING_JOBS` 覆盖。
-///
-/// `JOB_STORE_HARD_LIMIT` 限的是**表**（元数据），不是执行：全是 Running 时旧实现
-/// 只会「删记录、任务照跑」，真正的并发可以无限往上顶——每个 job 都在抢浏览器与
-/// 扩展通道，结果是所有命令一起变慢/超时。这里给它一个真正的执行上限。
-pub(crate) const JOB_DEFAULT_MAX_RUNNING: usize = 32;
-
-/// 当前生效的运行并发上限。
-///
-/// 用 `OnceLock` 缓存：`ATB_MAX_RUNNING_JOBS` 是进程级配置，运行期改环境变量本来
-/// 也不会被其它进程读到；`/health` 与拒绝分支必须看到同一个值。
-pub(crate) fn max_running_jobs() -> usize {
-    static LIMIT: OnceLock<usize> = OnceLock::new();
-    *LIMIT.get_or_init(|| {
-        std::env::var("ATB_MAX_RUNNING_JOBS")
-            .ok()
-            .and_then(|value| value.trim().parse::<usize>().ok())
-            .filter(|limit| *limit > 0)
-            .unwrap_or(JOB_DEFAULT_MAX_RUNNING)
-    })
-}
 
 impl JobStore {
     /// 为即将插入的新任务腾空间。
@@ -160,7 +139,7 @@ impl JobStore {
     /// 排序键固定为 `finished_at.unwrap_or(created_at)` 升序（同值按 id 字典序），
     /// 保证「先完成、最旧」的先走，而不是取决于 HashMap 的迭代顺序。
     /// 已结束的都删完了还到硬上限时，只能强制淘汰最旧的 Running——**先 abort 再删**
-    /// （旧实现只删记录，任务继续占着标签与并发额度）。被淘汰的 id 会留
+    /// （；旧实现只删记录，任务继续占着标签与并发额度）。被淘汰的 id 会留
     /// `job_evicted` 存根（见 `record_eviction`），这是表有界的代价，必须显式打日志。
     pub(crate) fn evict_for_insert(&mut self) {
         if self.jobs.len() < JOB_STORE_SOFT_LIMIT {
@@ -219,13 +198,13 @@ impl JobStore {
             }
             self.jobs.remove(&id);
             // 旧实现只打 eprintln：调用方随后 `job get/wait` 只会拿到 job_not_found，
-            // 看起来像 id 写错，于是去改一条本来正确的命令（D-05）。留一条
+            // 看起来像 id 写错，于是去改一条本来正确的命令。留一条
             // `job_evicted` 存根，把「daemon 侧丢弃」和「id 不存在」区分开。
             self.record_eviction(id, epoch_secs());
             forced += 1;
         }
         if forced > 0 {
-            // 消息里的「结果不可再查询」已按 D-05 存根语义更新：结果确实拿不回来，
+            // 消息里的「结果不可再查询」已按 存根语义更新：结果确实拿不回来，
             // 但 `job get/wait <id>` 会命中存根、明确报 job_evicted，不再是 job_not_found。
             eprintln!(
                 "job: 任务表达到硬上限 {JOB_STORE_HARD_LIMIT}，已强制淘汰并 abort {forced} 条最旧的 running 任务（查询将返回 job_evicted）"
@@ -486,7 +465,7 @@ pub(crate) async fn job_submit(
             .values()
             .filter(|job| job.status.is_running())
             .count();
-        let limit = max_running_jobs();
+        let limit = crate::settings::max_running_jobs();
         if running >= limit {
             drop(store);
             eprintln!(
@@ -543,7 +522,7 @@ pub(crate) async fn job_submit(
                 job.finished_at = Some(epoch_secs());
                 job.elapsed_ms = elapsed_ms;
                 // 只有「仍在 Running」才允许 cancel 改写终态：cancel 落在任务刚完成的
-                // 窗口里时结果已经产生，判成 Cancelled 会把结果整个丢掉（C-04）。
+                // 窗口里时结果已经产生，判成 Cancelled 会把结果整个丢掉。
                 if job.status.is_running() && cancelled {
                     job.status = JobStatus::Cancelled;
                     job.error =
@@ -582,7 +561,7 @@ pub(crate) async fn job_submit(
                     }
                 }
             }
-            // D-05 残留：任务表硬上限强制淘汰过这条任务时，`get_mut` 返回 None 后旧实现
+            // 残留：任务表硬上限强制淘汰过这条任务时，`get_mut` 返回 None 后旧实现
             // 静默丢弃结果——调用方只看到 job_evicted，不知道命令到底跑完没有。
             None => {
                 eprintln!(
@@ -624,7 +603,7 @@ pub(crate) async fn job_get(
     match store.jobs.get(&job_id) {
         Some(job) => Json(json!({ "ok": true, "job": job.to_json() })),
         // 被硬上限强制淘汰的任务：不能回落到 job_not_found（那会被当成 id 写错，
-        // 引导调用方去改一条本来正确的命令，D-05）。给出稳定的 job_evicted 语义。
+        // 引导调用方去改一条本来正确的命令）。给出稳定的 job_evicted 语义。
         None if store.evicted.contains_key(&job_id) => Json(json!({
             "ok": false,
             "error": format!("job {job_id} 因任务表达到硬上限被强制淘汰"),
@@ -677,7 +656,7 @@ pub(crate) async fn job_cancel(
         }));
     };
     // 只有 Running 的任务才真正接受取消：已结束的任务再 cancel 不能把终态
-    // 覆盖成 Cancelled（结果已经产生，丢了就再也拿不回来，C-04）。
+    // 覆盖成 Cancelled（结果已经产生，丢了就再也拿不回来）。
     // 对终态任务保持幂等：仍返回 ok:true，但明确 cancel_requested:false。
     let running = job.status.is_running();
     if running {

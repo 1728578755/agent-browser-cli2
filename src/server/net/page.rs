@@ -33,11 +33,11 @@ pub(crate) async fn net_page_call(
     }
 }
 
-/// 给「整个页面往返」再套一层总超时（的"别在持锁时无限等待"）。
+/// 给「整个页面往返」再套一层总超时（"别在持锁时无限等待"）。
 ///
-/// `execute_page_js` 的 timeout 只包住「最后等回包」（），前面等会话锁
+/// `execute_page_js` 的 timeout 只包住「最后等回包」（同理），前面等会话锁
 /// 没有超时：后台 job / 长 `exec`（hold_lock=true）正持锁时，net 命令会一直等，
-/// 而 `net_value` 此时握着 `net_persist_lock`，后续 net 命令全部被堵。
+/// 而 `net_value` 此时握着该 profile 的落盘锁，同 profile 的后续 net 命令会被堵。
 /// 这里把整段限制在 timeout 内，超时如实报错（不伪装成功）。
 pub(crate) async fn net_page_call_bounded(
     state: &AppState,

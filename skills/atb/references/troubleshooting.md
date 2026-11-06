@@ -37,7 +37,7 @@
 
 ## 4. 协议或版本不配套
 
-**症状**：`CLI 与 daemon 版本不配套`、`extension_outdated`、`upgrade_recommended:true`、`stealth` 返回 `extension_ok:false`。**判断**：三方须配套：API 协议 `5`、扩展消息协议 `4`、扩展文件版本 `5.3.0`。不配套时命令明确报错，不会静默跑错。
+**症状**：`CLI 与 daemon 版本不配套`、`extension_outdated`、`upgrade_recommended:true`、`stealth` 返回 `extension_ok:false`。**判断**：三方须配套：API 协议 `5`、扩展消息协议 `4`、扩展文件版本 `5.4.2`。不配套时命令明确报错，不会静默跑错。
 
 | 现象 | 原因 | 处理 |
 | --- | --- | --- |
@@ -74,7 +74,6 @@
   仍需要调试器的只剩 `network`、`console`、`upload`、`send-keys`、`net mock --engine cdp`、元素/后台标签页截图。
 - 错误里已经点名挡路的扩展（例如「检测到页面内嵌了扩展「XX助手」的 iframe」）：需要真实输入事件或可检索 PDF 时，让用户临时禁用该扩展后重试。
 - 不要把「合成事件成功」当成真实点击：部分站点只认 `isTrusted` 事件，看到 `synthetic:true` 要自行确认业务是否真的响应。
-- 不要改页面 CSP 头或注入 `<meta>` 绕过，那是改站点行为。
 
 ## 7. 选择器打不到
 
@@ -97,7 +96,7 @@ atb wait --selector '.result' --visible --timeout 10
 
 **症状**：`challenge_timeout`、`challenge_blocked`，或 `challenge.auto_solve.reason` 给出结论。
 
-**判断**：`open --challenge auto`、`challenge solve`、`challenge auto` 会主动点击组件并等待放行；`challenge wait` 才是纯等待。失败按 reason 处置，兜底由智能体自己点，最后才 `focus` 转人工。不破解访问控制，也不保证通过。
+**判断**：`open --challenge auto`、`challenge solve`、`challenge auto` 会主动点击组件并等待放行；`challenge wait` 才是纯等待。失败按 reason 处置，兜底由智能体自己点，最后才 `focus` 转人工。
 
 | reason | 含义 | 处理 |
 | --- | --- | --- |
@@ -128,7 +127,7 @@ atb download <url> --filename report.pdf --dir atb-downloads
 atb download-wait --id <downloadId> --timeout 300
 ```
 
-`--dir` 只能是 Chrome 默认下载目录下的子目录，不能写绝对路径。
+`--dir` 相对路径按当前工作目录解析，也可传绝对路径；包含 `..` 段会被拒绝。
 
 ## 10. 多智能体串扰
 
@@ -191,13 +190,13 @@ cp -r skills/atb/. ~/.workbuddy/skills/atb/
 atb schema --json
 ```
 
-## 12. 新增错误码（0.7.2）
+## 12. 新增错误码（0.7.4）
 
 | 错误码 | 症状 | 判断 | 处理 |
 | --- | --- | --- | --- |
 | `wait_js_failed` | `exec --wait-js` 返回 `ok:false`，但脚本已经执行 | 等待条件没满足；`js_return` 里可能已有结果，`wait.ok=false` / `matched=false` | 按失败处理，不要当成功继续；加 `--wait-timeout`、改谓词（保持轻量），或先 `wait` 再取结果 |
-| `challenge_probe_failed` | `challenge status/detect` 返回 `probed:false`、`status_usable:false` | 挑战探测拿不到可用载荷：扩展断连、注入被拒、或页面已导航 | 重试一次；持续失败看 `diag.errors`、`atb doctor`，**不要**当成「没有挑战」继续操作 |
+| `challenge_probe_failed` | `challenge status` 返回 `probed:false`、`status_usable:false` | 挑战探测拿不到可用载荷：扩展断连、注入被拒、或页面已导航 | 重试一次；持续失败看 `atb doctor`，**不要**当成「没有挑战」继续操作 |
 | `host_not_allowed` | CLI 连 daemon 返回 403 | 请求的 `Host` 不是 `127.0.0.1` / `localhost` / `[::1]` | 用回环地址访问；不要用局域网 IP、自定义域名或反代主机名 |
-| `ws_backpressure` | 命令偶发失败，扩展侧卡顿 | 目前只把 pong 控制通道改成有界（`ATB_WS_OUTBOUND_MAX`），命令通道仍是 `unbounded`，所以该错误码目前是**预留**，正常不会出现 | 偶发卡顿等几秒重试；持续出现重载扩展或 `atb restart`；大量并发改用 `batch` 控制并发 |
+| `ws_backpressure` | 命令偶发失败，扩展侧卡顿 | 当前只把 pong 控制通道改成有界（`ATB_WS_OUTBOUND_MAX`），命令通道仍是 `unbounded`，所以该错误码目前是**预留**，正常不会出现 | 偶发卡顿等几秒重试；持续出现重载扩展或 `atb restart`；大量并发改用 `batch` 控制并发 |
 | `outcome_unknown` | 退出码 4，`outcome_unknown:true` | 请求已发出但响应丢失（超时/断连），动作**可能已执行** | 带同一个 `--idempotency-key` 重发；不要换 key 重试副作用命令；先 `status` 看会话是否还活着 |
 | `agent_no_default` | `target_lost`，`reason:"agent_no_default"` | `ATB_SESSION_ISOLATION=strict`，具名 agent 没有自己的默认目标 | 先 `atb open <url>` 建默认；或临时改回 `legacy`（`ATB_SESSION_ISOLATION=legacy`） |

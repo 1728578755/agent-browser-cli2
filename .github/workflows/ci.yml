@@ -39,9 +39,23 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-      - run: node --check assets/atb_bridge/background.js
-      - run: node --check assets/atb_bridge/content.js
-      - run: node --check assets/atb_bridge/popup.js
+      # ：以前只 node --check background/content/popup 三个入口，options.js 与
+      # ui/*.js 完全没人解析——options.js 一个语法错误就让管理页白屏，而 CI 还是全绿。
+      # 现在扫全量：新增脚本自动纳入，不需要回来改 YAML。
+      - name: 全量语法校验（assets/atb_bridge 下所有 .js）
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(find assets/atb_bridge -name '*.js' -type f | sort)
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "::error::assets/atb_bridge 下没有找到任何 .js"
+            exit 1
+          fi
+          for file in "${files[@]}"; do
+            node --check "${file}"
+            echo "ok ${file}"
+          done
+          echo "已校验 ${#files[@]} 个扩展脚本"
 
   node-tests:
     name: Node tests
@@ -52,10 +66,13 @@ jobs:
         with:
           node-version: 24
 
-      # 这里不再跑 `npm ci --dry-run`：它会执行 postinstall，而 postinstall 的职责是
-      # 「确认原生二进制真的在」——CI 检出的是源码、平台子包要等发布才存在，必然报
-      # 「没有可执行的 atb」。lock 与 package.json 的一致性由下面的 check-lock 覆盖，
-      # 它同时比对 Cargo.lock、package-lock 与平台条目，比 dry-run 更严格且不装依赖。
+      # package.json 与 package-lock.json 必须同步：lock 版本漂移、平台条目缺 version
+      # 都会让下游的 `npm ci` 直接 EUSAGE 失败（v5 ）。这里只 dry-run，不装依赖。
+      # --ignore-scripts 是必需的：dry-run 仍会执行 lifecycle script，而 postinstall 在
+      # 没装原生二进制时会 exit 1（平台包在 CI 机器上本来就装不上），那是安装检查不是锁校验。
+      - name: lock 与 package.json 一致性（npm ci --dry-run）
+        run: npm ci --dry-run --ignore-scripts
+
       # 版本号以 package.json（CLI）与 assets/atb_bridge/manifest.json（扩展）为真相源：
       # Cargo.toml / Cargo.lock / package-lock.json / 两份 README / AI_INSTALL / SECURITY /
       # PRIVACY / FEATURE_STATUS / BEST_PRACTICES / skills/** 都要一致。
@@ -80,18 +97,18 @@ jobs:
       #
       # 用 `npm test` 而不是内联命令：本地 `npm test` 与 CI 必须是同一条。
       # 各文件守的是什么（改对应模块时请先看这一行）：
-      #   asset_parity             assets/page_*.js 与 ops/ 副本逐字节一致 + 文档里的扩展版本 = manifest
-      #   npm_wrapper              npm/bin/atb.js 的兜底错误分支不抛 ReferenceError
-      # page_net_contract hook 的 routes 是计数、routes_list 才是数组（上游契约）
-      #   page_net_fixes           URL 解析、字面量匹配、规则优先级、旁路捕获、net fetch 不自我欺骗
-      # net_response_rewrite 读不到原始响应体时不得用空 body 顶替（数据丢失型假成功）
+      # asset_parity assets/page_*.js 与 ops/ 副本逐字节一致 + 文档里的扩展版本 = manifest
+      # npm_wrapper npm/bin/atb.js 的兜底错误分支不抛 ReferenceError
+      # page_net_contract hook 的 routes 是计数、routes_list 才是数组（ 上游契约）
+      # page_net_fixes URL 解析、字面量匹配、规则优先级、旁路捕获、net fetch 不自我欺骗
+      # net_response_rewrite 读不到原始响应体时不得用空 body 顶替（ 数据丢失型假成功）
       # net_routes_idempotent net routes 是只读命令，不得把整份 config 当 cdp 规则下发
-      #   extension_net_intercept  网络拦截（CDP Fetch 域）
-      #   extension_csp_policy     CSP 策略 + 可选 API 加载
+      # extension_net_intercept 网络拦截（CDP Fetch 域）
+      # extension_csp_policy CSP 策略 + 可选 API 加载
       # fetch_pause_invariant Fetch 暂停后必须续传，否则页面请求永久挂起
       # cli_contract 退出码是唯一的机器可读信号
-      #   challenge_detect         挑战识别判据（TOKEN_SELECTORS / detect 分支）
-      #   stealth_audit            反检测审计的评分与 scope 归属
+      # challenge_detect 挑战识别判据（TOKEN_SELECTORS / detect 分支）
+      # stealth_audit 反检测审计的评分与 scope 归属
       - name: 页面脚本与接口契约回归（npm test）
         run: npm test
 
@@ -99,6 +116,39 @@ jobs:
       # 现在无条件执行；脚本缺失本身就是错误。
       - name: 扩展资源同步校验（主副本 vs ops）
         run: npm run check:extension
+
+  # ：Windows 是 5 个发布平台之一，历史事故（反斜杠、exe 占用、盘符相对路径）
+  # 大多只在 Windows 上复现，而 JS 面此前零覆盖。这里跑与 ubuntu 同一批纯 JS 检查；
+  # 浏览器相关的 e2e-live 仍只在 Linux 跑（Windows runner 装 unpacked 扩展不可靠）。
+  node-tests-windows:
+    name: Node tests (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      # --ignore-scripts：CI 里没有已发布的平台包，postinstall 的二进制检查只会误报。
+      - name: 安装（npm ci）
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: 版本一致性（sync-version --check）
+        run: node scripts/sync-version.mjs --check
+
+      - name: 锁文件一致性（check-lock）
+        run: node scripts/check-lock.mjs
+
+      - name: 页面脚本可解析且入口齐全
+        run: node tests/check_page_script.mjs
+
+      # shell: bash —— pwsh 不展开 glob，会把字面量 tests/*.test.mjs 传给 node。
+      - name: 页面脚本与接口契约回归（tests/*.test.mjs）
+        shell: bash
+        run: node --test tests/*.test.mjs
+
+      - name: 扩展资源同步校验（主副本 vs ops）
+        run: node scripts/sync-extension-assets.mjs --check
 
   # E2E 自检：起真 daemon + 假扩展，占 18766/18767 端口。
   # 必须是**单 job 单步骤串行**跑——并行会互相抢端口，产生假红/假绿
@@ -123,11 +173,6 @@ jobs:
     name: E2E live（真 Chrome + 真扩展）
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    # 这条链路依赖「xvfb 里用 --load-extension 装 MV3 扩展」这一环境行为，
-    # Chrome 版本一换就可能装不上（表现为扩展 60s 内不连 daemon），与产品代码无关。
-    # 保留它作为可见的冒烟信号，但不阻断合并与发布；本地用 `ATB_E2E=smoke node scripts/e2e.mjs`
-    # 跑同一批场景，结果是权威的。
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -166,7 +211,6 @@ jobs:
           xvfb-run -a --server-args="-screen 0 1280x1024x24" \
             "${{ steps.chrome.outputs.chrome-path }}" \
             --no-sandbox --disable-gpu --no-first-run --no-default-browser-check \
-            --disable-features=DisableLoadExtensionCommandLineSwitch \
             --user-data-dir="$RUNNER_TEMP/atb-e2e-profile" \
             --disable-extensions-except="$EXT" --load-extension="$EXT" \
             "http://127.0.0.1:8123/basic.html" > "$RUNNER_TEMP/chrome.log" 2>&1 &
@@ -214,3 +258,18 @@ jobs:
           echo "--- chrome.log ---"
           tail -n 80 "$RUNNER_TEMP/chrome.log" || true
           pkill -f "chrome.*atb-e2e-profile" || true
+
+  hygiene:
+    name: 仓库卫生
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 内部提示词 / 内部标记不得进入源码。命中即失败。
+      - name: 源码中不得出现内部提示词
+        run: |
+          if grep -rn "L3记忆" src/; then
+            echo "::error::src/ 中出现内部提示词，请移除"
+            exit 1
+          fi
+          echo "ok: src/ 未出现内部提示词"

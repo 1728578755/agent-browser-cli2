@@ -43,7 +43,7 @@ pub(crate) fn usage_failure(
 ///
 /// 有些误用是「把子命令名当成了位置参数」（`atb download list`），只给文案和 hint
 /// 调用方仍要自己找正确命令；把替代命令结构化地放在 `did_you_mean` 里，
-/// 预检信息就能直接被复用（P1 体验项）。
+/// 预检信息就能直接被复用（体验项）。
 pub(crate) fn usage_failure_with_suggestion(
     code: &str,
     message: impl Into<String>,
@@ -70,7 +70,7 @@ macro_rules! usage_err {
 pub(crate) use usage_err;
 
 /// `--async` 只在部分命令上实现。以前其余命令**静默忽略**它（照常同步执行、也不返回
-/// job_id），同一个 flag 在不同命令上三种行为并存（P3 CLI 一致性）。
+/// job_id），同一个 flag 在不同命令上三种行为并存（CLI 一致性）。
 /// 现在统一：不支持的命令给出结构化错误 + 退出码 2。
 pub(crate) fn reject_async_if_set(command: &str, is_async: bool) -> Result<()> {
     if !is_async {
@@ -104,7 +104,7 @@ pub(crate) fn report_failure(err: &anyhow::Error) -> i32 {
             Some(usage.hint.clone()),
             usage.suggestion.clone(),
         ),
-        // HTTP 层失败带结构化 code/hint（/17）：直接把稳定码透出去，
+        // HTTP 层失败带结构化 code/hint（17）：直接把稳定码透出去，
         // 否则会被兜底成 unexpected_error，调用方就分不清 token 失配与环境故障。
         None => match err.downcast_ref::<HttpFailure>() {
             Some(failure) => (
@@ -186,7 +186,7 @@ pub(crate) fn print_json(mut value: Value) {
             .to_string();
         // 子串兜底只在 JSON 里**没有**结构化 error_code 时才走：daemon 侧正在补
         // typed error_code，一旦有了结构化码就不能再被中文子串覆盖——否则同一次
-        // 失败在 daemon 升级前后会被归进不同分支，退出码漂移（P1 契约被破坏）。
+        // 失败在 daemon 升级前后会被归进不同分支，退出码漂移（契约被破坏）。
         if value.get("error_code").is_none() {
             if text.contains("exec_timeout") {
                 // exec/action 超时不代表结果丢失，扩展可能稍后才回包。
@@ -248,9 +248,15 @@ pub(crate) fn print_json(mut value: Value) {
 /// 判据是**结构优先、白名单兜底**：先按命名约定认前缀，再列那些不符合约定的历史码。
 /// 以前只有白名单，新增一个 `invalid_frame` / `unsupported_world` 而忘了登记，就会
 /// 静默落到退出码 1（= 可重试），Agent 于是反复重试一条本来就写错的命令（v8）。
+///
+/// 反例：`idempotency_in_flight_timeout` **不要**加进白名单——它表示首次请求仍在执行、
+/// 稍后可重试，属于执行失败（退出码 1）。
 pub(crate) fn is_usage_error_code(code: &str) -> bool {
     /// 命名约定：参数/目标/语法类错误都用这些前缀。
-    const USAGE_PREFIXES: &[&str] = &["invalid_", "unsupported_", "not_a_", "empty_"];
+    ///
+    /// `too_many_` 同样属于「调用方要改」：`too_many_rules` 是 net 规则数超过每
+    /// profile 上限（默认 64），原样重试永远还是满的，必须先 `net unroute` / `net reset`。
+    const USAGE_PREFIXES: &[&str] = &["invalid_", "unsupported_", "not_a_", "empty_", "too_many_"];
     /// 例外：同样是 `invalid_` 开头，但属于「daemon 侧异常」，重试或重启才有意义。
     /// 把它们判成 2 会让 Agent 去改一条本来没错的命令。
     const NOT_USAGE: &[&str] = &["invalid_response", "invalid_api_token"];
@@ -287,7 +293,35 @@ pub(crate) fn is_usage_error_code(code: &str) -> bool {
             | "idempotency_key_reused"
             // 解析出的目标已经失效（标签被关/会话被回收）。改命令重新选目标，
             // 盲目重试同一个目标只会一直失败。
-            | "target_lost" // 注意：`idempotency_in_flight_timeout` **不要**加进来——它表示首次请求
-                            // 仍在执行、可稍后重试，属于执行失败（退出码 1）。
+            | "target_lost"
+            // 同族：单条 mock/route 的 body 超过 `ATB_NET_RULE_MAX_BYTES`（默认 2MiB）。
+            // 和 `too_many_rules` 一样是「改 payload / 调上限」才解决，原样重试永远失败；
+            // 这里用**精确码**而不是 `net_rule_` 前缀：daemon 的规则校验未来可能新增
+            // 真正可重试的 `net_rule_*`，不能被一刀切归成用法错误。
+            | "net_rule_too_large"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `too_many_rules` 属于「改命令/先清理」那一档：原样重试永远是满的。
+    /// 同族前缀 `too_many_` 统一进 USAGE_PREFIXES，避免以后新增同类码又落回 1。
+    #[test]
+    fn too_many_prefix_maps_to_usage_exit() {
+        assert!(is_usage_error_code("too_many_rules"));
+        assert!(is_usage_error_code("too_many_nodes"));
+        // 单条 body 超上限同样是「改 payload 才解决」。
+        assert!(is_usage_error_code("net_rule_too_large"));
+        // 精确码而不是前缀：`net_rule_` 家族未来的其它码不能被顺手判成 2。
+        assert!(!is_usage_error_code("net_rule_pending_flush"));
+        // 反例：这些是执行失败/环境故障，不能被前缀或白名单误判成 2。
+        assert!(!is_usage_error_code("ws_backpressure"));
+        assert!(!is_usage_error_code("ws_disconnected"));
+        assert!(!is_usage_error_code("task_panicked"));
+        assert!(!is_usage_error_code("invalid_response"));
+        assert!(!is_usage_error_code("invalid_api_token"));
+        assert!(!is_usage_error_code("idempotency_in_flight_timeout"));
+    }
 }

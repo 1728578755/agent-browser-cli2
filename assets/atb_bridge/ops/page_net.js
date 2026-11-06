@@ -38,7 +38,7 @@
 // 4) 入口定义：整个文件包在 IIFE 里，末尾用 defineProperty 把 __abcNet 挂到 window，
 //    而不是写成顶层 `function __abcNet(){}`。原因有两条，都实测过：
 //    a. 顶层函数声明在 classic script（扩展 executeScript({files}) 路径）里创建的是
-//       **non-configurable** 全局绑定 —— 这个位是 V8 内部的 DONT_DELETE，
+// **non-configurable** 全局绑定 —— 这个位是 内部的 DONT_DELETE，
 //       getOwnPropertyDescriptor 上看不出来（configurable 仍报 true），但
 //       `delete window.__abcNet` 恒返回 false。结果 scrub 永远清不掉这个入口。
 //       （daemon 的 eval 路径没有这个问题，但两条路径必须都给对。）
@@ -346,8 +346,8 @@ function __abcNet(opts) {
     if (reCache.has(pattern)) return reCache.get(pattern);
     let compiled = null;
     try { compiled = new RegExp(pattern); } catch (_) { compiled = null; }
-    // 上限 64：规则本身就限 50 条，页面反复改规则时也不会无限增长。
-    if (reCache.size >= 64) reCache.clear();
+    // 上限 128：正常情况下规则只有 MAX_ROUTES（64）条，页面反复改规则时也不会无限增长。
+    if (reCache.size >= 128) reCache.clear();
     reCache.set(pattern, compiled);
     return compiled;
   }
@@ -549,7 +549,7 @@ function __abcNet(opts) {
   //
   // `clone.text()` 要等整个 body 结束。对 text/event-stream 这类**永不结束**的流，
   // 页面自己的 fetch Promise 就永远不 resolve —— 聊天流、进度推送、视频分片全挂死
-  // 。所以：
+  // （。所以：
   //   * 捕获走旁路（不 await）：日志条目先落盘、preview 后补；
   //   * 改写只动 status/headers 时透传 response.body 流，不缓冲；
   //   * 命中流式/超大响应且规则没给 body 时跳过改写，并标明原因。
@@ -560,6 +560,13 @@ function __abcNet(opts) {
   // 现在：超时硬上限 + reader.cancel()，并由 content-type 白名单挡掉二进制。
   const DEFAULT_BODY_TIMEOUT_MS = 1500;
   const MAX_BODY_TIMEOUT_MS = 10000;
+  /// 规则条数上限：与 daemon 的 `ATB_NET_RULE_MAX_RULES`（默认 64）同口径。
+  ///
+  /// 两边必须是**同一个数字**：daemon 在新增规则时按它报 `too_many_rules`，页面在
+  /// 「持久注入重放」时按它裁剪。历史实现这里是 50、daemon 是 64，于是 51~64 条规则
+  /// 在刷新后会被页面静默裁掉 —— `net routes` 显示全量、浏览器实际只生效前 50 条，
+  /// first-match 的原位替换语义也随之失真。只写一处、只改一处。
+  const MAX_ROUTES = 64;
   const TEXT_LIKE_TYPES = [
     'text/',
     'application/json',
@@ -586,7 +593,7 @@ function __abcNet(opts) {
     try { length = Number(response.headers.get('content-length') || 0); } catch (_) {}
     if (type.indexOf('text/event-stream') >= 0) return 'streaming_response (text/event-stream)';
     if (length > MAX_CAPTURE_BYTES) return 'content_length ' + length + ' > ' + MAX_CAPTURE_BYTES;
-    // 二进制（图片/字体/视频分片）不做捕获：clone().text() 会把它按 UTF-8 解码，
+    // 二进制（图片/字体/视频分片）不做捕获：clone.text 会把它按 解码，
     // 体积膨胀几十倍、内容全是乱码，对诊断没有价值。
     // 没有 content-type 时不跳过（宁可多读一次），没有 content-length 也不再跳过 ——
     // chunked 流由超时兜住。
@@ -669,8 +676,8 @@ function __abcNet(opts) {
 
   /// 构造 mock 响应。以前这段在 try **之外**：规则写 `status:204`（无内容响应是很
   /// 常见的 mock 需求）同时带 body 时 `new Response` 抛 TypeError，异常从包装器同步
-  /// 抛出 → 页面 fetch 直接 reject，且一条日志都没有，`net log` 里查不到这次请求
-  /// 。现在：无内容状态码强制 body=null，任何构造失败都记
+  /// 抛出 → 页面 fetch 直接 reject，且一条日志都没有，`net log` 里查不到这次请求。
+  /// 现在：无内容状态码强制 body=null，任何构造失败都记
   /// `mock_invalid` 并放行真实请求。
   function buildMockResponse(rule, url, method, started) {
     const status = rule.status === undefined ? 200 : Number(rule.status);
@@ -800,6 +807,28 @@ function __abcNet(opts) {
     state.xhrGuarded = true;
   }
 
+  /// 把 originals 的 XHR 基线对齐到**当前**原型方法（见 install 分支③）。
+  /// 当前方法是我们自己的 wrapper 时保持原基线，否则新 wrapper 会调自己 → 无限递归。
+  function rebaseXhrOriginals(originals) {
+    const proto = XMLHttpRequest.prototype;
+    const pairs = [
+      ['xhrOpen', 'open', 'xhrOpenWrapper'],
+      ['xhrSend', 'send', 'xhrSendWrapper'],
+      ['xhrSetHeader', 'setRequestHeader', 'xhrSetHeaderWrapper']
+    ];
+    for (const pair of pairs) {
+      const key = pair[0];
+      const name = pair[1];
+      const wrapperKey = pair[2];
+      const current = proto[name];
+      if (typeof current !== 'function') continue;
+      if (current === state[wrapperKey] || isOurWrapper(current)) continue;
+      if (originals[key] === current) continue;
+      if (typeof originals[key] === 'function') state.xhr_replaced = true;
+      originals[key] = current;
+    }
+  }
+
   function install() {
     // ① 已经装好且仍在位：直接复用（重复 hook 的最常见路径）。
     if (state.installed && state.fetchWrapper && window.fetch === state.fetchWrapper) {
@@ -842,11 +871,27 @@ function __abcNet(opts) {
     //    既不认页面后来装的 wrapper，也可能把页面的 fetch 抹成未定义。
     let originals = state.originals;
     if (originals && typeof originals === 'object') {
-      if (originals.fetch !== currentFetch) {
+      // 基线是**共享对象**：install #1 装上去的 wrapper 在调用时才读
+      // originals.fetch / originals.xhrOpen。就地改写等于让老 wrapper 调到「页面
+      // 当前的实现」，而页面的实现通常正好包着老 wrapper —— pageWrapper →
+      // 老 wrapper → pageWrapper 直接无限递归。所以先浅拷贝：新 wrapper 用新基线，
+      // 老 wrapper 继续用老基线，页面自己的补丁留在链上。
+      const next = Object.assign({}, originals);
+      if (next.fetch !== currentFetch) {
         // 记录「装好之后被页面换过」：回包给调用方，排查起来不用猜。
         if (state.fetchWrapper) state.fetch_replaced = true;
-        originals.fetch = currentFetch;
+        next.fetch = currentFetch;
       }
+      // fetch 之外，XHR 三个方法也必须重定基线。
+      //
+      // 为什么会走到这里：`window.fetch !== state.fetchWrapper`，也就是「页面在我们
+      // 装好之后换过 fetch，或把我们的 wrapper 顶掉了」。这时要装新 wrapper，而新
+      // wrapper 的闭包用的是 originals —— 如果页面监控 SDK（Sentry / 各种 RUM）在
+      // 这期间替换过 XHR 方法，沿用第一次保存的 originals 会把页面自己的补丁从调用
+      // 链上**整体剪掉**：请求照发，那层 SDK 完全不执行，而且没有任何标记可查。
+      // 只重定「当前值不是我们 wrapper」的项，否则会把基线改成自己（无限递归）。
+      rebaseXhrOriginals(next);
+      originals = next;
     } else {
       originals = {
         fetch: currentFetch,
@@ -1028,8 +1073,8 @@ function __abcNet(opts) {
       this.__abcNetRespSpec = null;
       try { delete this.__abcNetRespBuilt; } catch (_) {}
       // 同一个 XHR 反复 open/send 时，上一轮 send 里注册的 loadend 记账监听器
-      // 还挂在实例上 —— 每轮多一条日志、多一次 rewriteOf，长轮询页面上会线性膨胀
-      // 。这里按保存的引用精确摘掉自己注册的那一个，不用 removeAll 误伤页面。
+      // 还挂在实例上 —— 每轮多一条日志、多一次 rewriteOf，长轮询页面上会线性膨胀。
+      // 这里按保存的引用精确摘掉自己注册的那一个，不用 removeAll 误伤页面。
       if (this.__abcNetLoadend) {
         try { this.removeEventListener('loadend', this.__abcNetLoadend); } catch (_) {}
         this.__abcNetLoadend = null;
@@ -1333,7 +1378,7 @@ function __abcNet(opts) {
   if (action === 'fetch') return doFetch();
 
   if (action === 'hook' || action === 'install') {
-    // B-17：只有显式给出才覆盖。旧实现无条件 `= opts.captureBodies === true`，
+    // 只有显式给出才覆盖。旧实现无条件 `= opts.captureBodies === true`，
     // 于是第二次 `net hook --persist`（只想刷新 matches）会把已持久化的
     // captureBodies 静默压回 false，用户看到的是「body 抓不到了」却找不到原因。
     // daemon 侧已改成「None 不下发」，页面侧必须同样把「未传」当成「保持现状」。
@@ -1352,17 +1397,17 @@ function __abcNet(opts) {
     if (opts.maxLog > 0) {
       state.maxLog = Math.min(20000, Math.max(10, Math.floor(opts.maxLog)));
       // 收紧上限时立刻裁剪：否则要等下一条日志进来才生效，刚 `--max-log 10`
-      // 就 `net log` 仍会看到旧的几千条（P2-22b）。
+      // 就 `net log` 仍会看到旧的几千条（-22b）。
       if (state.log.length > state.maxLog) state.log.splice(0, state.log.length - state.maxLog);
     }
     // 持久注入重放时会带上已有规则，避免刷新后规则丢失。
-    // 超过 50 条的部分会被截断，这里必须把条数回传给调用方：
-    // 以前静默 slice(0,50)，第 51 条刷新后就消失且毫无提示。
+    // 超过 MAX_ROUTES 的部分会被截断，这里必须把条数回传给调用方：
+    // 以前静默截断，第 N+1 条刷新后就消失且毫无提示。
     let routesDropped = 0;
     if (Array.isArray(opts.routes)) {
       const accepted = opts.routes.filter((rule) => rule && typeof rule === 'object');
-      routesDropped = Math.max(0, accepted.length - 50);
-      state.routes = accepted.slice(0, 50);
+      routesDropped = Math.max(0, accepted.length - MAX_ROUTES);
+      state.routes = accepted.slice(0, MAX_ROUTES);
     }
     install();
     return {
@@ -1375,12 +1420,19 @@ function __abcNet(opts) {
       // 冲突/顶替如实回报：旧实现只在内部静默覆盖，用户永远查不到
       // 「为什么 hook 装了却不生效」。
       fetch_replaced_by_page: state.fetch_replaced || undefined,
+      // XHR 三个方法被页面在后装之后替换过（基线已重定，页面补丁不再被剪掉）。
+      xhr_replaced_by_page: state.xhr_replaced || undefined,
       fetch_conflict: state.fetch_conflict || undefined,
       // routes 历史上是「规则条数」（数字），保留给老调用方；
       // 新调用方（daemon 持久化后重放）必须读 routes_list —— 把数字当数组存下来，
       // 刷新后原样下发会被上面的 Array.isArray(opts.routes) 跳过，规则就静默丢了。
       routes: state.routes.length,
       count: state.routes.length,
+      // 本条实际生效的重放上限（与 `routes_dropped` 同级、number）。daemon 用它把
+      // 「只重放前 N 条」的告警文案说准，缺字段时它按 64 回落。值来自上面的
+      // `MAX_ROUTES` 单一常量，因此永远与真正的裁剪口径一致 —— 不要在 daemon 里
+      // 另写一份常量（那正是 50 vs 64 那类漂移）。
+      routes_cap: MAX_ROUTES,
       routes_dropped: routesDropped || undefined,
       routes_list: state.routes
     };
@@ -1496,6 +1548,7 @@ function __abcNet(opts) {
     state.xhrSendWrapper = null;
     state.xhrSetHeaderWrapper = null;
     state.fetch_replaced = false;
+    state.xhr_replaced = false;
     state.fetch_conflict = null;
     // 状态槽位本身也是痕迹：不可枚举，但仍能被 getOwnPropertyNames 列出来，
     // 所以 reset 要连它一起删掉（configurable:true 就是为了这一步）。

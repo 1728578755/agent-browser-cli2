@@ -1,4 +1,5 @@
 use super::*;
+use axum::body::HttpBody as _;
 use std::io::{BufRead as _, Seek as _, SeekFrom, Write as _};
 
 pub(crate) const HOST: &str = "127.0.0.1";
@@ -45,6 +46,11 @@ pub(crate) const IDEMPOTENCY_INFLIGHT_WAIT_MAX: Duration = Duration::from_secs(6
 /// 超过它 / 拿不到 `Content-Length`（流式上传）时**不读体**，直接把请求原样放行
 /// 且不缓存：能执行，只是失去「响应丢失后回放」的保护。
 pub(crate) const IDEMPOTENCY_BODY_LIMIT: usize = 4 * 1024 * 1024;
+/// 幂等中间件愿意读进内存的响应体上限（16MB）。
+///
+/// 超过它的响应**不缓存但原样透传**：大页面 `snapshot` / `exec` 的 `js_return`
+/// 落在这个区间，把正文换成空体等于"动作执行了、结果丢了"，比不回放更糟。
+pub(crate) const IDEMPOTENCY_RESPONSE_LIMIT: usize = 16 * 1024 * 1024;
 
 /// 幂等缓存里的一项。
 ///
@@ -106,7 +112,10 @@ pub(crate) struct WsConn {
     pub(crate) session_registry: Arc<std::sync::Mutex<HashSet<String>>>,
     /// 握手时创建的下行通道。断开清理时用它和会话上的 `sender` 比对
     /// （`same_channel`），避免扩展重载时新旧连接互相踩。
-    pub(crate) sender: mpsc::UnboundedSender<String>,
+    ///
+    /// 有界通道（容量 `ws_outbound_max`）。发送必须走
+    /// `send_downstream`，让「队列满」变成结构化 `ws_backpressure` 而不是无限积压。
+    pub(crate) sender: mpsc::Sender<String>,
 }
 
 /// token 的稳定指纹：**只用做相等比较，不承担密码学职责**。
@@ -143,11 +152,16 @@ pub struct AppState {
     /// 已经主动要求过重载的 (browser_id, 版本)，避免版本没变时反复触发。
     pub(crate) ext_reload_sent: Arc<Mutex<HashSet<String>>>,
     /// profile label 变更的串行锁：查重与写回之间隔着一次最长 10s 的扩展往返，
-    /// 只用读写锁挡不住两个并发请求同时通过查重（A2-05）。
+    /// 只用读写锁挡不住两个并发请求同时通过查重。
     pub(crate) profile_label_lock: Arc<Mutex<()>>,
-    /// net 配置落盘的串行锁：落盘改成「后台线程读盘 → 合并当前 profile → 写回」，
-    /// 读-改-写之间必须有锁，否则两个 profile 的并发保存会互相覆盖（B-13）。
-    pub(crate) net_persist_lock: Arc<Mutex<()>>,
+    /// net 配置落盘的 per-profile 串行锁。
+    ///
+    /// 旧实现是一把全局锁：两个 profile 的并发 net 命令排同一条队列，每轮最多等
+    /// `NET_RMW_LOCK_WAIT`，叠加后调用方预算先耗尽。现在 map 只用来取/建各自的
+    /// `Arc<Mutex<()>>`（瞬时持锁，不跨 await），真正串行的是 per-profile 的那把。
+    /// 落盘仍是「后台线程读盘 → 合并当前 profile → 写回」，读-改-写之间必须有锁，
+    /// 否则两个 profile 的并发保存会互相覆盖。
+    pub(crate) net_persist_lock: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     pub(crate) started_at: SystemTime,
     pub(crate) last_activity: Arc<Mutex<Instant>>,
     /// 正在处理的 HTTP 请求数。>0 时禁止空闲自杀：
@@ -157,7 +171,7 @@ pub struct AppState {
     /// 「最近一次有请求进来」的时刻：**每条**请求进入 `track_inflight` 时刷新，
     /// 计数回到 0 时清空。只给 `monitor_idle_shutdown` 判断「在途请求是不是已经卡死」用。
     ///
-    /// 语义刻意不是「最早一条在途请求的起点」（A-02）：旧实现只在 0→1 时记起点，
+    /// 语义刻意不是「最早一条在途请求的起点」：旧实现只在 0→1 时记起点，
     /// 那条请求离场后时间戳滞留，后续长请求会被提前判死；改成每条请求都刷新之后，
     /// 「`inflight > 0` 且这个时刻已经超过阈值」等价于「阈值时间内没有任何新请求进来」，
     /// 持续重叠的健康流量不会误触发。
@@ -196,7 +210,7 @@ pub struct AppState {
     /// `/shutdown` handler 也各调一次。没有幂等位就会向扩展重复下发
     /// `debugClearAll`，把刚重连上的新连接的拦截规则一并清掉。
     pub(crate) cleanup_done: Arc<AtomicBool>,
-    /// 扩展最近一次自检上报的 `warnings`（R-19）。
+    /// 扩展最近一次自检上报的 `warnings`。
     ///
     /// 只在非空时覆盖：连上来的旧扩展不发这个字段，不能把已有告警清空。
     pub(crate) ext_warnings: Arc<Mutex<Vec<Value>>>,
@@ -206,7 +220,7 @@ pub struct AppState {
     /// 条目内部：只有这样才能在「同一个 key 换了请求体」时识别出冲突并回 409。
     /// 若把指纹也拼进键里，换了 body 就变成另一条缓存项，冲突会静默通过并再执行一次。
     ///
-    /// A1：`Done` 条目同时追加到 `~/.atb/idempotency.jsonl`，daemon 重启时由
+    /// `Done` 条目同时追加到 `~/.atb/idempotency.jsonl`，daemon 重启时由
     /// `load_idempotency_cache` 读回（`Pending` 永不落盘）。
     pub(crate) idempotency: Arc<Mutex<HashMap<String, IdempotencySlot>>>,
     /// 迟到结果暂存：`exec_id` -> (结果/错误, 登记时刻)。
@@ -287,7 +301,7 @@ where
 ///
 /// 分层位置（见 `build_api_router`）：`require_api_access` **内层**、`track_inflight`
 /// **内层**——即 token 校验之后才进本中间件，未授权请求既不会占位也不会被缓存
-/// （层序由 `.layer` 的添加顺序保证，见 boot.rs 注释）。
+/// （；层序由 `.layer` 的添加顺序保证，见 boot.rs 注释）。
 pub(crate) async fn idempotency_replay(
     State(state): State<AppState>,
     request: Request<Body>,
@@ -377,7 +391,25 @@ pub(crate) async fn idempotency_replay(
     let (parts, body) = response.into_parts();
     // 记录原状态码：回放时不再把它抹平成 200。
     let status = parts.status.as_u16();
-    let bytes = match axum::body::to_bytes(body, 16 * 1024 * 1024).await {
+    // 先按已知长度预判。旧实现直接 `to_bytes(..., 16MB)`，超限时**整体替换成
+    // 空 body + 原状态码**——`exec` 的 `js_return`、大页面 `snapshot` 正好落在这个区间，
+    // 动作已经执行、结果却被抹掉，调用方还无法与「命令写错」区分。
+    // 现在超限只做「不缓存」：响应原样透传，只是失去 60s 内的回放能力。
+    if body
+        .size_hint()
+        .upper()
+        .is_some_and(|upper| upper > IDEMPOTENCY_RESPONSE_LIMIT as u64)
+    {
+        eprintln!(
+            "idempotency: {path} 的响应超过 {}MB，本次不缓存但原样透传",
+            IDEMPOTENCY_RESPONSE_LIMIT / (1024 * 1024)
+        );
+        // 必须解除占位：否则同 key 的等待者会一直等到超时。
+        yield_slot(&state, &cache_key, &scope, &notify, None, status).await;
+        guard.disarm();
+        return Response::from_parts(parts, body);
+    }
+    let bytes = match axum::body::to_bytes(body, IDEMPOTENCY_RESPONSE_LIMIT).await {
         Ok(bytes) => bytes,
         // 响应体读不出来（客户端中断等）：无法缓存，也没有可重建的正文，
         // 只能返回空体 + 原状态头。该路径正常业务不会走到（响应都由 Json() 构造）。
@@ -454,7 +486,7 @@ fn body_requests_dry_run(bytes: &[u8]) -> bool {
 }
 
 /// 抢占位的结果。
-enum SlotDecision {
+pub(crate) enum SlotDecision {
     /// 本请求是首个执行者：拿到占位，执行完必须 [`yield_slot`]。
     Lead(Arc<Notify>),
     /// 已有可回放的响应。
@@ -469,7 +501,7 @@ enum SlotDecision {
 ///
 /// **为什么是「检查 + 插入」同一把锁**：分两次加锁时两个并发请求都会看到
 /// 「没有条目」，于是各自成为首个执行者——占位形同虚设。
-async fn claim_idempotency_slot(
+pub(crate) async fn claim_idempotency_slot(
     state: &AppState,
     cache_key: &str,
     scope: &str,
@@ -642,7 +674,7 @@ fn cacheable_response(status: u16, value: &Value) -> bool {
 ///
 /// `Drop` 里不能 `.await`，所以只 `tokio::spawn` 一个清理任务；正常完成路径调用
 /// [`Self::disarm`] 避免「刚写好的 Done 被误删」。
-struct IdempotencySlotGuard {
+pub(crate) struct IdempotencySlotGuard {
     state: AppState,
     cache_key: String,
     scope: String,
@@ -651,7 +683,12 @@ struct IdempotencySlotGuard {
 }
 
 impl IdempotencySlotGuard {
-    fn new(state: AppState, cache_key: String, scope: String, notify: Arc<Notify>) -> Self {
+    pub(crate) fn new(
+        state: AppState,
+        cache_key: String,
+        scope: String,
+        notify: Arc<Notify>,
+    ) -> Self {
         Self {
             state,
             cache_key,
@@ -661,7 +698,7 @@ impl IdempotencySlotGuard {
         }
     }
 
-    fn disarm(&mut self) {
+    pub(crate) fn disarm(&mut self) {
         self.armed = false;
     }
 }
@@ -747,7 +784,7 @@ fn idempotency_inflight_timeout(key: &str, wait: Duration) -> Response {
 }
 
 // ---------------------------------------------------------------------------
-// A1：幂等缓存跨进程持久化
+// 幂等缓存跨进程持久化
 //
 // 内存缓存只能在**同一个** daemon 生命周期内回放：daemon 重启（空闲退出、升级、
 // 崩溃）后缓存清空，调用方带同一个 `--idempotency-key` 重发就会**二次执行**——
@@ -781,9 +818,7 @@ static IDEMPOTENCY_APPEND_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new()
 /// 超过就触发一次 compact（tmp + rename，只保留未过期条目），而不是让长驻
 /// daemon 把文件无限追加下去。
 fn idempotency_file_max_bytes() -> u64 {
-    crate::settings::env_usize_clamped("ATB_IDEMPOTENCY_FILE_MAX_MB", 32, 1, 512) as u64
-        * 1024
-        * 1024
+    crate::settings::idempotency_file_max_mb() * 1024 * 1024
 }
 
 fn idempotency_append_lock() -> &'static std::sync::Mutex<()> {
@@ -1250,7 +1285,7 @@ mod tests {
             .unwrap_or(0)
     }
 
-    /// A1 验收：Done 条目落盘后能被重新加载、body 一致；过期条目被丢弃；Pending 不落盘。
+    /// 验收：Done 条目落盘后能被重新加载、body 一致；过期条目被丢弃；Pending 不落盘。
     #[test]
     fn persisted_entries_survive_reload() {
         let path = temp_store_path("reload");
@@ -1308,7 +1343,7 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
-    /// A1 验收：恢复出来的条目仍然遵守「同 key 换 body → 409」，不会被误回放。
+    /// 验收：恢复出来的条目仍然遵守「同 key 换 body → 409」，不会被误回放。
     #[test]
     fn reloaded_entry_still_rejects_other_fingerprint() {
         let path = temp_store_path("fingerprint");
@@ -1336,7 +1371,7 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
-    /// A1 要求：加载时超过上限只保留最新的 N 条，避免异常 key 把文件/内存撑大。
+    /// 要求：加载时超过上限只保留最新的 N 条，避免异常 key 把文件/内存撑大。
     #[test]
     fn reload_keeps_newest_entries_only() {
         let path = temp_store_path("limit");
@@ -1425,7 +1460,7 @@ mod tests {
             idempotency_inflight_wait(b"{\"timeout\":-1}"),
             IDEMPOTENCY_INFLIGHT_WAIT
         );
-        // 300s 的动作必须给出明显长于 90s 的窗口，否则就是复现条件。
+        // 300s 的动作必须给出明显长于 90s 的窗口，否则就是 的复现条件。
         assert!(idempotency_inflight_wait(b"{\"timeout\":300}") > IDEMPOTENCY_INFLIGHT_WAIT);
         // 上限夹到 600s：timeout=600 加上余量后仍不能超过它。
         assert_eq!(
@@ -1530,9 +1565,9 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
-    /// 构造一条最小可用的会话：A2 的判据只看 `is_active()`，其余字段只需形状正确。
+    /// 构造一条最小可用的会话： 的判据只看 `is_active`，其余字段只需形状正确。
     fn test_session(session_key: &str, browser_id: &str, disconnected: bool) -> Session {
-        let (sender, _receiver) = mpsc::unbounded_channel();
+        let (sender, _receiver) = mpsc::channel::<String>(64);
         Session {
             session_key: session_key.to_string(),
             tab_id: "1".to_string(),
@@ -1564,7 +1599,7 @@ mod tests {
         }
     }
 
-    /// A2 验收：两个 browser 同时连着时，默认目标只有「当前默认失效」后才允许改选。
+    /// 验收：两个 browser 同时连着时，默认目标只有「当前默认失效」后才允许改选。
     ///
     /// 判据本体在 `ws.rs::should_set_default_session`；测试放在本文件，是因为本子任务
     /// 只被授权在 state.rs 自由新增代码（sessions.rs / ws.rs 仅授权指定点位）。
@@ -1606,7 +1641,7 @@ mod tests {
         assert!(should_set_default_session(&driver, "browser-c:profile:3"));
     }
 
-    /// A2 TTL：6 小时内（1 小时前登记）仍然有效，且设置时一定写时间戳。
+    /// TTL：6 小时内（1 小时前登记）仍然有效，且设置时一定写时间戳。
     #[test]
     fn preferred_default_survives_within_ttl() {
         let mut driver = DriverState::default();
@@ -1634,7 +1669,7 @@ mod tests {
         );
     }
 
-    /// A2 TTL：超过 6 小时视为「没有」，并且被真正清掉（key 与时间戳一起清）。
+    /// TTL：超过 6 小时视为「没有」，并且被真正清掉（key 与时间戳一起清）。
     #[test]
     fn preferred_default_expires_after_ttl() {
         // 用结构体更新语法而不是「先 default 再逐字段赋值」：clippy 的
@@ -1658,7 +1693,7 @@ mod tests {
         assert!(should_set_default_session(&driver, "browser-b:profile:2"));
     }
 
-    /// A2：断线时只有「它就是当前默认」且「没有更晚的 preferred」才记下来。
+    /// 断线时只有「它就是当前默认」且「没有更晚的 preferred」才记下来。
     ///
     /// 记下来的 preferred 会在重连快照里被 `apply_tabs_snapshot` 消费掉（设回默认 + 清空），
     /// 这条断言守的是「什么时候值得记」这一半；消费那一半是快照路径，属 sessions.rs。

@@ -88,7 +88,7 @@ function __abcRead(opts) {
   } else {
     // XML / SVG 文档没有 body：旧实现让 root 停在 null，下面报出
     // "selector not found: undefined" —— 既点名了一个不存在的选择器，又没说清
-    // 真实原因是「这份文档没有 body」（P3）。退回 documentElement 仍能读正文。
+    // 真实原因是「这份文档没有 body」。退回 documentElement 仍能读正文。
     root = doc.body || doc.documentElement;
   }
   if (!root) {
@@ -150,13 +150,17 @@ function __abcRead(opts) {
     return /current-password|new-password|cc-number|cc-csc|one-time-code/.test(autocomplete);
   }
 
-  /// 派生文本掩码：与 page_find.js 的 __abcMaskDerived 同语义、不同名。
-  /// 表单字段的 `name` 是站点写的**结构标识**（agent 靠它定位字段），不是用户输入，
-  /// 因此只掩码 placeholder 这类可能夹带半明文的派生文本，并保留 redacted 标记。
+  /// 派生文本掩码（收口）：口径与 page_find.js 的 __abcMaskDerived
+  /// 逐字对齐（三份文件各留一份、各叫各的名字，见 page_action.js 头部的命名约定）。
+  ///
+  /// 只掩码 placeholder 这类可能夹带半明文的**派生文本**：表单字段的 `name` 是站点
+  /// 写的**结构标识**（agent 靠它定位字段），不是用户输入，不能一起掩掉。
+  /// 空值统一返回 null（调用方据此区分「字段没写」与「写了但被掩码」）；
+  /// secret 字段的非空值一律 '•••'，并在字段对象上置 redacted:true。
   function maskDerived(el, value) {
     const raw = value === undefined || value === null ? '' : String(value);
-    if (!secretField(el)) return raw;
-    return raw ? '•••' : raw;
+    if (!secretField(el)) return raw || null;
+    return raw ? '•••' : null;
   }
 
   // 走一次 TreeWalker 收集文本；includeAll=false 时粗略跳过明显隐藏的子树。

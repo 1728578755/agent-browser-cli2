@@ -14,7 +14,7 @@
 //
 // 入口定义：整个文件包在 IIFE 里，末尾用 defineProperty 把 __abcStealth 挂到 window。
 // 与 page_net.js 同因同理：顶层 `function __abcStealth(){}` 在扩展 executeScript({files})
-// 这条 classic script 路径上会创建 non-configurable 的全局绑定（V8 的 DONT_DELETE 位），
+// 这条 classic script 路径上会创建 non-configurable 的全局绑定（DONT_DELETE 位），
 // `delete window.__abcStealth` 恒返回 false —— 审计函数自己就成了永远擦不掉的指纹；
 // 而且函数声明是可枚举的，`Object.keys(window)` 一行就能列出来。
 ;(function () {
@@ -23,6 +23,12 @@ function __abcStealth(opts) {
   const action = String(opts.action || 'audit').toLowerCase();
 
   // 本工具可能留在页面里的全局名。改这里必须同步 background.js 的 PAGE_OP_FILES。
+  //
+  // 后两个不是 `__abc*`，但同样是本工具注入的入口：simphtml 的 scan / find_list
+  // 脚本（daemon eval 通道，见 html.rs）把 optHTML / findMainList 临时挂到 window
+  // 供同一段脚本里的 `return optHTML(...)` 解析。它们已经改成
+  // 不可枚举 + 可配置 + 用完即撤；列在这里是为了「撤不掉时」audit 能报、scrub 能删 ——
+  // 只列 `__abc*` 会让这两条完全漏网（历史问题：audit 报「干净」，页面其实留着入口）。
   const OWN_GLOBALS = [
     '__abcStealth',
     '__abcNet',
@@ -31,7 +37,9 @@ function __abcStealth(opts) {
     '__abcSnapshot',
     '__abcAct',
     '__abcWait',
-    '__abcChallenge'
+    '__abcChallenge',
+    'optHTML',
+    'findMainList'
   ];
   // 本工具可能留在 DOM 里的节点（扩展角标与其样式表）。
   // atb-status-host 是 5.0 起的 Shadow DOM 宿主，atb-* 是历史版本留下的节点。

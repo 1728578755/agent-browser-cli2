@@ -368,7 +368,7 @@ test('token 轮换只换一条新连接，并把 token 带进 URL', async () => 
   assert.equal(harness.sockets.length, count, 'token 值未变化时不应重建连接');
 });
 
-test('同 id 重发：running 回 duplicate_inflight，done 回放结果且不重复执行', async () => {
+test('同 id 重发：running 挂起等原结果后回放，done 直接回放且不重复执行', async () => {
   const harness = await boot();
   const socket = currentSocket(harness);
   await socket.open();
@@ -388,24 +388,32 @@ test('同 id 重发：running 回 duplicate_inflight，done 回放结果且不�
   const firstRun = socket.message(command);
   await flush(6);
 
-  // 第二次：同 id、仍 running → 立即回 duplicate_inflight，不进入执行。
-  await socket.message(command);
-  const duplicate = socket.sent
-    .map((item) => JSON.parse(item))
-    .find((item) => item.type === 'error' && item.id === 'cmd-1');
-  assert.ok(duplicate, `应回一条 duplicate 错误，实际 ${JSON.stringify(socket.sent)}`);
-  assert.equal(duplicate.error?.code, 'duplicate_inflight');
+  // 第二次：同 id、仍 running → 不重新执行，挂起等原命令终态后回放同一条结果。
+  // 旧语义是立即回 duplicate_inflight；那会把「慢但会成功」变成确定性失败，
+  // 所以这里断言「没有回包 + 没有二次执行」，而不是断言错误码。
+  const duplicateRun = socket.message(command);
+  await flush(6);
   assert.equal(execCount, 1, `running 期间的重复命令不应再次执行，实际执行 ${execCount} 次`);
+  assert.equal(
+    socket.sent
+      .map((item) => JSON.parse(item))
+      .filter((item) => item.id === 'cmd-1' && (item.type === 'result' || item.type === 'error')).length,
+    0,
+    `running 期间的重发不应立即回终态（应等原命令终态），实际 ${JSON.stringify(socket.sent)}`,
+  );
 
-  // 放行原命令 → 登记 done。
+  // 放行原命令 → 登记 done，并唤醒挂起的重发回放同一条结果。
   release();
   await firstRun;
+  await duplicateRun;
   await flush(10);
-  const resultMessage = socket.sent
+  const settled = socket.sent
     .map((item) => JSON.parse(item))
-    .find((item) => item.type === 'result' && item.id === 'cmd-1');
-  assert.ok(resultMessage, `首次执行应回 result，实际 ${JSON.stringify(socket.sent)}`);
-  assert.equal(resultMessage.result, 42);
+    .filter((item) => item.type === 'result' && item.id === 'cmd-1');
+  assert.equal(settled.length, 2, `原命令与挂起的重发都应回 result，实际 ${JSON.stringify(socket.sent)}`);
+  assert.equal(settled[0].result, 42);
+  assert.equal(settled[1].result, 42, '重发应回放同一结果');
+  assert.equal(execCount, 1, `重发不得再次执行，实际执行 ${execCount} 次`);
 
   // 第三次：同 id、已 done → 回放原结果，不再执行。
   socket.sent.length = 0;

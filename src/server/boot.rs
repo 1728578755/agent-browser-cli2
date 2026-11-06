@@ -82,7 +82,7 @@ pub async fn run_daemon() -> Result<()> {
         ws_bind_error: Arc::new(Mutex::new(None)),
         ext_reload_sent: Arc::new(Mutex::new(HashSet::new())),
         profile_label_lock: Arc::new(Mutex::new(())),
-        net_persist_lock: Arc::new(Mutex::new(())),
+        net_persist_lock: Arc::new(Mutex::new(HashMap::new())),
         started_at: SystemTime::now(),
         last_activity: Arc::new(Mutex::new(Instant::now())),
         inflight: Arc::new(AtomicUsize::new(0)),
@@ -118,7 +118,7 @@ pub async fn run_daemon() -> Result<()> {
         }
     }
 
-    // A1：幂等缓存跨进程恢复。daemon 重启（空闲退出 / 升级 / 崩溃）后，60s 内
+    // 幂等缓存跨进程恢复。daemon 重启（空闲退出 / 升级 / 崩溃）后，60s 内
     // 同 key 同指纹的请求仍能回放首次响应，否则「响应丢失后重发」会二次执行——
     // 正是幂等键要防的场景。只恢复 Done 条目；文件缺失/损坏/无权限都不阻断启动。
     load_idempotency_cache(&state).await;
@@ -264,7 +264,7 @@ pub(crate) fn build_api_router(state: AppState) -> Router {
 
 /// `x-agent-browser-agent` 的合法形态：1..=80 个 `[A-Za-z0-9._:-]`。
 ///
-/// 与 CLI 侧清洗规则一致（的另一半在 CLI）。**不合法不是"清洗"而是忽略**：
+/// 与 CLI 侧清洗规则一致（另一半在 CLI）。**不合法不是"清洗"而是忽略**：
 /// 清洗会把 `客服`、`运维` 都塌缩成空串再落到 `default`，两个不同智能体共享
 /// 同一个默认标签页，`cleanup` 互相关对方页面，且看起来一切正常。
 pub(crate) fn is_valid_agent_id(value: &str) -> bool {
@@ -344,7 +344,7 @@ impl InflightGuard {
     /// 计数 +1 与守卫创建必须是同一步：若先递增、再 `.await` 取锁，请求在取锁期间
     /// 被取消，就只留下「计数 +1、守卫从未创建」的泄漏，daemon 再也不会空闲退出。
     ///
-    /// A-02 / ：旧实现只在「0→1」那一刻记录起点，于是 (a) 这条请求离场后
+    /// 旧实现只在「0→1」那一刻记录起点，于是 (a) 这条请求离场后
     /// 时间戳仍滞留，下一条长请求会在 `since` 已经很旧时被提前判死；(b) 0→1 之后、
     /// 写入起点之前还有个 await 窗口，期间 monitor 看到的是上一条请求留下的旧值。
     /// 现在起点改成「**每条**请求进入时由 `track_inflight` 刷新」，acquire 不再承担
@@ -377,10 +377,10 @@ pub(crate) async fn track_inflight(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    // A-02 / ：起点语义固定为「最近一次有请求进来的时刻」，**每条**请求都刷新，
+    // 起点语义固定为「最近一次有请求进来的时刻」，**每条**请求都刷新，
     // 不再只在 0→1 时写。由此：
     // - 多条持续重叠的健康请求会不断续期，不会因为「最早那条请求的陈旧时间戳」
-    //   在卡死阈值后被误杀（A-02）；
+    // 在卡死阈值后被误杀；
     // - 反过来「`inflight > 0` 且这个时刻已经超过阈值」就意味着阈值时间内
     //   一条新请求都没进来——这才是真的挂了。
     //
@@ -557,7 +557,7 @@ fn split_host_port(value: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// 缺少 `Host` 时只提示一次（的放行分支）。
+/// 缺少 `Host` 时只提示一次（放行分支）。
 fn warn_missing_host() {
     static WARNED: AtomicBool = AtomicBool::new(false);
     if !WARNED.swap(true, Ordering::Relaxed) {
@@ -565,6 +565,10 @@ fn warn_missing_host() {
             "HTTP API: 请求缺少 Host 头，已放行（仅本机回环；浏览器与 DNS rebinding 一定带 Host）；后续同类不再提示"
         );
     }
+}
+
+pub(crate) fn build_ws_router(state: AppState) -> Router {
+    Router::new().route("/", get(ws_handler)).with_state(state)
 }
 
 pub(crate) async fn run_ws_server(state: AppState) -> Result<()> {
@@ -579,9 +583,7 @@ pub(crate) async fn run_ws_server(state: AppState) -> Result<()> {
 
 /// 空闲自杀阈值：默认 300s，`ATB_IDLE_TTL=<秒>`（旧名 AGENT_BROWSER_CLI_IDLE_TTL）可覆盖（0 或非法值回落默认）。
 pub(crate) fn idle_shutdown_ttl_from_env() -> Duration {
-    config::env_compat("IDLE_TTL")
-        .and_then(|raw| raw.to_string_lossy().trim().parse::<u64>().ok())
-        .filter(|secs| *secs > 0)
+    crate::settings::idle_shutdown_ttl_sec()
         .map(Duration::from_secs)
         .unwrap_or(IDLE_SHUTDOWN_TTL)
 }
@@ -613,105 +615,122 @@ pub(crate) fn max_inflight_stall(state: &AppState) -> Duration {
         .max(MAX_INFLIGHT_STALL)
 }
 
-pub(crate) async fn monitor_idle_shutdown(state: AppState) {
-    // 扩展断开后的宽限期。
+/// 扩展断开后的宽限期。
+///
+/// 扩展重连靠 chrome.alarms，其硬下限 30s（Chrome 120+ 会抬到 ≥30s），
+/// 所以"扩展一断就按空闲计时"等于"一断就自退"。给它一个明显大于 alarms
+/// 周期的窗口，短暂断线仍能自愈。
+pub(crate) const EXTENSION_RECONNECT_GRACE: Duration = Duration::from_secs(60);
+
+/// 空闲监控的「单轮结论」。
+///
+/// 判定从循环体里抽出来，单测才能直接驱动**生产代码**跑一轮（构造 `AppState`
+/// 就够了），不必等 5s 定时器、也不必等到 300s TTL。
+pub(crate) enum IdleAction {
+    KeepAlive,
+    /// 由调用方统一 cleanup + `shutdown.send(())` + break；日志已在判定处打完。
+    Exit,
+}
+
+/// 跑一轮空闲判定。`disconnected_since` 由调用方持有，跨轮保存。
+///
+/// 顺序即优先级：
+/// 1. 在途请求（`inflight > 0`）默认阻止退出——否则长命令被腰斩；但卡死超阈值要放行，
+///    否则 `download-wait --timeout 3600` 遇上扩展失联会让 daemon 永不退出；
+/// 2. running job 同理（对称的保护）；
+/// 3. 真正空闲（`idle_for >= ttl`）时，只要还有扩展连着就不退（重连代价更大）；
+/// 4. 扩展刚断开时先等一个宽限窗口，别把短暂断线当成「没有浏览器」。
+pub(crate) async fn idle_tick(
+    state: &AppState,
+    disconnected_since: &mut Option<Instant>,
+) -> IdleAction {
+    // 这里的 `since` 是「最近一次有请求进来的时刻」：持续重叠的健康请求会
+    // 一直把它刷新到现在，所以不会被「最早那条请求的陈旧时间戳」误杀。
+    if state.inflight.load(Ordering::Relaxed) > 0 {
+        let since = *state.inflight_since.lock().await;
+        let stalled_for = match since {
+            // 起点丢失（极端竞态）时保守处理：不算卡死，宁可多等一轮。
+            None => Duration::ZERO,
+            Some(since) => since.elapsed(),
+        };
+        let stall_limit = max_inflight_stall(state);
+        if stalled_for < stall_limit {
+            return IdleAction::KeepAlive;
+        }
+        eprintln!(
+            "在途请求已挂起 {}s（阈值 {}s），判定为卡死，daemon 直接退出（inflight={}）",
+            stalled_for.as_secs(),
+            stall_limit.as_secs(),
+            state.inflight.load(Ordering::Relaxed)
+        );
+        // 不能落入下面的 idle 判定：其它请求会不断刷新 `last_activity`，
+        // 那样只会每 5s 重打一条「允许退出」却永远不退出。
+        return IdleAction::Exit;
+    }
+    // 后台异步任务运行期间不允许退出，否则用户提交的长时间任务会被腰斩。
+    let (running_jobs, oldest_running) = running_jobs_snapshot(state).await;
+    if running_jobs > 0 {
+        if let Some(stalled_for) = oldest_running {
+            let stall_limit = max_inflight_stall(state);
+            if stalled_for >= stall_limit {
+                eprintln!(
+                    "后台 job 已运行 {}s（阈值 {}s，running={}），判定为卡死，daemon 直接退出",
+                    stalled_for.as_secs(),
+                    stall_limit.as_secs(),
+                    running_jobs
+                );
+                return IdleAction::Exit;
+            }
+        }
+        return IdleAction::KeepAlive;
+    }
+    let idle_for = state.last_activity.lock().await.elapsed();
+    if idle_for < state.idle_shutdown_ttl {
+        return IdleAction::KeepAlive;
+    }
+    // 只要还有扩展连着就不退。
     //
-    // 扩展重连靠 chrome.alarms，其硬下限 30s（Chrome 120+ 会抬到 ≥30s），
-    // 所以"扩展一断就按空闲计时"等于"一断就自退"。给它一个明显大于 alarms
-    // 周期的窗口，短暂断线仍能自愈。
-    const EXTENSION_RECONNECT_GRACE: Duration = Duration::from_secs(60);
+    // 扩展的重连靠 chrome.alarms，而 alarms 的硬下限是 30s（Chrome 120+ 会把
+    // periodInMinutes 抬到 ≥30s），所以 daemon 一退，下一次 CLI 冷启动最多要等
+    // 近一分钟才看得见标签页 —— 用户侧表现就是「第一条命令特别慢 / 说没有可用标签页」。
+    // 空闲退出的初衷是别让扩展长期挂着「已连接」状态，但那个状态本身无害，
+    // 真正的代价（重连抖动、@e 引用失联、挑战求解中断）大得多。
+    let connected = {
+        let driver = state.driver.read().await;
+        driver.sessions.values().any(|session| session.is_active())
+    };
+    if connected {
+        // 连接期间持续续期：旧实现只是 `continue`，`last_activity`
+        // 停在最后一次业务请求上，于是扩展一断，下一个 5s tick 立刻自退，
+        // 没有任何重连宽限；`/health.ttl_remaining` 也会长期显示 0（谎报"马上退出"）。
+        *state.last_activity.lock().await = Instant::now();
+        *disconnected_since = None;
+        return IdleAction::KeepAlive;
+    }
+    // 刚断开：先等一个宽限窗口，别把短暂断线当成"没有浏览器"。
+    let since = *disconnected_since.get_or_insert_with(Instant::now);
+    if since.elapsed() < EXTENSION_RECONNECT_GRACE {
+        return IdleAction::KeepAlive;
+    }
+    eprintln!(
+        "atb daemon idle for {}s（扩展已断开 {}s）, shutting down",
+        idle_for.as_secs(),
+        since.elapsed().as_secs()
+    );
+    IdleAction::Exit
+}
+
+pub(crate) async fn monitor_idle_shutdown(state: AppState) {
     let mut disconnected_since: Option<Instant> = None;
     loop {
         tokio::time::sleep(IDLE_SHUTDOWN_CHECK_INTERVAL).await;
-        // 有请求正在处理时不允许退出：`download-wait --timeout 600`、`run`、`batch`
-        // 这类命令整个生命周期只有一次请求，`last_activity` 期间不会变，
-        // 只看时间会把它们连同 cleanup 一起腰斩。
-        //
-        // 但「在途」也可能是永久挂住：扩展失联时 `download-wait --timeout 3600`
-        // 会让 inflight 永远 >0，daemon 再也退不出去。超过阈值就当作卡死放行，
-        // 并明确打一行日志（含已挂时长），免得用户以为 daemon 行为诡异。
-        //
-        // 这里的 `since` 是「最近一次有请求进来的时刻」（A-02）：持续重叠的健康请求会
-        // 一直把它刷新到现在，所以不会被「最早那条请求的陈旧时间戳」误杀。
-        if state.inflight.load(Ordering::Relaxed) > 0 {
-            let since = *state.inflight_since.lock().await;
-            let stalled_for = match since {
-                // 起点丢失（极端竞态）时保守处理：不算卡死，宁可多等一轮。
-                None => Duration::ZERO,
-                Some(since) => since.elapsed(),
-            };
-            let stall_limit = max_inflight_stall(&state);
-            if stalled_for < stall_limit {
-                continue;
+        match idle_tick(&state, &mut disconnected_since).await {
+            IdleAction::KeepAlive => continue,
+            IdleAction::Exit => {
+                cleanup_on_shutdown(&state).await;
+                let _ = state.shutdown.send(());
+                break;
             }
-            eprintln!(
-                "在途请求已挂起 {}s（阈值 {}s），判定为卡死，daemon 直接退出（inflight={}）",
-                stalled_for.as_secs(),
-                stall_limit.as_secs(),
-                state.inflight.load(Ordering::Relaxed)
-            );
-            // 不能落入下面的 idle 判定：其它请求会不断刷新 `last_activity`，
-            // 那样只会每 5s 重打一条「允许退出」却永远不退出。
-            cleanup_on_shutdown(&state).await;
-            let _ = state.shutdown.send(());
-            break;
-        }
-        // 后台异步任务运行期间不允许退出，否则用户提交的长时间任务会被腰斩。
-        // 但 job 也可能卡死（页面脚本不返回、扩展失联），此时只看「有 running job」
-        // 会让 daemon 永不退出——HTTP 在途有 `max_inflight_stall` 兜底，job 也要有
-        // 对称的保护。
-        let (running_jobs, oldest_running) = running_jobs_snapshot(&state).await;
-        if running_jobs > 0 {
-            if let Some(stalled_for) = oldest_running {
-                let stall_limit = max_inflight_stall(&state);
-                if stalled_for >= stall_limit {
-                    eprintln!(
-                        "后台 job 已运行 {}s（阈值 {}s，running={}），判定为卡死，daemon 直接退出",
-                        stalled_for.as_secs(),
-                        stall_limit.as_secs(),
-                        running_jobs
-                    );
-                    cleanup_on_shutdown(&state).await;
-                    let _ = state.shutdown.send(());
-                    break;
-                }
-            }
-            continue;
-        }
-        let idle_for = state.last_activity.lock().await.elapsed();
-        if idle_for >= state.idle_shutdown_ttl {
-            // 只要还有扩展连着就不退。
-            //
-            // 扩展的重连靠 chrome.alarms，而 alarms 的硬下限是 30s（Chrome 120+ 会把
-            // periodInMinutes 抬到 ≥30s），所以 daemon 一退，下一次 CLI 冷启动最多要等
-            // 近一分钟才看得见标签页 —— 用户侧表现就是「第一条命令特别慢 / 说没有可用标签页」。
-            // 空闲退出的初衷是别让扩展长期挂着「已连接」状态，但那个状态本身无害，
-            // 真正的代价（重连抖动、@e 引用失联、挑战求解中断）大得多。
-            let connected = {
-                let driver = state.driver.read().await;
-                driver.sessions.values().any(|session| session.is_active())
-            };
-            if connected {
-                // 连接期间持续续期：旧实现只是 `continue`，`last_activity`
-                // 停在最后一次业务请求上，于是扩展一断，下一个 5s tick 立刻自退，
-                // 没有任何重连宽限；`/health.ttl_remaining` 也会长期显示 0（谎报"马上退出"）。
-                *state.last_activity.lock().await = Instant::now();
-                disconnected_since = None;
-                continue;
-            }
-            // 刚断开：先等一个宽限窗口，别把短暂断线当成"没有浏览器"。
-            let since = *disconnected_since.get_or_insert_with(Instant::now);
-            if since.elapsed() < EXTENSION_RECONNECT_GRACE {
-                continue;
-            }
-            eprintln!(
-                "atb daemon idle for {}s（扩展已断开 {}s）, shutting down",
-                idle_for.as_secs(),
-                since.elapsed().as_secs()
-            );
-            cleanup_on_shutdown(&state).await;
-            let _ = state.shutdown.send(());
-            break;
         }
     }
 }
@@ -740,10 +759,6 @@ pub(crate) async fn running_jobs_snapshot(state: &AppState) -> (usize, Option<Du
         Duration::try_from_secs_f64((now - oldest).max(0.0)).unwrap_or(Duration::ZERO)
     });
     (count, age)
-}
-
-pub(crate) fn build_ws_router(state: AppState) -> Router {
-    Router::new().route("/", get(ws_handler)).with_state(state)
 }
 
 #[cfg(test)]
