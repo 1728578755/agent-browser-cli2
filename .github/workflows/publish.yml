@@ -173,7 +173,7 @@ jobs:
           if [[ ${status} -eq 0 ]]; then
             exit 0
           fi
-          if printf '%s\n' "${output}" | grep -Eq 'E403|already exists|cannot publish over previously published version'; then
+          if printf '%s\n' "${output}" | grep -Eq 'E403|already exists|cannot publish over the previously published versions?'; then
             echo "::notice::${PACKAGE_NAME}@${PACKAGE_VERSION} 已发布过（npm 返回「已存在」），跳过"
             exit 0
           fi
@@ -260,7 +260,7 @@ jobs:
           if [[ ${status} -eq 0 ]]; then
             exit 0
           fi
-          if printf '%s\n' "${output}" | grep -Eq 'E403|already exists|cannot publish over previously published version'; then
+          if printf '%s\n' "${output}" | grep -Eq 'E403|already exists|cannot publish over the previously published versions?'; then
             echo "::notice::${PACKAGE_NAME}@${PACKAGE_VERSION} 已发布过（npm 返回「已存在」），跳过"
             exit 0
           fi
