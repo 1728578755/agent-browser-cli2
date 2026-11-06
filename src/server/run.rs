@@ -326,6 +326,8 @@ pub(crate) async fn batch_steps(
     Json(req): Json<BatchRequest>,
 ) -> Json<Value> {
     touch(&state).await;
+    // `/batch` 并发执行，不按步中断；该字段只为兼容 CLI 统一的步骤文件。
+    let _ = req.stop_on_error;
     if req.steps.is_empty() {
         return Json(json!({
             "ok": false,

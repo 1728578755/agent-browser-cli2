@@ -648,6 +648,10 @@ pub(crate) struct BatchRequest {
     /// 并发度：同时在多个标签页上执行的上限。
     #[serde(default = "default_batch_concurrency")]
     pub(crate) concurrency: usize,
+    /// CLI 与 `/run` 共用同一份步骤文件合并逻辑，会带上这个键；
+    /// `/batch` 是并发执行，不按步中断，但必须接受该字段而不是报 422。
+    #[serde(default = "default_true", alias = "stopOnError")]
+    pub(crate) stop_on_error: bool,
 }
 
 #[cfg(test)]
@@ -672,6 +676,17 @@ mod contract_tests {
         assert_eq!(req.wait_js.as_deref(), Some("window.ok"));
         assert_eq!(req.wait_timeout, 2.5);
         assert_eq!(req.max_bytes, Some(100));
+    }
+
+    /// CLI 的 `batch` 实际 payload 带 `stop_on_error`（与 `run` 共用步骤文件）：
+    /// `/batch` 并发执行，但 DTO 必须接受该字段，否则整条命令会 422。
+    #[test]
+    fn batch_request_accepts_cli_payload() {
+        let req: BatchRequest =
+            serde_json::from_str(r#"{"steps":[],"concurrency":4,"stop_on_error":true}"#)
+                .expect("batch payload");
+        assert_eq!(req.concurrency, 4);
+        assert!(req.stop_on_error);
     }
 
     /// CLI 的 `read` / `snapshot` 实际 payload（cmd_page.rs）必须原样被接受：
