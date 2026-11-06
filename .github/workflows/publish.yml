@@ -269,7 +269,7 @@ jobs:
 
   github-release:
     name: GitHub Release
-    # / ：以前只依赖 publish-binaries，且把 `skipped` 当成功 —— 版本门禁失败
+    # 以前只依赖 publish-binaries，且把 `skipped` 当成功 —— 版本门禁失败
     # 或 npm 主包发布失败时照样产出 Release，用户下到与 tag 不符 / npm 上不存在的版本。
     # 现在三条依赖都必须成功；扩展专用 tag（*-extension）没有 npm 包，单独走一条分支。
     needs: [version-check, publish-binaries, publish-main]
@@ -278,6 +278,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # 附注 tag 的说明就是 Release notes 的来源；浅克隆只有 commit，
+          # `git tag --format='%(contents)'` 会退化成 commit 标题。
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
