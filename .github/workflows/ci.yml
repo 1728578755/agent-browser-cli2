@@ -173,6 +173,10 @@ jobs:
     name: E2E live（真 Chrome + 真扩展）
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    # 依赖 runner 上 Chrome 对 `--load-extension` 的行为：品牌版 Chrome 收紧该开关时，
+    # 扩展根本不会加载，失败原因在环境而不在代码。真链路仍由本地/发布前手动跑，
+    # 这里失败只告警，不把整条 CI 标红。
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
